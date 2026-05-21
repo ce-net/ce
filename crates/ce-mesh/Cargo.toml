@@ -1,0 +1,16 @@
+[package]
+name = "ce-mesh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ce-identity = { path = "../ce-identity" }
+ce-chain = { path = "../ce-chain" }
+libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "tokio", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+sha2 = "0.10"
+anyhow = "1"
+tracing = "0.1"
+futures = "0.3"

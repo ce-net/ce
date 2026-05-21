@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/ce-identity",
+    "crates/ce-chain",
+    "crates/ce-mesh",
+    "crates/ce-container",
+    "crates/ce-node",
+    "crates/ce-protocol",
+    "crates/ce-deploy",
+]
+resolver = "2"
+
+[package]
+name = "ce"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ce"
+path = "src/main.rs"
+
+[dependencies]
+ce-node = { path = "crates/ce-node" }
+ce-identity = { path = "crates/ce-identity" }
+ce-chain = { path = "crates/ce-chain" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
