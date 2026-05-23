@@ -7,12 +7,14 @@ use ce_chain::{Block, Chain, Tx, TxKind};
 use ce_container::{ContainerManager, JobSpec};
 use ce_identity::{Identity, NodeId};
 use ce_mesh::{Mesh, MeshEvent, MeshHandle};
-use ce_protocol::CellSignal;
+use ce_protocol::{CellSignal, Capability};
 use directories::ProjectDirs;
+use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -20,6 +22,18 @@ use tracing::{info, warn};
 const SIGNAL_RING_CAPACITY: usize = 100;
 
 pub(crate) type SignalRing = Arc<Mutex<VecDeque<CellSignal>>>;
+
+/// Capacity snapshot cached from incoming peer capacity signals.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerCapacity {
+    pub cpu_cores: u32,
+    pub mem_mb: u32,
+    pub running_jobs: u32,
+    pub last_seen_secs: u64,
+}
+
+/// Atlas: maps NodeId → latest capacity snapshot. Updated from incoming CEP-1 capacity signals.
+pub(crate) type Atlas = Arc<Mutex<HashMap<NodeId, PeerCapacity>>>;
 
 fn push_signal(ring: &mut VecDeque<CellSignal>, sig: CellSignal) {
     if ring.len() >= SIGNAL_RING_CAPACITY {
@@ -83,6 +97,10 @@ pub struct JobRecord {
     pub payer_sig: Option<[u8; 64]>,
     /// Agreed settlement cost, set alongside payer_sig.
     pub cost: Option<u64>,
+    /// Original bid amount from the JobBid tx. Used for heartbeat rate calculation.
+    pub bid: u64,
+    /// Expected job duration in seconds. Used for heartbeat rate calculation.
+    pub duration_secs: u64,
 }
 
 /// Shared job store: maps CE job_id ([u8;32]) → job record.
@@ -131,6 +149,8 @@ pub struct Node {
     mesh_handle: MeshHandle,
     #[allow(dead_code)]
     signals: SignalRing,
+    #[allow(dead_code)]
+    atlas: Atlas,
     config: NodeConfig,
 }
 
@@ -164,6 +184,7 @@ impl Node {
         let (signal_tx, _signal_rx0) = broadcast::channel::<CellSignal>(64);
         let send_nonce = Arc::new(AtomicU64::new(0));
         let job_store: JobStore = Arc::new(Mutex::new(HashMap::new()));
+        let atlas: Atlas = Arc::new(Mutex::new(HashMap::new()));
 
         // Channel: mesh event loop → job manager for incoming JobBid txs.
         let (bid_notify_tx, bid_notify_rx) = mpsc::channel::<Tx>(64);
@@ -175,6 +196,7 @@ impl Node {
             chain: chain.clone(),
             mesh_handle: mesh_handle.clone(),
             signals: signals.clone(),
+            atlas: atlas.clone(),
             config,
         };
 
@@ -212,6 +234,7 @@ impl Node {
             let pool = pool.clone();
             let signals = signals.clone();
             let signal_tx = signal_tx.clone();
+            let atlas2 = atlas.clone();
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain,
@@ -223,6 +246,7 @@ impl Node {
                     signals,
                     signal_tx,
                     bid_notify_tx,
+                    atlas2,
                 )
                 .await;
             });
@@ -250,6 +274,17 @@ impl Node {
             });
         }
 
+        // Capacity broadcast: every 60s announce CPU/memory/job capacity as a CEP-1 signal.
+        if node.config.mine {
+            let identity2 = identity.clone();
+            let handle2 = mesh_handle.clone();
+            let job_store2 = job_store.clone();
+            let send_nonce2 = send_nonce.clone();
+            tokio::spawn(async move {
+                capacity_broadcast_loop(identity2, handle2, job_store2, send_nonce2).await;
+            });
+        }
+
         {
             let chain = chain.clone();
             let identity = identity.clone();
@@ -260,6 +295,7 @@ impl Node {
             let js = job_store.clone();
             let pool = pool.clone();
             let data_dir = node.config.data_dir.clone();
+            let atlas3 = atlas.clone();
             tokio::spawn(async move {
                 if let Err(e) = api::start(
                     chain,
@@ -272,6 +308,7 @@ impl Node {
                     pool,
                     settle_notify_tx,
                     data_dir,
+                    atlas3,
                 )
                 .await
                 {
@@ -389,6 +426,7 @@ async fn mesh_event_loop(
     signals: SignalRing,
     signal_tx: broadcast::Sender<CellSignal>,
     bid_notify_tx: mpsc::Sender<Tx>,
+    atlas: Atlas,
 ) {
     // Tracks the highest accepted nonce per sender to prevent replays.
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
@@ -517,6 +555,12 @@ async fn mesh_event_loop(
                     }
                 }
                 last_nonce.insert(signal.from, signal.nonce);
+
+                // Update atlas if this is a capacity advertisement.
+                if let Some(cap) = parse_capacity_signal(&signal) {
+                    atlas.lock().await.insert(signal.from, cap);
+                }
+
                 {
                     let mut ring = signals.lock().await;
                     push_signal(&mut ring, signal.clone());
@@ -551,6 +595,29 @@ async fn job_manager_loop(
     // Per-container tasks send (job_id, exit_code) when the container exits.
     let (completion_tx, mut completion_rx) = mpsc::channel::<([u8; 32], i64)>(32);
     let mut settle_ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut heartbeat_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    // Skip the first (immediate) tick so the heartbeat fires 30s after start.
+    heartbeat_ticker.tick().await;
+
+    // Initialize heartbeat epoch counters from chain state (survives restarts).
+    let mut heartbeat_epochs: HashMap<NodeId, u64> = {
+        let c = chain.lock().await;
+        let host_id = identity.node_id();
+        let mut epochs: HashMap<NodeId, u64> = HashMap::new();
+        for block in &c.blocks {
+            for tx in &block.transactions {
+                if let ce_chain::TxKind::Heartbeat { cell, host, epoch, .. } = &tx.kind {
+                    if host == &host_id {
+                        let e = epochs.entry(*cell).or_insert(0);
+                        if *epoch >= *e {
+                            *e = *epoch + 1;
+                        }
+                    }
+                }
+            }
+        }
+        epochs
+    };
 
     loop {
         tokio::select! {
@@ -575,6 +642,28 @@ async fn job_manager_loop(
             }
             _ = settle_notify_rx.recv() => {}
             _ = settle_ticker.tick() => {}
+            _ = heartbeat_ticker.tick() => {
+                let to_terminate = emit_heartbeats(
+                    &chain,
+                    &identity,
+                    &mesh_handle,
+                    &pool,
+                    &job_store,
+                    &mut heartbeat_epochs,
+                ).await;
+                for (job_id, cid) in to_terminate {
+                    if let Some(cid) = cid {
+                        let mgr = manager.clone();
+                        tokio::spawn(async move {
+                            let _ = mgr.stop_job(&cid).await;
+                        });
+                    }
+                    let mut store = job_store.lock().await;
+                    if let Some(r) = store.get_mut(&job_id) {
+                        r.status = CeJobStatus::Failed("cell wallet exhausted".into());
+                    }
+                }
+            }
         }
 
         // Submit settle txs for any jobs that now have a payer signature.
@@ -598,10 +687,11 @@ async fn handle_incoming_bid(
     job_store: &JobStore,
     completion_tx: &mpsc::Sender<([u8; 32], i64)>,
 ) {
-    let TxKind::JobBid { job_id, payer, image, cmd, env, cpu_cores, mem_mb, .. } = &tx.kind
+    let TxKind::JobBid { job_id, payer, image, cmd, env, cpu_cores, mem_mb, bid, duration_secs, .. } = &tx.kind
     else {
         return;
     };
+    let (bid, duration_secs) = (*bid, *duration_secs);
 
     // Never accept our own bids; chain would reject the settle (payer == host).
     if payer == &identity.node_id() {
@@ -644,6 +734,8 @@ async fn handle_incoming_bid(
                         status: CeJobStatus::Running,
                         payer_sig: None,
                         cost: None,
+                        bid,
+                        duration_secs,
                     },
                 );
             }
@@ -669,6 +761,8 @@ async fn handle_incoming_bid(
                     status: CeJobStatus::Failed(e.to_string()),
                     payer_sig: None,
                     cost: None,
+                    bid,
+                    duration_secs,
                 },
             );
         }
@@ -751,12 +845,171 @@ async fn submit_pending_settles(
     }
 }
 
+/// Emit Heartbeat txs for all Running jobs. Returns (job_id, container_id) pairs
+/// for cells whose balance is too low to afford the next heartbeat.
+async fn emit_heartbeats(
+    chain: &Arc<Mutex<Chain>>,
+    identity: &Identity,
+    mesh_handle: &MeshHandle,
+    pool: &TxPool,
+    job_store: &JobStore,
+    heartbeat_epochs: &mut HashMap<NodeId, u64>,
+) -> Vec<([u8; 32], Option<String>)> {
+    // Snapshot running jobs: (payer, bid, duration_secs, job_id, container_id)
+    let running: Vec<(NodeId, u64, u64, [u8; 32], Option<String>)> = {
+        let store = job_store.lock().await;
+        store.values()
+            .filter(|r| matches!(r.status, CeJobStatus::Running))
+            .map(|r| (r.payer, r.bid, r.duration_secs, r.job_id, r.container_id.clone()))
+            .collect()
+    };
+
+    let mut to_terminate: Vec<([u8; 32], Option<String>)> = Vec::new();
+
+    for (cell, bid, duration_secs, job_id, container_id) in running {
+        // Heartbeat rate: spread the bid evenly over 30-second intervals.
+        let intervals = (duration_secs / 30).max(1);
+        let amount = bid / intervals;
+        if amount == 0 {
+            continue;
+        }
+
+        let cell_balance = chain.lock().await.balance(&cell);
+        if cell_balance < amount as i64 {
+            info!(
+                "cell {} insufficient balance ({cell_balance}) for heartbeat {amount}, terminating job {}",
+                hex::encode(&cell[..4]),
+                hex::encode(&job_id),
+            );
+            to_terminate.push((job_id, container_id));
+            continue;
+        }
+
+        let epoch = {
+            let e = heartbeat_epochs.entry(cell).or_insert(0);
+            let current = *e;
+            *e += 1;
+            current
+        };
+
+        let kind = TxKind::Heartbeat { cell, host: identity.node_id(), amount, epoch };
+        let data = bincode::serialize(&kind).expect("serialize Heartbeat");
+        let sig = identity.sign(&data);
+        let tx = Tx::new(kind, identity.node_id(), sig);
+
+        pool.add(tx.clone()).await;
+        let _ = mesh_handle.broadcast_tx(&tx).await;
+        info!(
+            "heartbeat epoch {epoch} for cell {} job {}",
+            hex::encode(&cell[..4]),
+            hex::encode(&job_id),
+        );
+    }
+
+    to_terminate
+}
+
+/// Broadcast this node's available capacity as a capability-only CEP-1 signal every 60 seconds.
+/// Capabilities encode cpu_cores / mem_mb / running_jobs so peers can build an atlas.
+async fn capacity_broadcast_loop(
+    identity: Arc<Identity>,
+    mesh_handle: MeshHandle,
+    job_store: JobStore,
+    send_nonce: Arc<AtomicU64>,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    // Skip immediate first tick.
+    ticker.tick().await;
+
+    // Read available system resources once (approximation; accurate values need sysinfo).
+    let cpu_cores = num_cpus() as u32;
+    let mem_mb = available_mem_mb();
+
+    loop {
+        ticker.tick().await;
+
+        let running_jobs = {
+            let store = job_store.lock().await;
+            store.values().filter(|r| matches!(r.status, CeJobStatus::Running)).count() as u32
+        };
+
+        let capabilities = vec![
+            Capability { name: "cpu".into(), version: cpu_cores },
+            Capability { name: "mem_mb".into(), version: mem_mb },
+            Capability { name: "jobs".into(), version: running_jobs },
+        ];
+
+        let nonce = send_nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let signal = CellSignal::build(
+            identity.node_id(),
+            ce_protocol::CellAddress::Broadcast,
+            capabilities,
+            vec![],   // empty payload — no burn proof required
+            None,
+            nonce,
+            &identity,
+        );
+
+        if let Err(e) = mesh_handle.broadcast_signal(&signal).await {
+            warn!("capacity broadcast: {e}");
+        } else {
+            info!("broadcast capacity: {cpu_cores} cpu, {mem_mb} mb, {running_jobs} jobs");
+        }
+    }
+}
+
+/// Extract a PeerCapacity from an incoming capacity advertisement signal.
+/// Returns None if the signal is not a capacity advertisement.
+fn parse_capacity_signal(signal: &CellSignal) -> Option<PeerCapacity> {
+    let mut cpu = None;
+    let mut mem = None;
+    let mut jobs = None;
+    for cap in &signal.capabilities {
+        match cap.name.as_str() {
+            "cpu"    => cpu  = Some(cap.version),
+            "mem_mb" => mem  = Some(cap.version),
+            "jobs"   => jobs = Some(cap.version),
+            _ => {}
+        }
+    }
+    let (cpu_cores, mem_mb) = cpu.zip(mem)?;
+    let last_seen_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Some(PeerCapacity { cpu_cores, mem_mb, running_jobs: jobs.unwrap_or(0), last_seen_secs })
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+fn available_mem_mb() -> u32 {
+    // Best-effort: read /proc/meminfo on Linux; fall back to 4096.
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+            for line in s.lines() {
+                if line.starts_with("MemTotal:") {
+                    if let Some(kb_str) = line.split_whitespace().nth(1) {
+                        if let Ok(kb) = kb_str.parse::<u64>() {
+                            return (kb / 1024).min(u32::MAX as u64) as u32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    4096
+}
+
 fn tx_burn_amount(tx: &Tx) -> Option<u64> {
     match &tx.kind {
         TxKind::Transfer { amount, .. } => Some(*amount),
         TxKind::UptimeReward { amount, .. } => Some(*amount),
         TxKind::JobBid { bid, .. } => Some(*bid),
         TxKind::JobSettle { cost, .. } => Some(*cost),
+        TxKind::Heartbeat { amount, .. } => Some(*amount),
         // JobExpire and TrustGrant carry no burnable credit amount.
         TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => None,
     }

@@ -56,6 +56,65 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Deploy a cell (container job) on the local node.
+    ///
+    /// Example: ce deploy alpine:latest --fund 1000 --duration 300
+    Deploy {
+        /// Docker image to run.
+        image: String,
+        #[arg(long, default_value = "1000")]
+        fund: u64,
+        #[arg(long, default_value = "1")]
+        cpu: u32,
+        #[arg(long, default_value = "128")]
+        mem: u64,
+        #[arg(long, default_value = "300")]
+        duration: u64,
+        /// Command override for the container.
+        #[arg(short, long)]
+        cmd: Vec<String>,
+        #[arg(long, default_value = "8080")]
+        api_port: u16,
+    },
+    /// List jobs on this node (or a remote device).
+    ///
+    /// Example: ce ps
+    Ps {
+        #[arg(long, default_value = "8080")]
+        api_port: u16,
+    },
+    /// Force-stop a job by CE job ID.
+    ///
+    /// Example: ce kill <job-id>
+    Kill {
+        job_id: String,
+        #[arg(long, default_value = "8080")]
+        api_port: u16,
+    },
+    /// Transfer credits to another node.
+    ///
+    /// Example: ce fund <node-id> 500
+    Fund {
+        /// Recipient NodeId (64 hex chars).
+        to: String,
+        amount: u64,
+        #[arg(long, default_value = "8080")]
+        api_port: u16,
+    },
+    /// Send a CEP-1 signal to a cell and print the response.
+    ///
+    /// Example: ce run <cell-id> deadbeef
+    Run {
+        /// Destination NodeId (64 hex chars) or "broadcast".
+        cell: String,
+        /// Payload as hex string. Requires a burn_tx_id if non-empty.
+        #[arg(default_value = "")]
+        payload_hex: String,
+        #[arg(long)]
+        burn_tx: Option<String>,
+        #[arg(long, default_value = "8080")]
+        api_port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -325,6 +384,101 @@ async fn main() -> Result<()> {
             if exit_code != 0 {
                 std::process::exit(exit_code as i32);
             }
+        }
+
+        Commands::Deploy { image, fund, cpu, mem, duration, cmd, api_port } => {
+            let url = format!("http://127.0.0.1:{api_port}/jobs/bid");
+            let body = serde_json::json!({
+                "image": image,
+                "cmd": cmd,
+                "cpu_cores": cpu,
+                "mem_mb": mem,
+                "duration_secs": duration,
+                "bid": fund,
+            });
+            let client = reqwest::Client::new();
+            let resp = client.post(&url).json(&body).send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("deploy failed ({status}): {text}"));
+            }
+            let result: serde_json::Value = resp.json().await?;
+            println!("job_id: {}", result["job_id"].as_str().unwrap_or("?"));
+        }
+
+        Commands::Ps { api_port } => {
+            let url = format!("http://127.0.0.1:{api_port}/jobs");
+            let client = reqwest::Client::new();
+            let resp = client.get(&url).send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("ps failed ({status}): {text}"));
+            }
+            let jobs: serde_json::Value = resp.json().await?;
+            let jobs = jobs.as_array().map(|v| v.as_slice()).unwrap_or(&[]);
+            if jobs.is_empty() {
+                println!("No jobs.");
+            } else {
+                println!("{:<66}  {:<22}  {:<8}  payer", "JOB ID", "STATUS", "BID");
+                for job in jobs {
+                    let id     = job["job_id"].as_str().unwrap_or("?");
+                    let status = job["status"].as_str().unwrap_or("?");
+                    let bid    = job["bid"].as_u64().unwrap_or(0);
+                    let payer  = job["payer"].as_str().unwrap_or("?");
+                    println!("{id:<66}  {status:<22}  {bid:<8}  {payer}");
+                }
+            }
+        }
+
+        Commands::Kill { job_id, api_port } => {
+            let url = format!("http://127.0.0.1:{api_port}/jobs/{job_id}");
+            let client = reqwest::Client::new();
+            let resp = client.delete(&url).send().await?;
+            if resp.status().is_success() {
+                println!("Job {job_id} stopped.");
+            } else {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("kill failed ({status}): {text}"));
+            }
+        }
+
+        Commands::Fund { to, amount, api_port } => {
+            let url = format!("http://127.0.0.1:{api_port}/transfer");
+            let body = serde_json::json!({ "to": to, "amount": amount });
+            let client = reqwest::Client::new();
+            let resp = client.post(&url).json(&body).send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("fund failed ({status}): {text}"));
+            }
+            let result: serde_json::Value = resp.json().await?;
+            println!("tx_id: {}", result["tx_id"].as_str().unwrap_or("?"));
+        }
+
+        Commands::Run { cell, payload_hex, burn_tx, api_port } => {
+            let url = format!("http://127.0.0.1:{api_port}/signals/send");
+            let mut body = serde_json::json!({
+                "to": cell,
+                "payload_hex": payload_hex,
+                "capabilities": [],
+            });
+            if let Some(burn) = burn_tx {
+                body["burn_tx_id_hex"] = serde_json::Value::String(burn);
+            }
+            let client = reqwest::Client::new();
+            let resp = client.post(&url).json(&body).send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("run failed ({status}): {text}"));
+            }
+            let result: serde_json::Value = resp.json().await?;
+            println!("signal id: {}", result["id"].as_str().unwrap_or("?"));
+            println!("nonce    : {}", result["nonce"].as_u64().unwrap_or(0));
         }
     }
 

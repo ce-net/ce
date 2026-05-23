@@ -75,6 +75,7 @@ Nodes earn credits by staying online and mining blocks. Credits are spent to run
 | `JobSettle` | host (+ payer co-sig) | Confirm job completion, transfer cost (≤ bid) |
 | `JobExpire` | payer | Reclaim locked credits after EXPIRY_BLOCKS (1440) with no settlement |
 | `TrustGrant` | grantor | Record on-chain that grantor trusts grantee as a named device |
+| `Heartbeat` | host | Periodic billing for a running cell: debits cell, credits host |
 
 ### Job lifecycle
 
@@ -149,11 +150,14 @@ See [docs/api.md](docs/api.md) for the complete reference.
 | GET | `/health` | Liveness probe |
 | GET | `/status` | Node ID, chain height, balance |
 | POST | `/jobs/bid` | Broadcast a container job bid |
+| GET | `/jobs` | List all jobs tracked by this node |
 | GET | `/jobs/:id` | Job status (pending/running/awaiting_settlement/settled/failed) |
 | POST | `/jobs/:id/settle` | Payer co-signs the settlement |
 | DELETE | `/jobs/:id` | Force-stop a container |
+| POST | `/transfer` | Transfer credits to another node |
 | GET | `/signals` | Last 100 validated CEP-1 signals |
 | POST | `/signals/send` | Sign and broadcast a CEP-1 signal |
+| GET | `/atlas` | Peer capacity atlas from capacity advertisements |
 | PUT | `/sync/*path` | Upload a file (CE identity auth, must be trusted device) |
 | GET | `/sync/*path` | Download a file (CE identity auth, must be trusted device) |
 | POST | `/exec` | Run a command remotely (CE identity auth, must be trusted device) |
@@ -184,4 +188,13 @@ ce devices ls                       # list registered devices
 ce devices revoke <name>            # remove a device
 ce sync <src> <device:remote-path>  # push files to a trusted device
 ce exec <device> <command...>       # run a command on a trusted device, print output
+
+# Cell economy
+ce deploy <image> [--fund N] [--cpu N] [--mem N] [--duration N]
+                                    # submit a job bid on the local node
+ce ps [--api-port N]                # list all jobs on this node
+ce kill <job-id> [--api-port N]     # force-stop a job
+ce fund <node-id> <credits>         # transfer credits to another node
+ce run <cell-id> [payload-hex] [--burn-tx <tx-id>]
+                                    # send a CEP-1 signal to a cell
 ```

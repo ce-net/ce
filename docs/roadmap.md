@@ -23,13 +23,13 @@ These are the same system viewed from two angles. The same identity primitive th
 | Component | Status | Notes |
 |---|---|---|
 | `ce-identity` | ✅ Complete | Ed25519 keypair, node ID, sign/verify, benchmarks |
-| `ce-chain` | ✅ Complete | Uptime emission, Transfer/UptimeReward/JobBid/JobSettle/JobExpire/TrustGrant, supply cap (21B), halving schedule, credit escrow (locked_balance), tx_by_id, full validation, persistence, tests |
+| `ce-chain` | ✅ Complete | Uptime emission, Transfer/UptimeReward/JobBid/JobSettle/JobExpire/TrustGrant/Heartbeat, supply cap (21B), halving schedule, credit escrow (locked_balance), tx_by_id, last_heartbeat_epoch, full validation, persistence, tests |
 | `ce-mesh` | ✅ Complete | 6 gossip topics, Kademlia DHT, chain sync, CEP-1 signal routing |
 | `ce-protocol` | ✅ Complete | CEP-1 wire format, BurnProof, CellSignal build/verify/encode/decode |
-| `ce-container` | ✅ Complete | gVisor detection, CPU/memory/network limits, image pull, wait-for-exit |
-| `ce-node` | ✅ Complete | Mining loop (10s ticker), mesh event loop, job manager, signal ring buffer, tx pool, nonce replay prevention |
-| HTTP API | ✅ Complete | /jobs/bid, /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /status, /signals, /signals/send, /health, /sync/*, /exec |
-| CLI | ✅ Complete | start, balance, status, id, devices (add/ls/revoke), sync, exec |
+| `ce-container` | ✅ Complete | gVisor detection, CPU/memory/network limits, image pull, wait-for-exit, stop_job |
+| `ce-node` | ✅ Complete | Mining loop, mesh event loop, job manager, heartbeat loop (30s), capacity broadcast (60s), atlas, signal ring buffer, tx pool, nonce replay prevention |
+| HTTP API | ✅ Complete | /jobs/bid, /jobs (list), /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /transfer, /status, /signals, /signals/send, /health, /atlas, /sync/*, /exec |
+| CLI | ✅ Complete | start, balance, status, id, devices (add/ls/revoke), sync, exec, deploy, ps, kill, fund, run |
 | Device registry | ✅ Complete | machines.toml, trusted device management, CE identity auth for sync/exec |
 | `ce-deploy` | ✅ Complete | Hetzner provisioning, SSH deploy, E2E tests |
 | Integration tests | ✅ Complete | single node mines, two nodes sync, tx pool propagates, API health/status, signal propagation, job lifecycle (requires Docker, skipped by default) |
@@ -175,55 +175,51 @@ ce exec desktop cargo build --release
 
 ---
 
-## Phase 3 — Cell economy CLI
+## Phase 3 — Cell economy CLI ✅ Done
 
-This layer makes cells (CEP-1 containers) first-class deployable units from the CLI.
+### 3a. Heartbeat economy ✅ Done
 
-### 3a. Heartbeat economy
+`Heartbeat { cell: NodeId, host: NodeId, amount: u64, epoch: u64 }` added to `TxKind`.
 
-Add `Heartbeat` tx type:
-```rust
-Heartbeat { cell: NodeId, host: NodeId, amount: u64, epoch: u64 }
-```
+The host submits a Heartbeat tx every 30 seconds for each running cell. `amount` is the bid spread evenly over 30-second intervals (`bid / (duration_secs / 30).max(1)`). If the cell's balance cannot cover the next heartbeat, the host terminates the container.
 
-The cell signs its own heartbeat every 30 seconds and pays `amount` to the host from its own wallet. If a cell's wallet reaches zero and it can't afford the next heartbeat, the host terminates the container.
+Chain validation: signed by host, cell != host, epoch strictly increasing per (cell, host) pair, cell balance sufficient. Balance effect: debit cell, credit host.
 
-This replaces the current job-lifetime model for long-running cells. Short batch jobs still use JobBid/JobSettle.
+Short batch jobs still use JobBid/JobSettle; heartbeats are for long-running cells.
 
-### 3b. `ce deploy` for cells
+### 3b. `ce deploy` for cells ✅ Done
 
 ```bash
-ce deploy github.com/user/ollama-cell --fund 1000
-ce deploy docker:ollama/ollama --fund 500
+ce deploy <image> [--fund N] [--cpu N] [--mem N] [--duration N] [--cmd CMD...]
 ```
 
-Steps:
-1. Find cheapest available node via mesh atlas (nodes broadcast capacity)
-2. Submit `JobBid` with the cell image and initial wallet funding
-3. Cell starts, registers its capabilities via capability-only CEP-1 signals
-4. Returns a `CellHandle` (NodeId) you can address signals to
+Submits a `JobBid` on the local node's API (default port 8080). Use `--api-port` to override.
 
-### 3c. Cell management CLI
+### 3c. Cell management CLI ✅ Done
 
 ```bash
-ce ps                          # list your running cells, their balance, capability
-ce fund <cell-id> <credits>    # top up a cell's wallet
-ce kill <cell-id>              # withdraw remaining balance, terminate
-ce run <cell-id> <input>       # send a signal, stream response to stdout
+ce ps [--api-port N]                     # list all jobs on the local node
+ce fund <node-id> <credits> [--api-port N]   # transfer credits to a node via POST /transfer
+ce kill <job-id> [--api-port N]          # force-stop a job via DELETE /jobs/:id
+ce run <cell-id> <payload-hex> [--burn-tx <tx-id>] [--api-port N]   # send a CEP-1 signal
 ```
 
-`ce run` is just:
-```bash
-ce signals send --to <cell-id> --payload "$(echo $input)" | ce signals receive
+### 3d. Capacity advertisement ✅ Done
+
+Nodes broadcast available capacity as a capability-only CEP-1 signal every 60 seconds:
+```
+Capability { name: "cpu",    version: <cpu_cores> }
+Capability { name: "mem_mb", version: <total_mem_mb> }
+Capability { name: "jobs",   version: <running_job_count> }
 ```
 
-The pipe model: `ce deploy github.com/ollama-cell | ce run "what is the meaning of life"`
+Peers cache these in an in-memory atlas (updated by `mesh_event_loop`). The atlas is
+exposed at `GET /atlas`. Use this to find nodes with spare capacity before calling
+`ce deploy`.
 
-### 3d. Capacity advertisement
-
-Nodes broadcast their available capacity (CPU, memory, running cell count) as a capability-only CEP-1 signal every 60 seconds. Other nodes cache this in an atlas.
-
-The atlas is how `ce deploy` finds a host — scan the atlas for nodes with enough capacity and the lowest current load.
+**Not yet implemented**: atlas-guided host selection in `ce deploy` (currently deploys
+to the local node only). The `GET /atlas` endpoint exposes the data; host selection is a
+future enhancement.
 
 ---
 
@@ -260,8 +256,8 @@ No central registry server. No DNS. Pure mesh.
 1. ~~**Fix nonce replay**~~ ✅ Done
 2. ~~**Personal mesh OS** (Phase 2)~~ ✅ Done (core: device registry, sync push, exec; watch + .ceignore + on-chain TrustGrant broadcast planned)
 3. ~~**Credit escrow / JobExpire**~~ ✅ Done
-4. **Heartbeat economy** — enables long-running cells
-5. **Cell deploy CLI** — completes the developer-facing product
+4. ~~**Heartbeat economy**~~ ✅ Done — 30s heartbeat loop, epoch replay prevention, cell wallet exhaustion terminates container
+5. ~~**Cell deploy CLI**~~ ✅ Done — `ce deploy`, `ce ps`, `ce kill`, `ce fund`, `ce run`, `GET /jobs`, `POST /transfer`, `GET /atlas`
 6. **Chain checkpoints** — needed before public launch
 7. **Bootstrap / multi-provider deploy** — launch infrastructure
 

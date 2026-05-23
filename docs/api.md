@@ -169,6 +169,70 @@ or a raw Docker container ID.
 
 ---
 
+## GET /jobs
+
+List all jobs tracked by this node (both as payer and as host).
+
+**Response** `200 OK`
+```json
+[
+  {
+    "job_id": "a3f2...",
+    "status": "running",
+    "payer": "8f3a...",
+    "container_id": "abc123...",
+    "cost": null,
+    "bid": 1000
+  }
+]
+```
+
+---
+
+## POST /transfer
+
+Transfer credits from this node to another node. Builds a `Transfer` tx, adds it to the pool, and broadcasts it on the mesh.
+
+**Request body**
+```json
+{ "to": "<64 hex chars>", "amount": 500 }
+```
+
+**Response** `201 Created`
+```json
+{ "tx_id": "<64 hex chars>" }
+```
+
+**Error responses**
+
+| Code | Meaning |
+|---|---|
+| 400 Bad Request | Invalid `to` format or `amount == 0` |
+| 402 Payment Required | Sender balance is insufficient |
+
+---
+
+## GET /atlas
+
+Return the capacity atlas: the latest capacity snapshot received from each peer via CEP-1 capacity signals.
+
+Nodes broadcast capacity every 60 seconds with capabilities `{name: "cpu", version: N}`, `{name: "mem_mb", version: N}`, `{name: "jobs", version: N}`.
+
+**Response** `200 OK`
+```json
+[
+  {
+    "node_id": "a3f2...",
+    "cpu_cores": 8,
+    "mem_mb": 16384,
+    "running_jobs": 3,
+    "last_seen_secs": 1716470400
+  }
+]
+```
+
+---
+
 ## GET /signals
 
 Returns the last 100 validated CEP-1 signals seen by this node (newest at the end).

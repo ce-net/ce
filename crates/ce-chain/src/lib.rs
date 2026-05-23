@@ -64,6 +64,10 @@ pub enum TxKind {
     /// Trust grant: records that `grantor` trusts `grantee` as a named device.
     /// Used by the personal mesh OS layer for authenticated sync and exec.
     TrustGrant { grantor: NodeId, grantee: NodeId, label: String },
+    /// Periodic heartbeat payment for a long-running cell.
+    /// Signed by the host; debits the cell's wallet and credits the host.
+    /// `epoch` must strictly increase per (cell, host) pair to prevent replay.
+    Heartbeat { cell: NodeId, host: NodeId, amount: u64, epoch: u64 },
 }
 
 /// Canonical bytes the payer signs to authorize a settlement of `cost` against `job_id`.
@@ -379,6 +383,44 @@ impl Chain {
                 }
             }
         }
+        // Heartbeat rules.
+        {
+            // Track highest epoch seen per (cell, host) pair within this block,
+            // so multiple heartbeats in one block each get a strictly increasing epoch.
+            let mut in_block_epochs: std::collections::HashMap<(NodeId, NodeId), u64> =
+                std::collections::HashMap::new();
+            let mut heartbeat_debits: std::collections::HashMap<NodeId, u64> =
+                std::collections::HashMap::new();
+            for tx in &block.transactions {
+                if let TxKind::Heartbeat { cell, host, amount, epoch } = &tx.kind {
+                    // Must be signed by the host.
+                    if &tx.origin != host {
+                        return false;
+                    }
+                    // No self-pay.
+                    if cell == host {
+                        return false;
+                    }
+                    // Epoch must be strictly greater than the last confirmed for this pair.
+                    let chain_last = self.last_heartbeat_epoch(cell, host);
+                    let in_block_last = in_block_epochs.get(&(*cell, *host)).copied();
+                    let last = in_block_last.or(chain_last);
+                    if let Some(prev) = last {
+                        if *epoch <= prev {
+                            return false;
+                        }
+                    }
+                    in_block_epochs.insert((*cell, *host), *epoch);
+                    // Cell balance must cover the heartbeat.
+                    let prior_balance = self.balance(cell);
+                    let accumulated = *heartbeat_debits.get(cell).unwrap_or(&0) as i64;
+                    if prior_balance - accumulated < *amount as i64 {
+                        return false;
+                    }
+                    *heartbeat_debits.entry(*cell).or_insert(0) += amount;
+                }
+            }
+        }
         self.blocks.push(block);
         true
     }
@@ -401,6 +443,10 @@ impl Chain {
                     TxKind::JobSettle { host, payer, cost, .. } => {
                         if payer == node { bal -= *cost as i64; }
                         if host == node { bal += *cost as i64; }
+                    }
+                    TxKind::Heartbeat { cell, host, amount, .. } => {
+                        if cell == node { bal -= *amount as i64; }
+                        if host == node { bal += *amount as i64; }
                     }
                     // JobExpire and TrustGrant have no direct balance effect.
                     TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => {}
@@ -431,6 +477,25 @@ impl Chain {
                 }
             })
             .sum()
+    }
+
+    /// Highest confirmed Heartbeat epoch for a given (cell, host) pair across all blocks.
+    /// Returns None if no Heartbeat has been confirmed for this pair yet.
+    pub fn last_heartbeat_epoch(&self, cell: &NodeId, host: &NodeId) -> Option<u64> {
+        let mut max_epoch: Option<u64> = None;
+        for block in &self.blocks {
+            for tx in &block.transactions {
+                if let TxKind::Heartbeat { cell: c, host: h, epoch, .. } = &tx.kind {
+                    if c == cell && h == host {
+                        max_epoch = Some(match max_epoch {
+                            Some(m) => m.max(*epoch),
+                            None => *epoch,
+                        });
+                    }
+                }
+            }
+        }
+        max_epoch
     }
 
     /// Linear scan of all blocks for a transaction with the given id.
@@ -1081,6 +1146,124 @@ mod tests {
         let mut block = chain.next_block(vec![reward, tg], grantor.node_id());
         block.seal(&grantor);
         assert!(chain.append(block), "valid TrustGrant must be accepted");
+    }
+
+    fn signed_heartbeat(host: &Identity, cell_id: NodeId, amount: u64, epoch: u64) -> Tx {
+        let kind = TxKind::Heartbeat { cell: cell_id, host: host.node_id(), amount, epoch };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = host.sign(&data);
+        Tx::new(kind, host.node_id(), sig)
+    }
+
+    #[test]
+    fn heartbeat_happy_path() {
+        let host = make_identity("hb-host");
+        let cell = make_identity("hb-cell");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &cell, 1_000);
+
+        let hb = signed_heartbeat(&host, cell.node_id(), 100, 0);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, hb], host.node_id());
+        block.seal(&host);
+        assert!(chain.append(block), "valid heartbeat must be accepted");
+        assert_eq!(chain.balance(&cell.node_id()), 1_000 - 100);
+        assert_eq!(chain.last_heartbeat_epoch(&cell.node_id(), &host.node_id()), Some(0));
+    }
+
+    #[test]
+    fn heartbeat_rejects_replay() {
+        let host = make_identity("hb-replay-host");
+        let cell = make_identity("hb-replay-cell");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &cell, 1_000);
+
+        let hb = signed_heartbeat(&host, cell.node_id(), 100, 5);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, hb], host.node_id());
+        block.seal(&host);
+        assert!(chain.append(block));
+
+        // Replay: same epoch must be rejected.
+        let hb2 = signed_heartbeat(&host, cell.node_id(), 100, 5);
+        let reward2 = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block2 = chain.next_block(vec![reward2, hb2], host.node_id());
+        block2.seal(&host);
+        assert!(!chain.append(block2), "replayed heartbeat epoch must be rejected");
+
+        // Earlier epoch also rejected.
+        let hb3 = signed_heartbeat(&host, cell.node_id(), 100, 3);
+        let reward3 = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block3 = chain.next_block(vec![reward3, hb3], host.node_id());
+        block3.seal(&host);
+        assert!(!chain.append(block3), "earlier epoch must be rejected");
+
+        // Strictly higher epoch accepted.
+        let hb4 = signed_heartbeat(&host, cell.node_id(), 100, 6);
+        let reward4 = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block4 = chain.next_block(vec![reward4, hb4], host.node_id());
+        block4.seal(&host);
+        assert!(chain.append(block4), "higher epoch must be accepted");
+    }
+
+    #[test]
+    fn heartbeat_rejects_insufficient_balance() {
+        let host = make_identity("hb-poor-host");
+        let cell = make_identity("hb-poor-cell");
+        let mut chain = Chain::genesis();
+        // cell has no balance
+
+        let hb = signed_heartbeat(&host, cell.node_id(), 100, 0);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, hb], host.node_id());
+        block.seal(&host);
+        assert!(!chain.append(block), "heartbeat with insufficient cell balance must be rejected");
+    }
+
+    #[test]
+    fn heartbeat_rejects_self_pay() {
+        let host = make_identity("hb-self");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &host, 1_000);
+
+        // host == cell: forbidden
+        let kind = TxKind::Heartbeat {
+            cell: host.node_id(),
+            host: host.node_id(),
+            amount: 100,
+            epoch: 0,
+        };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = host.sign(&data);
+        let bad_hb = Tx::new(kind, host.node_id(), sig);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, bad_hb], host.node_id());
+        block.seal(&host);
+        assert!(!chain.append(block), "heartbeat self-pay must be rejected");
+    }
+
+    #[test]
+    fn heartbeat_rejects_wrong_signer() {
+        let host = make_identity("hb-ws-host");
+        let cell = make_identity("hb-ws-cell");
+        let attacker = make_identity("hb-attacker");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &cell, 1_000);
+
+        // Attacker submits heartbeat claiming to be host, but signs as attacker.
+        let kind = TxKind::Heartbeat {
+            cell: cell.node_id(),
+            host: host.node_id(),
+            amount: 100,
+            epoch: 0,
+        };
+        let data = bincode::serialize(&kind).unwrap();
+        let bad_sig = attacker.sign(&data);
+        let bad_hb = Tx::new(kind, attacker.node_id(), bad_sig);
+        let reward = signed_uptime_reward(&attacker, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, bad_hb], attacker.node_id());
+        block.seal(&attacker);
+        assert!(!chain.append(block), "heartbeat with wrong signer must be rejected");
     }
 
     #[test]

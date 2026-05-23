@@ -78,5 +78,5 @@ start
 | Tx authenticity | Every tx signed by origin node; chain validates before accepting |
 | Block integrity | Ed25519 block seal; chain validates prev_hash, index, tx sigs, emission amount |
 | Ledger consensus | First valid chain wins currently; honest majority > 50% required |
-| Replay prevention | CellSignal carries monotone nonce per sender |
-| Credit enforcement | No credits → API returns 402 before touching Docker |
+| Replay prevention | CellSignal carries monotone nonce per sender; Heartbeat epoch strictly increases per (cell, host) |
+| Credit enforcement | No credits → API returns 402 before touching Docker; cell wallet exhaustion → host terminates container |

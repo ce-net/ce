@@ -44,6 +44,13 @@ Run with `cargo test --workspace`. These are fast (sub-second) and test logic in
 - `save_and_load_roundtrip` — JSON persistence
 - `load_or_genesis_returns_genesis_when_missing` — missing file fallback
 
+### ce-chain Heartbeat tests
+- `heartbeat_happy_path` — host emits heartbeat, cell balance debited, epoch recorded
+- `heartbeat_rejects_replay` — same or earlier epoch rejected; higher epoch accepted
+- `heartbeat_rejects_insufficient_balance` — cell with zero balance cannot be billed
+- `heartbeat_rejects_self_pay` — host == cell forbidden
+- `heartbeat_rejects_wrong_signer` — heartbeat must be signed by the named host
+
 ### ce-protocol tests
 - `roundtrip_and_verify` — build, encode, decode, verify
 - `requires_burn` — flags payload-without-burn-proof

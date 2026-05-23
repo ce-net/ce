@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 use bollard::{container::RemoveContainerOptions, Docker};
+use bincode;
 use ce_chain::{payer_settle_bytes, Chain};
 use ce_identity::{verify, Identity, NodeId};
 use ce_mesh::MeshHandle;
@@ -23,7 +24,7 @@ use std::{
 };
 use tokio::sync::{mpsc, Mutex};
 
-use crate::{CeJobStatus, JobRecord, JobStore, SignalRing, TxPool};
+use crate::{Atlas, CeJobStatus, JobRecord, JobStore, PeerCapacity, SignalRing, TxPool};
 
 /// Per-sender last-accepted timestamp (ms). Used to enforce strictly increasing
 /// nonces and close replay attacks within the 5-minute freshness window.
@@ -46,6 +47,8 @@ struct ApiState {
     data_dir: PathBuf,
     /// Anti-replay: last accepted timestamp per sender NodeId.
     nonce_cache: NonceCache,
+    /// Peer capacity atlas updated by incoming capacity signals.
+    atlas: Atlas,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,6 +145,8 @@ async fn bid_job(
                 status: CeJobStatus::Pending,
                 payer_sig: None,
                 cost: None,
+                bid: req.bid,
+                duration_secs: req.duration_secs,
             },
         );
     }
@@ -441,6 +446,7 @@ fn tx_value(tx: &ce_chain::Tx) -> Option<u64> {
         TxKind::UptimeReward { amount, .. } => Some(*amount),
         TxKind::JobBid { bid, .. } => Some(*bid),
         TxKind::JobSettle { cost, .. } => Some(*cost),
+        TxKind::Heartbeat { amount, .. } => Some(*amount),
         TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => None,
     }
 }
@@ -690,6 +696,92 @@ async fn exec_command(State(state): State<ApiState>, headers: HeaderMap, req: Re
     }
 }
 
+// ----- GET /jobs -----
+
+#[derive(Debug, Serialize)]
+struct JobListItem {
+    job_id: String,
+    status: String,
+    payer: String,
+    container_id: Option<String>,
+    cost: Option<u64>,
+    bid: u64,
+}
+
+async fn list_jobs(State(state): State<ApiState>) -> Response {
+    let store = state.job_store.lock().await;
+    let jobs: Vec<JobListItem> = store
+        .values()
+        .map(|r| JobListItem {
+            job_id: hex::encode(r.job_id),
+            status: status_string(&r.status),
+            payer: hex::encode(r.payer),
+            container_id: r.container_id.clone(),
+            cost: r.cost,
+            bid: r.bid,
+        })
+        .collect();
+    (StatusCode::OK, Json(jobs)).into_response()
+}
+
+// ----- POST /transfer -----
+
+#[derive(Debug, Deserialize)]
+pub struct TransferRequest {
+    /// Recipient NodeId as 64 hex chars.
+    pub to: String,
+    pub amount: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TransferResponse {
+    tx_id: String,
+}
+
+async fn transfer(State(state): State<ApiState>, Json(req): Json<TransferRequest>) -> Response {
+    let to: NodeId = match hex::decode(&req.to).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "`to` must be 64 hex chars"),
+    };
+    if req.amount == 0 {
+        return err(StatusCode::BAD_REQUEST, "amount must be > 0");
+    }
+    let from = state.identity.node_id();
+    let balance = state.chain.lock().await.balance(&from);
+    if balance < req.amount as i64 {
+        return err(
+            StatusCode::PAYMENT_REQUIRED,
+            format!("balance {balance} insufficient for transfer {}", req.amount),
+        );
+    }
+    let kind = ce_chain::TxKind::Transfer { from, to, amount: req.amount };
+    let data = bincode::serialize(&kind).expect("serialize Transfer");
+    let sig = state.identity.sign(&data);
+    let tx = ce_chain::Tx::new(kind, from, sig);
+    let tx_id = hex::encode(tx.id());
+    state.pool.add(tx.clone()).await;
+    let _ = state.mesh_handle.broadcast_tx(&tx).await;
+    (StatusCode::CREATED, Json(TransferResponse { tx_id })).into_response()
+}
+
+// ----- GET /atlas -----
+
+#[derive(Debug, Serialize)]
+struct AtlasEntry {
+    node_id: String,
+    #[serde(flatten)]
+    capacity: PeerCapacity,
+}
+
+async fn get_atlas(State(state): State<ApiState>) -> Response {
+    let map = state.atlas.lock().await;
+    let entries: Vec<AtlasEntry> = map
+        .iter()
+        .map(|(node_id, cap)| AtlasEntry { node_id: hex::encode(node_id), capacity: cap.clone() })
+        .collect();
+    (StatusCode::OK, Json(entries)).into_response()
+}
+
 // ----- Router -----
 
 #[allow(clippy::too_many_arguments)]
@@ -704,6 +796,7 @@ pub async fn start(
     pool: TxPool,
     settle_notify_tx: mpsc::Sender<()>,
     data_dir: PathBuf,
+    atlas: Atlas,
 ) -> Result<()> {
     let docker = Docker::connect_with_socket_defaults().ok();
     if docker.is_none() {
@@ -724,17 +817,21 @@ pub async fn start(
         settle_notify_tx,
         data_dir,
         nonce_cache,
+        atlas,
     };
 
     let app = Router::new()
         .route("/jobs/bid", post(bid_job))
+        .route("/jobs", get(list_jobs))
         .route("/jobs/:id", get(job_status))
         .route("/jobs/:id/settle", post(settle_job))
         .route("/jobs/:id", delete(stop_job))
+        .route("/transfer", post(transfer))
         .route("/status", get(node_status))
         .route("/signals", get(list_signals))
         .route("/signals/send", post(send_signal))
         .route("/health", get(|| async { "ok" }))
+        .route("/atlas", get(get_atlas))
         // Personal mesh OS: authenticated file sync and remote exec.
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))

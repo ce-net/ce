@@ -109,6 +109,15 @@ impl ContainerManager {
         wait_for_exit_impl(&self.docker, container_id).await
     }
 
+    /// Force-remove a running container (used when a cell's wallet is exhausted).
+    pub async fn stop_job(&self, container_id: &str) -> Result<()> {
+        use bollard::container::RemoveContainerOptions;
+        self.docker
+            .remove_container(container_id, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+            .await?;
+        Ok(())
+    }
+
     /// Runs the metering loop indefinitely. Call this in a spawned task.
     pub async fn run(self, reading_tx: mpsc::Sender<MeterReading>) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(METERING_INTERVAL_SECS));
