@@ -1,9 +1,10 @@
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    body::Body,
+    extract::{Path, Request, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use bollard::{container::RemoveContainerOptions, Docker};
@@ -14,6 +15,7 @@ use ce_protocol::{BurnProof, Capability, CellAddress, CellSignal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    path::PathBuf,
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -35,6 +37,8 @@ struct ApiState {
     pool: TxPool,
     /// Poke the job manager to check for newly-signed settlements immediately.
     settle_notify_tx: mpsc::Sender<()>,
+    /// CE data directory; used to load devices.toml for sync/exec auth.
+    data_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -430,6 +434,235 @@ fn tx_value(tx: &ce_chain::Tx) -> Option<u64> {
         TxKind::UptimeReward { amount, .. } => Some(*amount),
         TxKind::JobBid { bid, .. } => Some(*bid),
         TxKind::JobSettle { cost, .. } => Some(*cost),
+        TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => None,
+    }
+}
+
+// ----- Device auth -----
+
+/// Canonical bytes the client signs for authenticated sync/exec requests.
+/// scheme: b"ce-auth-v1" SP method SP path SP timestamp_le_u64
+fn auth_bytes(method: &str, path: &str, timestamp_ms: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"ce-auth-v1 ");
+    buf.extend_from_slice(method.as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(path.as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(&timestamp_ms.to_le_bytes());
+    buf
+}
+
+/// Extract and verify CE device auth headers. Returns the verified sender NodeId on success.
+/// Headers: X-CE-From (64 hex), X-CE-Timestamp (unix ms u64), X-CE-Sig (128 hex).
+fn verify_device_auth(
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+    data_dir: &std::path::Path,
+) -> Result<NodeId, Response> {
+    let from_hex = headers
+        .get("x-ce-from")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing X-CE-From"))?;
+    let ts_str = headers
+        .get("x-ce-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing X-CE-Timestamp"))?;
+    let sig_hex = headers
+        .get("x-ce-sig")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing X-CE-Sig"))?;
+
+    let from_bytes = hex::decode(from_hex)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad X-CE-From"))?;
+    let from: NodeId = from_bytes
+        .try_into()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "X-CE-From must be 64 hex chars"))?;
+
+    let ts_ms: u64 = ts_str
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad X-CE-Timestamp"))?;
+
+    let sig_bytes = hex::decode(sig_hex)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad X-CE-Sig"))?;
+    let sig: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "X-CE-Sig must be 128 hex chars"))?;
+
+    // Timestamp must be within ±5 minutes of server time.
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let diff = now_ms.abs_diff(ts_ms);
+    if diff > 5 * 60 * 1000 {
+        return Err(err(StatusCode::UNAUTHORIZED, "X-CE-Timestamp out of range"));
+    }
+
+    let bytes = auth_bytes(method, path, ts_ms);
+    verify(&from, &bytes, &sig)
+        .map_err(|_| err(StatusCode::UNAUTHORIZED, "invalid CE signature"))?;
+
+    let devices = crate::devices::Devices::load_or_empty(&data_dir.join("machines.toml"));
+    if !devices.is_trusted(&from) {
+        return Err(err(StatusCode::FORBIDDEN, "sender is not a trusted device"));
+    }
+
+    Ok(from)
+}
+
+// ----- PUT /sync/*path -----
+
+async fn sync_put(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    req: Request,
+) -> Response {
+    let path = req.uri().path().to_string();
+    if let Err(resp) = verify_device_auth(&headers, "PUT", &path, &state.data_dir) {
+        return resp;
+    }
+
+    // Strip the leading "/sync/" prefix to get the relative path.
+    let rel = req.uri().path().trim_start_matches("/sync/");
+    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let target = home.join(rel);
+
+    // Prevent path traversal outside the home directory.
+    let canonical_home = home.canonicalize().unwrap_or(home.clone());
+    let canonical_target = match target.parent() {
+        Some(p) => {
+            let _ = std::fs::create_dir_all(p);
+            match target.canonicalize().ok().or_else(|| {
+                p.canonicalize().ok().map(|cp| cp.join(target.file_name().unwrap_or_default()))
+            }) {
+                Some(c) => c,
+                None => return err(StatusCode::BAD_REQUEST, "cannot resolve target path"),
+            }
+        }
+        None => return err(StatusCode::BAD_REQUEST, "invalid path"),
+    };
+    if !canonical_target.starts_with(&canonical_home) {
+        return err(StatusCode::BAD_REQUEST, "path traversal not allowed");
+    }
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 256 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("read body: {e}")),
+    };
+
+    if let Some(parent) = canonical_target.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}"));
+        }
+    }
+    if let Err(e) = std::fs::write(&canonical_target, &body_bytes) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"));
+    }
+
+    tracing::info!("sync PUT {} ({} bytes)", canonical_target.display(), body_bytes.len());
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ----- GET /sync/*path -----
+
+async fn sync_get(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    req: Request,
+) -> Response {
+    let path = req.uri().path().to_string();
+    if let Err(resp) = verify_device_auth(&headers, "GET", &path, &state.data_dir) {
+        return resp;
+    }
+
+    let rel = req.uri().path().trim_start_matches("/sync/");
+    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let target = home.join(rel);
+    let canonical_home = home.canonicalize().unwrap_or(home.clone());
+    let canonical_target = match target.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return err(StatusCode::NOT_FOUND, "file not found"),
+    };
+    if !canonical_target.starts_with(&canonical_home) {
+        return err(StatusCode::BAD_REQUEST, "path traversal not allowed");
+    }
+
+    let data = match std::fs::read(&canonical_target) {
+        Ok(d) => d,
+        Err(_) => return err(StatusCode::NOT_FOUND, "file not found"),
+    };
+
+    (StatusCode::OK, Body::from(data)).into_response()
+}
+
+// ----- POST /exec -----
+
+#[derive(Debug, Deserialize)]
+pub struct ExecRequest {
+    /// Command to run, e.g. ["cargo", "build", "--release"].
+    pub cmd: Vec<String>,
+    /// Working directory (relative to home dir or absolute). Defaults to home.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecResponse {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+async fn exec_command(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ExecRequest>,
+) -> Response {
+    // Build the path string for auth (fixed, not from URI since body carries the command).
+    let path = "/exec";
+    if let Err(resp) = verify_device_auth(&headers, "POST", path, &state.data_dir) {
+        return resp;
+    }
+
+    if req.cmd.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "cmd must not be empty");
+    }
+
+    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let cwd = match &req.cwd {
+        Some(c) => {
+            let p = if c.starts_with('~') {
+                home.join(c.trim_start_matches("~/").trim_start_matches('~'))
+            } else {
+                PathBuf::from(c)
+            };
+            p
+        }
+        None => home,
+    };
+
+    let result = tokio::process::Command::new(&req.cmd[0])
+        .args(&req.cmd[1..])
+        .current_dir(&cwd)
+        .output()
+        .await;
+
+    match result {
+        Ok(output) => {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            tracing::info!(
+                "exec {:?} in {} → exit {}",
+                req.cmd,
+                cwd.display(),
+                exit_code
+            );
+            (StatusCode::OK, Json(ExecResponse { stdout, stderr, exit_code })).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("exec failed: {e}")),
     }
 }
 
@@ -446,6 +679,7 @@ pub async fn start(
     job_store: JobStore,
     pool: TxPool,
     settle_notify_tx: mpsc::Sender<()>,
+    data_dir: PathBuf,
 ) -> Result<()> {
     let docker = Docker::connect_with_socket_defaults().ok();
     if docker.is_none() {
@@ -463,6 +697,7 @@ pub async fn start(
         job_store,
         pool,
         settle_notify_tx,
+        data_dir,
     };
 
     let app = Router::new()
@@ -474,6 +709,9 @@ pub async fn start(
         .route("/signals", get(list_signals))
         .route("/signals/send", post(send_signal))
         .route("/health", get(|| async { "ok" }))
+        // Personal mesh OS: authenticated file sync and remote exec.
+        .route("/sync/*path", put(sync_put).get(sync_get))
+        .route("/exec", post(exec_command))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");

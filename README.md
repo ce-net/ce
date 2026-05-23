@@ -71,8 +71,10 @@ Nodes earn credits by staying online and mining blocks. Credits are spent to run
 |---|---|---|
 | `Transfer` | sender | Move credits between nodes |
 | `UptimeReward` | miner | Mint credits for the block producer |
-| `JobBid` | payer | Broadcast an open offer for compute |
-| `JobSettle` | host (+ payer co-sig) | Confirm job completion, transfer cost |
+| `JobBid` | payer | Broadcast an open offer for compute; `bid` credits are locked |
+| `JobSettle` | host (+ payer co-sig) | Confirm job completion, transfer cost (≤ bid) |
+| `JobExpire` | payer | Reclaim locked credits after EXPIRY_BLOCKS (1440) with no settlement |
+| `TrustGrant` | grantor | Record on-chain that grantor trusts grantee as a named device |
 
 ### Job lifecycle
 
@@ -152,6 +154,9 @@ See [docs/api.md](docs/api.md) for the complete reference.
 | DELETE | `/jobs/:id` | Force-stop a container |
 | GET | `/signals` | Last 100 validated CEP-1 signals |
 | POST | `/signals/send` | Sign and broadcast a CEP-1 signal |
+| PUT | `/sync/*path` | Upload a file (CE identity auth, must be trusted device) |
+| GET | `/sync/*path` | Download a file (CE identity auth, must be trusted device) |
+| POST | `/exec` | Run a command remotely (CE identity auth, must be trusted device) |
 
 ## Data Directory
 
@@ -172,4 +177,11 @@ ce start [--port 4001] [--api-port 8080] [--bootstrap <multiaddr>]
 ce status
 ce balance
 ce id
+
+# Personal mesh OS
+ce devices add <name>               # register a trusted device (prompts for node ID + addr)
+ce devices ls                       # list registered devices
+ce devices revoke <name>            # remove a device
+ce sync <src> <device:remote-path>  # push files to a trusted device
+ce exec <device> <command...>       # run a command on a trusted device, print output
 ```

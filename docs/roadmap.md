@@ -23,60 +23,42 @@ These are the same system viewed from two angles. The same identity primitive th
 | Component | Status | Notes |
 |---|---|---|
 | `ce-identity` | ✅ Complete | Ed25519 keypair, node ID, sign/verify, benchmarks |
-| `ce-chain` | ✅ Complete | Uptime emission, Transfer/UptimeReward/JobBid/JobSettle, supply cap (21B), halving schedule, tx_by_id, full validation, persistence, tests |
+| `ce-chain` | ✅ Complete | Uptime emission, Transfer/UptimeReward/JobBid/JobSettle/JobExpire/TrustGrant, supply cap (21B), halving schedule, credit escrow (locked_balance), tx_by_id, full validation, persistence, tests |
 | `ce-mesh` | ✅ Complete | 6 gossip topics, Kademlia DHT, chain sync, CEP-1 signal routing |
 | `ce-protocol` | ✅ Complete | CEP-1 wire format, BurnProof, CellSignal build/verify/encode/decode |
 | `ce-container` | ✅ Complete | gVisor detection, CPU/memory/network limits, image pull, wait-for-exit |
-| `ce-node` | ✅ Complete | Mining loop (10s ticker), mesh event loop, job manager, signal ring buffer, tx pool |
-| HTTP API | ✅ Complete | /jobs/bid, /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /status, /signals, /signals/send, /health |
-| CLI | ✅ Partial | start, balance, status, id |
+| `ce-node` | ✅ Complete | Mining loop (10s ticker), mesh event loop, job manager, signal ring buffer, tx pool, nonce replay prevention |
+| HTTP API | ✅ Complete | /jobs/bid, /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /status, /signals, /signals/send, /health, /sync/*, /exec |
+| CLI | ✅ Complete | start, balance, status, id, devices (add/ls/revoke), sync, exec |
+| Device registry | ✅ Complete | machines.toml, trusted device management, CE identity auth for sync/exec |
 | `ce-deploy` | ✅ Complete | Hetzner provisioning, SSH deploy, E2E tests |
 | Integration tests | ✅ Complete | single node mines, two nodes sync, tx pool propagates, API health/status, signal propagation, job lifecycle (requires Docker, skipped by default) |
 
-The foundation — identity, chain, mesh, protocol, containers, job economy — is fully implemented and tested. The system can mine blocks, earn credits, accept jobs from other nodes, run containers in gVisor, settle on-chain, and route CEP-1 signals across the mesh.
+The foundation — identity, chain, mesh, protocol, containers, job economy — is fully implemented and tested. The system can mine blocks, earn credits, accept jobs from other nodes, run containers in gVisor, settle on-chain, route CEP-1 signals, sync files between trusted devices, and execute remote commands.
 
 ### Known gaps and correctness issues
 
-**Nonce replay prevention** — CEP-1 signals carry a monotone nonce but `ce-node` doesn't track last-seen nonce per sender. Replay attacks on signals are currently possible. Fix: `HashMap<NodeId, u64>` in the mesh event loop, reject signals where `nonce <= last_seen`.
-
 **Fork selection** — `Chain::append` uses first-wins. If two nodes mine simultaneously and then each receives the other's block, whichever arrived first stays. No longest-chain rule. Fix: in `mesh_event_loop`, on `NewBlock`, compare against current tip and replace if the incoming chain would be longer (needs a reorg function).
 
-**JobBid credits not locked** — A payer can submit a bid, then spend those credits elsewhere before the job settles. The chain's balance check in `JobSettle` catches it at settle time (rejects the settle if balance insufficient), but the host has already done the work. Fix: track `locked_balance` per node for open bids; debit at bid time, credit back on settle or expire. Add `JobExpire` tx type with a block-height timeout.
-
 **`difficulty` field is vestigial** — Always 0. Kept for forward compatibility. Fine for now.
+
+**`ce sync --watch` not yet implemented** — Directory watching (inotify/fsevents via the `notify` crate) is planned but not yet built. Use periodic `ce sync` for now.
+
+**`.ceignore` format not yet implemented** — Sync skips a hardcoded set of default patterns (`target/`, `node_modules/`, `.git/objects/`, `*.pyc`, `__pycache__/`, `.DS_Store`). Full `.ceignore` file support (using the `ignore` crate) is planned.
+
+**TrustGrant not broadcast on mesh** — `ce devices add` stores the trust relationship locally in `machines.toml`. Broadcasting a `TrustGrant` tx to the mesh (so other nodes can discover trust) is planned but not yet wired to the CLI.
 
 ---
 
 ## Phase 1 — Chain hardening
 
-These close the correctness gaps in the existing economy before building on top.
+### 1a. Nonce replay prevention ✅ Done
 
-### 1a. Nonce replay prevention
+`HashMap<NodeId, u64>` in `mesh_event_loop`; signals with `nonce <= last_seen` are dropped with a warning.
 
-In `ce-node/src/lib.rs`, `mesh_event_loop`, add:
+### 1b. Credit escrow for JobBid ✅ Done
 
-```rust
-let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
-// ... in CellSignal handler:
-if let Some(&prev) = last_nonce.get(&signal.from) {
-    if signal.nonce <= prev {
-        warn!("dropping replay: nonce {} <= {}", signal.nonce, prev);
-        continue;
-    }
-}
-last_nonce.insert(signal.from, signal.nonce);
-```
-
-### 1b. Credit escrow for JobBid
-
-Add `locked_balance: HashMap<NodeId, u64>` to `Chain`. When a `JobBid` is appended, lock `bid` credits from payer. When `JobSettle` is confirmed, release to host. When `JobExpire` is confirmed, release back to payer.
-
-New tx type:
-```rust
-JobExpire { job_id: [u8; 32], payer: NodeId }
-```
-
-Chain validation: `JobExpire` is only valid if no `JobSettle` exists for `job_id` and current block height > bid_block + EXPIRY_BLOCKS (e.g., 144 blocks ≈ 24 hours at 10min/block, or ~1440 at 10s/block).
+`Chain::locked_balance(node)` computes credits locked in open bids (no matching `JobSettle` or `JobExpire`). `Chain::append` validates that the payer's free balance (`balance - locked_balance`) covers each new bid; settle cost must not exceed the original bid. `JobExpire { job_id, payer }` releases locked credits once `EXPIRY_BLOCKS = 1440` have elapsed with no settlement.
 
 ### 1c. Chain checkpoints
 
@@ -96,67 +78,46 @@ pub struct Checkpoint {
 
 ## Phase 2 — Personal mesh OS
 
-This is the "connect your own computers" layer. Builds entirely on existing identity and mesh primitives — no new chain logic needed.
+### 2a. Machine registry ✅ Done
 
-### 2a. Machine registry
-
-`~/.ce/machines.toml`:
+`~/.local/share/ce/machines.toml` (or `--data-dir` override):
 ```toml
-[devices]
-desktop = "8f3a9b..."   # NodeId hex
-laptop  = "2d91fc..."
-server  = "a441e2..."
+[devices.desktop]
+node_id = "8f3a9b..."
+addr    = "192.168.1.10:8080"
 ```
 
-CLI commands:
+CLI commands implemented:
 ```
-ce devices add <name>          # trust a device (prompts for its public key)
-ce devices ls                  # list registered machines with online status
-ce devices revoke <name>       # remove trust, broadcast revocation
-```
-
-Devices are added by signing their NodeId with your master key. The trust relationship is broadcast on the mesh and recorded on-chain (new tx type: `TrustGrant { grantor: NodeId, grantee: NodeId, label: String }`).
-
-### 2b. Authenticated file transfer endpoint
-
-New endpoint in `ce-node/src/api.rs`:
-
-```
-PUT  /sync/<path>   — receive file chunks, verify sender is in trusted devices
-GET  /sync/<path>   — serve file, verify requester is in trusted devices
+ce devices add <name>          # prompts for node ID and API address
+ce devices ls                  # list registered devices
+ce devices revoke <name>       # remove trust
 ```
 
-Auth: standard CE identity — request is signed by the sender's node key. Receiver checks against its machine registry. No additional auth layer needed.
+The chain supports `TrustGrant { grantor, grantee, label }` tx type (validated and signed by grantor). Broadcasting `TrustGrant` from the CLI is planned — currently devices are stored locally only.
+
+### 2b. Authenticated file transfer endpoint ✅ Done
+
+```
+PUT  /sync/*path   — receive file, verify sender is in trusted devices
+GET  /sync/*path   — serve file, verify requester is in trusted devices
+```
+
+Auth: requests are signed with the sender's CE identity key using `X-CE-From`, `X-CE-Timestamp`, `X-CE-Sig` headers. Receiver validates signature and checks sender against `machines.toml`.
 
 ### 2c. `.ceignore` format
 
-Like `.gitignore`. Patterns for paths to skip during sync. Defaults include:
-```
-target/
-node_modules/
-.git/objects/
-*.pyc
-__pycache__/
-.DS_Store
-```
+Hardcoded default ignores are applied during `ce sync` (`target/`, `node_modules/`, `.git/objects/`, `*.pyc`, `__pycache__/`, `.DS_Store`). Full `.ceignore` file support via the `ignore` crate is planned.
 
-Parser: use the `ignore` crate (already common in Rust ecosystem).
-
-### 2d. CLI commands
+### 2d. CLI commands ✅ Done (sync push + exec; --watch planned)
 
 ```
-ce sync <src> <dst>            # e.g. ce sync . desktop:~/code/ce
-ce sync --watch <src> <dst>    # inotify/fsevents, sync on save
-ce exec <machine> <command>    # run remotely, stream stdout/stderr back
+ce sync <src> <dst>            # e.g. ce sync . desktop:~/code/ce  (push)
+ce sync --watch <src> <dst>    # planned: inotify/fsevents, sync on save
+ce exec <machine> <command>    # run remotely, print stdout/stderr
 ```
 
-`ce exec` connects to the target node's API, sends a signed command via a new endpoint:
-```
-POST /exec   { cmd: ["cargo", "build"], cwd: "~/code/ce" }
-```
-Response is a streaming newline-delimited stream of stdout/stderr lines.
-
-`ce sync --watch` uses inotify on Linux (via the `notify` crate) to detect file modifications and immediately pushes diffs.
+`ce exec` calls `POST /exec` with the command and working directory; the response is a JSON object with `stdout`, `stderr`, and `exit_code` fields. Process exit code is propagated to the shell.
 
 ### Developer workflow this enables
 
@@ -255,9 +216,9 @@ No central registry server. No DNS. Pure mesh.
 
 ## Implementation order
 
-1. **Fix nonce replay** — one day, closes a security hole
-2. **Personal mesh OS** (Phase 2) — this is what makes CE useful on day one for the person building it
-3. **Credit escrow / JobExpire** — closes the "host did work but payer disappeared" gap
+1. ~~**Fix nonce replay**~~ ✅ Done
+2. ~~**Personal mesh OS** (Phase 2)~~ ✅ Done (core: device registry, sync push, exec; watch + .ceignore + on-chain TrustGrant broadcast planned)
+3. ~~**Credit escrow / JobExpire**~~ ✅ Done
 4. **Heartbeat economy** — enables long-running cells
 5. **Cell deploy CLI** — completes the developer-facing product
 6. **Chain checkpoints** — needed before public launch

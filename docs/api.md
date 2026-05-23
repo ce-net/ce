@@ -44,18 +44,19 @@ Node status snapshot.
 
 Jobs follow a two-step flow:
 
-1. **Payer** calls `POST /jobs/bid` on their own node — signs and broadcasts a `JobBid` tx.
+1. **Payer** calls `POST /jobs/bid` on their own node — signs and broadcasts a `JobBid` tx. The `bid` credits are locked immediately; the payer cannot double-spend them while the job is open.
 2. **Any host** with capacity picks up the bid from the gossip mesh, starts the container, and marks the job `running`.
 3. When the container exits the host marks the job `awaiting_settlement`.
-4. **Payer** calls `POST /jobs/:id/settle` on the **host** node with their co-signature and the agreed cost.
+4. **Payer** calls `POST /jobs/:id/settle` on the **host** node with their co-signature and the agreed cost (must not exceed the original `bid`).
 5. Host submits the signed `JobSettle` tx; the next mined block confirms it and adjusts balances.
+
+If no host settles within `EXPIRY_BLOCKS` (1440 blocks ≈ 24 hours at 10s/block), the payer may submit a `JobExpire` tx to reclaim the locked credits.
 
 ---
 
 ## POST /jobs/bid
 
-Create a job bid. The **calling node** is the payer; their balance is checked before broadcasting.
-The bid is signed by this node's identity and gossiped to the mesh so any host can accept it.
+Create a job bid. The **calling node** is the payer; their free balance (total minus locked bids) is checked before broadcasting. The bid amount is locked until `JobSettle` or `JobExpire` confirms.
 
 **Request body**
 ```json
@@ -78,7 +79,7 @@ The bid is signed by this node's identity and gossiped to the mesh so any host c
 | `cpu_cores` | integer | yes | CPU allocation hint for resource limits |
 | `mem_mb` | integer | yes | Memory limit in MiB |
 | `duration_secs` | integer | yes | Maximum expected runtime |
-| `bid` | integer | yes | Maximum credits the payer is willing to spend |
+| `bid` | integer | yes | Maximum credits the payer is willing to spend (locked at bid time) |
 
 **Response** `201 Created`
 ```json
@@ -141,7 +142,7 @@ a `JobSettle` tx.
 
 | Field | Type | Description |
 |---|---|---|
-| `cost` | integer | Agreed settlement amount in credits (≤ original bid) |
+| `cost` | integer | Agreed settlement amount in credits (must be ≤ original `bid`) |
 | `payer_sig` | string | Ed25519 signature (128 hex chars) of `payer_settle_bytes(job_id, cost)` using the payer's identity key |
 
 The server verifies the payer signature before storing it.
@@ -222,6 +223,79 @@ Build a CEP-1 signal locally, sign it, and broadcast it on the `ce-protocol-1` g
 
 ---
 
+## Personal Mesh OS
+
+These endpoints power the `ce sync` and `ce exec` CLI commands. All requests must be signed with the sender's CE identity key and the sender must appear in the receiver's `machines.toml` device registry.
+
+### Authentication
+
+Every request to `/sync/*` and `/exec` must include three headers:
+
+| Header | Value |
+|---|---|
+| `X-CE-From` | Sender's NodeId as 64 hex chars |
+| `X-CE-Timestamp` | Current Unix time in milliseconds (u64) |
+| `X-CE-Sig` | Ed25519 signature (128 hex) over `b"ce-auth-v1 " + method + " " + path + " " + timestamp_le_u64` |
+
+The receiver validates that:
+1. The timestamp is within ±5 minutes of server time (prevents replay attacks).
+2. The signature is valid for the declared sender key.
+3. The sender's NodeId appears in the local `machines.toml` device registry.
+
+### PUT /sync/*path
+
+Upload a file to the receiver's home directory at the given path. Path is relative to `~/`.
+
+Intermediate directories are created automatically. Path traversal outside `~/` is rejected.
+
+**Headers:** CE auth headers (see above)  
+**Body:** Raw file bytes  
+**Response:** `204 No Content`
+
+### GET /sync/*path
+
+Download a file from the receiver's home directory at the given path.
+
+**Headers:** CE auth headers (see above)  
+**Response:** `200 OK` with raw file bytes, or `404 Not Found`
+
+### POST /exec
+
+Run a command on the remote node and return its output.
+
+**Headers:** CE auth headers (see above)
+
+**Request body**
+```json
+{
+  "cmd": ["cargo", "build", "--release"],
+  "cwd": "~/code/ce"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `cmd` | array | yes | Command and arguments to execute |
+| `cwd` | string | no | Working directory (relative to `~/` or absolute). Defaults to `~/`. |
+
+**Response** `200 OK`
+```json
+{
+  "stdout": "...",
+  "stderr": "...",
+  "exit_code": 0
+}
+```
+
+**Error responses**
+
+| Code | Meaning |
+|---|---|
+| 401 Unauthorized | Missing or invalid auth headers |
+| 403 Forbidden | Sender is not in the device registry |
+
+---
+
 ## Container isolation
 
 Containers are launched with:
@@ -230,16 +304,3 @@ Containers are launched with:
 - **CPU**: cgroup v2 limit via `nano_cpus` (1 CPU core = 1,000,000,000 nanocpus).
 - **Memory**: hard cgroup v2 limit from `mem_mb`.
 - **Network**: `none` — containers have no direct internet access; all traffic must route through CE.
-
----
-
-## Credit metering
-
-Once a container is running the metering loop (every 10 seconds) reads Docker stats and
-can generate `Meter` transactions. Settlement cost is determined by the agreed `cost` field
-in `POST /jobs/:id/settle`.
-
-```
-cost = (cpu_ms / 1000) * 10   +   (mem_mb * interval_secs / 1024) * 1
-       └── 10 credits/cpu-sec     └── 1 credit/GB-second
-```

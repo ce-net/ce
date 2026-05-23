@@ -1,4 +1,5 @@
 mod api;
+pub mod devices;
 
 use anyhow::Result;
 use ce_chain::{Block, Chain, Tx, TxKind};
@@ -257,6 +258,7 @@ impl Node {
             let send_nonce = send_nonce.clone();
             let js = job_store.clone();
             let pool = pool.clone();
+            let data_dir = node.config.data_dir.clone();
             tokio::spawn(async move {
                 if let Err(e) = api::start(
                     chain,
@@ -268,6 +270,7 @@ impl Node {
                     js,
                     pool,
                     settle_notify_tx,
+                    data_dir,
                 )
                 .await
                 {
@@ -753,5 +756,7 @@ fn tx_burn_amount(tx: &Tx) -> Option<u64> {
         TxKind::UptimeReward { amount, .. } => Some(*amount),
         TxKind::JobBid { bid, .. } => Some(*bid),
         TxKind::JobSettle { cost, .. } => Some(*cost),
+        // JobExpire and TrustGrant carry no burnable credit amount.
+        TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => None,
     }
 }
