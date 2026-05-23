@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use ce_chain::{Block, Tx};
 use ce_identity::NodeId;
+use ce_protocol::{CellSignal, GOSSIP_TOPIC as PROTOCOL_TOPIC};
 use libp2p::{
     futures::StreamExt,
     gossipsub, identify, kad,
@@ -55,6 +56,7 @@ enum MeshCommand {
     AnnounceHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32] },
     SendSyncRequest { from_node: NodeId, from_height: u64 },
     SendSyncResponse { for_node: NodeId, blocks: Vec<Block> },
+    PublishSignal(Vec<u8>),
 }
 
 // ----- Public event type -----
@@ -71,6 +73,9 @@ pub enum MeshEvent {
     SyncRequest { from_node: NodeId, from_height: u64 },
     /// Incoming block batch from a sync response, addressed to `for_node`.
     SyncBlocks { for_node: NodeId, blocks: Vec<Block> },
+    /// A peer published a CEP-1 signal that decoded and passed signature verification.
+    /// Burn-proof / chain-side validation still happens in ce-node.
+    CellSignal(CellSignal),
 }
 
 // ----- Topic names -----
@@ -80,6 +85,8 @@ const TOPIC_BLOCKS: &str = "ce-blocks";
 const TOPIC_HEIGHTS: &str = "ce-heights";
 const TOPIC_SYNCREQ: &str = "ce-syncreq";
 const TOPIC_SYNCRESP: &str = "ce-syncresp";
+// CEP-1 cell signaling topic; the actual string lives in ce-protocol.
+const TOPIC_PROTOCOL: &str = PROTOCOL_TOPIC;
 
 // ----- Network behaviour -----
 
@@ -98,6 +105,7 @@ struct Topics {
     heights: gossipsub::TopicHash,
     syncreq: gossipsub::TopicHash,
     syncresp: gossipsub::TopicHash,
+    protocol: gossipsub::TopicHash,
 }
 
 // ----- Handle returned to callers -----
@@ -130,6 +138,14 @@ impl MeshHandle {
         self.send(MeshCommand::SendSyncResponse { for_node, blocks }).await
     }
 
+    /// Publish a (locally-signed) CEP-1 signal to the `ce-protocol-1` topic.
+    /// Caller is responsible for building and signing the signal; this just
+    /// serializes and broadcasts.
+    pub async fn broadcast_signal(&self, signal: &CellSignal) -> Result<()> {
+        let bytes = signal.encode()?;
+        self.send(MeshCommand::PublishSignal(bytes)).await
+    }
+
     async fn send(&self, cmd: MeshCommand) -> Result<()> {
         self.cmd_tx.send(cmd).await.map_err(|_| anyhow!("mesh actor gone"))
     }
@@ -144,6 +160,7 @@ pub struct Mesh {
     heights_topic: gossipsub::IdentTopic,
     syncreq_topic: gossipsub::IdentTopic,
     syncresp_topic: gossipsub::IdentTopic,
+    protocol_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<MeshCommand>,
     event_tx: mpsc::Sender<MeshEvent>,
 }
@@ -161,6 +178,7 @@ impl Mesh {
         let heights_topic = gossipsub::IdentTopic::new(TOPIC_HEIGHTS);
         let syncreq_topic = gossipsub::IdentTopic::new(TOPIC_SYNCREQ);
         let syncresp_topic = gossipsub::IdentTopic::new(TOPIC_SYNCRESP);
+        let protocol_topic = gossipsub::IdentTopic::new(TOPIC_PROTOCOL);
 
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -216,6 +234,7 @@ impl Mesh {
             heights_topic,
             syncreq_topic,
             syncresp_topic,
+            protocol_topic,
             cmd_rx,
             event_tx,
         };
@@ -242,6 +261,7 @@ impl Mesh {
             &self.heights_topic,
             &self.syncreq_topic,
             &self.syncresp_topic,
+            &self.protocol_topic,
         ] {
             self.swarm.behaviour_mut().gossipsub.subscribe(topic)?;
         }
@@ -252,6 +272,7 @@ impl Mesh {
             heights: self.heights_topic.hash(),
             syncreq: self.syncreq_topic.hash(),
             syncresp: self.syncresp_topic.hash(),
+            protocol: self.protocol_topic.hash(),
         };
 
         loop {
@@ -313,6 +334,13 @@ impl Mesh {
                         let _ = self.swarm.behaviour_mut().gossipsub
                             .publish(self.syncresp_topic.clone(), bytes);
                     }
+                }
+            }
+            MeshCommand::PublishSignal(bytes) => {
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub
+                    .publish(self.protocol_topic.clone(), bytes)
+                {
+                    debug!("publish signal: {e}");
                 }
             }
         }
@@ -394,6 +422,14 @@ fn decode_gossip(message: gossipsub::Message, topics: &Topics) -> Option<MeshEve
                 blocks: r.blocks,
             }),
             Err(e) => { warn!("bad syncresp: {e}"); None }
+        }
+    } else if t == &topics.protocol {
+        match CellSignal::decode(&message.data) {
+            Ok(signal) => match signal.verify() {
+                Ok(()) => Some(MeshEvent::CellSignal(signal)),
+                Err(e) => { warn!("ce-protocol-1 signal failed sig check: {e}"); None }
+            },
+            Err(e) => { warn!("bad ce-protocol-1 gossip: {e}"); None }
         }
     } else {
         None

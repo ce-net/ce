@@ -4,8 +4,10 @@
 //! other cells, earn/spend credit, and self-replicate. Containers that don't
 //! implement it are "foreign" — they run but cannot communicate through CE.
 //!
-//! Integration with ce-mesh (gossip topic `ce-protocol-1`) is deferred until
-//! the adapter system is designed. This crate is currently standalone.
+//! Wired into ce-mesh under the `ce-protocol-1` gossip topic. ce-mesh decodes
+//! incoming messages, runs `CellSignal::verify()`, and emits
+//! `MeshEvent::CellSignal` for valid signals. Burn-proof / chain-side
+//! validation lives in ce-node.
 
 use anyhow::{Result, anyhow};
 use ce_identity::{NodeId, verify};
@@ -13,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: u8 = 1;
-/// Gossipsub topic name — will be subscribed to by ce-mesh once the adapter is ready.
+/// Gossipsub topic name — subscribed by ce-mesh in `Mesh::run`.
 pub const GOSSIP_TOPIC: &str = "ce-protocol-1";
 
 // ----- Address -----

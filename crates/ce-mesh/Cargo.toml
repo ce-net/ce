@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ce-identity = { path = "../ce-identity" }
 ce-chain = { path = "../ce-chain" }
+ce-protocol = { path = "../ce-protocol" }
 libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "tokio", "macros"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

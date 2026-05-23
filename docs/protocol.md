@@ -99,14 +99,18 @@ received.verify()?;   // check sig + version
 
 ---
 
-## Integration with ce-mesh (planned)
+## Integration with ce-mesh
 
-Currently the `ce-protocol` crate is standalone. Future integration:
-1. `ce-mesh` subscribes to `ce-protocol-1` gossipsub topic
-2. Incoming messages decoded as `CellSignal`, verified, emitted as `MeshEvent::CellSignal`
-3. `MeshHandle::send_signal(signal)` publishes to the topic
+`ce-mesh` subscribes to the `ce-protocol-1` gossipsub topic in `Mesh::run`. Inbound:
 
-This is deferred until the adapter system is designed to bridge foreign containers into the protocol.
+1. Decode message bytes as `CellSignal`; drop on decode error.
+2. Call `signal.verify()`; drop on bad signature or wrong version.
+3. Emit `MeshEvent::CellSignal(signal)` to the node.
+
+Outbound: `MeshHandle::broadcast_signal(&signal)` serializes (bincode) and publishes to the topic.
+
+Chain-side validation (burn-proof tx lookup, amount match) happens in `ce-node`'s
+mesh event loop before the signal is exposed via `GET /signals`.
 
 ---
 
