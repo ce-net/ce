@@ -358,13 +358,19 @@ async fn exec_unknown_device_returns_403() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+// Execution tests require Docker. Run with: cargo test -p ce-node exec -- --ignored --nocapture
+
 #[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn exec_runs_echo_and_returns_stdout() {
     let (_node, server_dir, api) = start_node("exec-echo").await;
     let client_id = make_identity("exec-echo-client");
     register_device(&server_dir, &client_id);
 
-    let body = serde_json::to_vec(&serde_json::json!({ "cmd": ["echo", "hello-from-ce"] })).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "image": "alpine:latest",
+        "cmd": ["echo", "hello-from-ce"],
+    })).unwrap();
     let req = add_auth(
         reqwest::Client::new()
             .post(format!("http://127.0.0.1:{api}/exec"))
@@ -385,13 +391,16 @@ async fn exec_runs_echo_and_returns_stdout() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn exec_captures_exit_code() {
     let (_node, server_dir, api) = start_node("exec-exit").await;
     let client_id = make_identity("exec-exit-client");
     register_device(&server_dir, &client_id);
 
-    let body =
-        serde_json::to_vec(&serde_json::json!({ "cmd": ["sh", "-c", "exit 42"] })).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "image": "alpine:latest",
+        "cmd": ["sh", "-c", "exit 42"],
+    })).unwrap();
     let req = add_auth(
         reqwest::Client::new()
             .post(format!("http://127.0.0.1:{api}/exec"))
@@ -414,15 +423,16 @@ async fn exec_captures_exit_code() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn exec_captures_stderr() {
     let (_node, server_dir, api) = start_node("exec-stderr").await;
     let client_id = make_identity("exec-stderr-client");
     register_device(&server_dir, &client_id);
 
-    let body = serde_json::to_vec(
-        &serde_json::json!({ "cmd": ["sh", "-c", "echo error-output >&2"] }),
-    )
-    .unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "image": "alpine:latest",
+        "cmd": ["sh", "-c", "echo error-output >&2"],
+    })).unwrap();
     let req = add_auth(
         reqwest::Client::new()
             .post(format!("http://127.0.0.1:{api}/exec"))
@@ -471,7 +481,7 @@ async fn exec_empty_cmd_returns_400() {
     let client_id = make_identity("exec-empty-client");
     register_device(&server_dir, &client_id);
 
-    let body = serde_json::to_vec(&serde_json::json!({ "cmd": [] })).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({ "image": "alpine:latest", "cmd": [] })).unwrap();
     let req = add_auth(
         reqwest::Client::new()
             .post(format!("http://127.0.0.1:{api}/exec"))

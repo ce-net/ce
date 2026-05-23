@@ -182,12 +182,13 @@ ce status
 ce balance
 ce id
 
-# Personal mesh OS
-ce devices add <name>               # register a trusted device (prompts for node ID + addr)
-ce devices ls                       # list registered devices
-ce devices revoke <name>            # remove a device
-ce sync <src> <device:remote-path>  # push files to a trusted device
-ce exec <device> <command...>       # run a command on a trusted device, print output
+# Node-to-node services (sync files and run sandboxed commands on trusted peers)
+ce devices add <name>               # register a trusted peer (prompts for node ID + addr)
+ce devices ls                       # list registered peers
+ce devices revoke <name>            # remove trust
+ce sync <src> <device:remote-path>  # push files to a peer
+ce exec <device> --image <img> [--cwd ~/path] <command...>
+                                    # run in sandboxed container on a peer
 
 # Cell economy
 ce deploy <image> [--fund N] [--cpu N] [--mem N] [--duration N]

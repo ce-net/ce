@@ -287,9 +287,9 @@ Build a CEP-1 signal locally, sign it, and broadcast it on the `ce-protocol-1` g
 
 ---
 
-## Personal Mesh OS
+## Authenticated node services
 
-These endpoints power the `ce sync` and `ce exec` CLI commands. All requests must be signed with the sender's CE identity key and the sender must appear in the receiver's `machines.toml` device registry.
+These endpoints let trusted CE nodes sync files and execute commands. Any CE node can offer these services to any other CE node that it trusts. Register trusted peers in `machines.toml` (via `ce devices add`).
 
 ### Authentication
 
@@ -325,13 +325,16 @@ Download a file from the receiver's home directory at the given path.
 
 ### POST /exec
 
-Run a command on the remote node and return its output.
+Run a command on the remote node inside a sandboxed Docker container and return its output.
+
+The node's home directory is bind-mounted read-write at `/workspace` inside the container, so files synced via `PUT /sync/*` are accessible to the command. Isolation matches job containers: gVisor when available, no network, 1 CPU / 512 MB limits, container removed on exit.
 
 **Headers:** CE auth headers (see above)
 
 **Request body**
 ```json
 {
+  "image": "rust:latest",
   "cmd": ["cargo", "build", "--release"],
   "cwd": "~/code/ce"
 }
@@ -339,8 +342,9 @@ Run a command on the remote node and return its output.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `image` | string | yes | Docker image to run the command in (e.g. `rust:latest`, `alpine:latest`) |
 | `cmd` | array | yes | Command and arguments to execute |
-| `cwd` | string | no | Working directory (relative to `~/` or absolute). Defaults to `~/`. |
+| `cwd` | string | no | Working directory relative to `~/` (e.g. `~/code/ce`). Defaults to `~/`. |
 
 **Response** `200 OK`
 ```json
@@ -357,14 +361,16 @@ Run a command on the remote node and return its output.
 |---|---|
 | 401 Unauthorized | Missing or invalid auth headers |
 | 403 Forbidden | Sender is not in the device registry |
+| 503 Service Unavailable | Docker not available on this node |
 
 ---
 
 ## Container isolation
 
-Containers are launched with:
+All containers (job containers and exec containers) are launched with:
 
-- **Runtime**: `runsc` (gVisor) when available; falls back to default runc with a logged warning.
-- **CPU**: cgroup v2 limit via `nano_cpus` (1 CPU core = 1,000,000,000 nanocpus).
-- **Memory**: hard cgroup v2 limit from `mem_mb`.
-- **Network**: `none` — containers have no direct internet access; all traffic must route through CE.
+- **Runtime**: `runsc` (gVisor) when available; falls back to runc with a logged warning.
+- **Network**: `none` — no direct internet access; all traffic must route through CE.
+- **CPU**: cgroup v2 hard limit via `nano_cpus`. Job containers use the bid's `cpu_cores`; exec containers use 1 CPU.
+- **Memory**: cgroup v2 hard limit. Job containers use `mem_mb` from the bid; exec containers use 512 MB.
+- **Exec-only**: home directory bind-mounted at `/workspace:rw` so the command can read synced files. Job containers have no bind mounts.

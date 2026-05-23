@@ -8,8 +8,8 @@ use axum::{
     Json, Router,
 };
 use bollard::{container::RemoveContainerOptions, Docker};
-use bincode;
 use ce_chain::{payer_settle_bytes, Chain};
+use ce_container::{exec_in_container, ExecSpec};
 use ce_identity::{verify, Identity, NodeId};
 use ce_mesh::MeshHandle;
 use ce_protocol::{BurnProof, Capability, CellAddress, CellSignal};
@@ -628,9 +628,11 @@ async fn sync_get(
 
 #[derive(Debug, Deserialize)]
 pub struct ExecRequest {
-    /// Command to run, e.g. ["cargo", "build", "--release"].
+    /// Docker image to run the command in, e.g. "rust:latest" or "alpine:latest".
+    pub image: String,
+    /// Command and arguments, e.g. ["cargo", "build", "--release"].
     pub cmd: Vec<String>,
-    /// Working directory (relative to `~/` or absolute). Defaults to `~/`.
+    /// Working directory relative to `~/` (e.g. `~/code/ce` or `code/ce`). Defaults to `~/`.
     #[serde(default)]
     pub cwd: Option<String>,
 }
@@ -663,32 +665,28 @@ async fn exec_command(State(state): State<ApiState>, headers: HeaderMap, req: Re
     if req.cmd.is_empty() {
         return err(StatusCode::BAD_REQUEST, "cmd must not be empty");
     }
+    if req.image.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "image must not be empty");
+    }
 
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let cwd = match &req.cwd {
-        Some(c) if c.starts_with('~') => {
-            home.join(c.trim_start_matches("~/").trim_start_matches('~'))
-        }
-        Some(c) => PathBuf::from(c),
-        None => home,
+    let docker = match &state.docker {
+        Some(d) => d,
+        None => return err(StatusCode::SERVICE_UNAVAILABLE, "Docker not available on this node"),
     };
 
-    match tokio::process::Command::new(&req.cmd[0])
-        .args(&req.cmd[1..])
-        .current_dir(&cwd)
-        .output()
-        .await
-    {
-        Ok(output) => {
-            let exit_code = output.status.code().unwrap_or(-1);
-            tracing::info!("exec {:?} in {} → exit {exit_code}", req.cmd, cwd.display());
+    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let spec = ExecSpec { image: req.image.clone(), cmd: req.cmd.clone(), cwd: req.cwd.clone() };
+
+    match exec_in_container(docker, &spec, &home).await {
+        Ok((stdout, stderr, exit_code)) => {
+            let exit_code = exit_code as i32;
+            tracing::info!(
+                "exec {:?} image={} → exit {exit_code}",
+                req.cmd, req.image
+            );
             (
                 StatusCode::OK,
-                Json(ExecResponse {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    exit_code,
-                }),
+                Json(ExecResponse { stdout, stderr, exit_code }),
             )
                 .into_response()
         }

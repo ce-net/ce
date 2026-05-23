@@ -10,9 +10,9 @@ CE is two things simultaneously:
 
 1. **Open compute economy** — a mesh where any node can offer or consume compute, with credits as the only resource allocation mechanism. Cells (containers that implement CEP-1) earn and spend credits to stay alive on the network. A cell that nobody uses drains its wallet and dies. A cell that everyone uses accumulates credits, replicates, and thrives.
 
-2. **Personal mesh OS** — your laptop, desktop, and servers all run CE nodes. They share the same Ed25519 identity as auth. `ce sync` moves files between your machines. `ce exec` runs commands remotely. There is no "deployment" — your machines are already one virtual computer, and the mesh makes the boundaries invisible.
+2. **Node-to-node services** — CE nodes can sync files and run commands on each other. Any node can trust any other via `machines.toml`. `ce sync` pushes files. `ce exec` runs commands inside a sandboxed container on the remote node — same gVisor/no-network isolation as compute jobs. There is no special "personal OS" mode; it is the same trust model applied to your own machines. Register the peers you own in `machines.toml` so `ce deploy` prefers them over stranger nodes when building or hosting cells.
 
-These are the same system viewed from two angles. The same identity primitive that lets untrusted strangers transact safely also lets your own machines trust each other implicitly.
+These are the same system from two angles. The identity primitive that lets untrusted strangers transact safely is also what lets your machines authenticate each other without passwords.
 
 ---
 
@@ -117,7 +117,7 @@ pub struct Checkpoint {
 
 ---
 
-## Phase 2 — Personal mesh OS
+## Phase 2 — Node-to-node services
 
 ### 2a. Machine registry ✅ Done
 
@@ -153,24 +153,23 @@ Hardcoded default ignores are applied during `ce sync` (`target/`, `node_modules
 ### 2d. CLI commands ✅ Done (sync push + exec; --watch planned)
 
 ```
-ce sync <src> <dst>            # e.g. ce sync . desktop:~/code/ce  (push)
-ce sync --watch <src> <dst>    # planned: inotify/fsevents, sync on save
-ce exec <machine> <command>    # run remotely, print stdout/stderr
+ce sync <src> <dst>                         # e.g. ce sync . desktop:~/code/ce  (push)
+ce sync --watch <src> <dst>                 # planned: inotify/fsevents, sync on save
+ce exec <machine> --image <img> <command>   # run in sandboxed container, print stdout/stderr
 ```
 
-`ce exec` calls `POST /exec` with the command and working directory; the response is a JSON object with `stdout`, `stderr`, and `exit_code` fields. Process exit code is propagated to the shell.
+`ce exec` calls `POST /exec` with the image, command, and working directory. The remote node runs the command inside a Docker container (gVisor, no network, 1 CPU / 512 MB, home dir bind-mounted at `/workspace`). The JSON response with `stdout`, `stderr`, and `exit_code` is printed; the exit code is propagated to the shell.
 
-### Developer workflow this enables
+### Workflow example
 
 ```bash
-# On laptop — edit a file, it auto-syncs to desktop
-ce sync --watch . desktop:~/code/ce
+# Sync source to a peer you own
+ce sync . desktop:~/code/ce
 
-# Compile on the desktop (your actual powerful machine)
-ce exec desktop cargo build --release
+# Compile on that peer inside a Rust container
+ce exec desktop --image rust:latest --cwd ~/code/ce cargo build --release
 
-# Output streams back to your laptop terminal in real time
-# You never think about "which machine am I on"
+# Output prints to your terminal; exit code propagated
 ```
 
 ---
@@ -254,7 +253,7 @@ No central registry server. No DNS. Pure mesh.
 ## Implementation order
 
 1. ~~**Fix nonce replay**~~ ✅ Done
-2. ~~**Personal mesh OS** (Phase 2)~~ ✅ Done (core: device registry, sync push, exec; watch + .ceignore + on-chain TrustGrant broadcast planned)
+2. ~~**Node-to-node services** (Phase 2)~~ ✅ Done (device registry, sync push, sandboxed exec; watch + .ceignore + on-chain TrustGrant broadcast planned)
 3. ~~**Credit escrow / JobExpire**~~ ✅ Done
 4. ~~**Heartbeat economy**~~ ✅ Done — 30s heartbeat loop, epoch replay prevention, cell wallet exhaustion terminates container
 5. ~~**Cell deploy CLI**~~ ✅ Done — `ce deploy`, `ce ps`, `ce kill`, `ce fund`, `ce run`, `GET /jobs`, `POST /transfer`, `GET /atlas`

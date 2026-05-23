@@ -48,11 +48,18 @@ enum Commands {
         src: String,
         dst: String,
     },
-    /// Execute a command on a remote device and stream its output.
+    /// Execute a command on a remote CE node inside a sandboxed container.
     ///
-    /// Example: ce exec desktop cargo build --release
+    /// The node's home directory is bind-mounted at /workspace inside the container.
+    /// Example: ce exec desktop --image rust:latest cargo build --release
     Exec {
         machine: String,
+        /// Docker image to run the command in (e.g. rust:latest, alpine:latest).
+        #[arg(long, short = 'i')]
+        image: String,
+        /// Working directory (relative to ~/). Defaults to ~/workspace.
+        #[arg(long)]
+        cwd: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -341,9 +348,9 @@ async fn main() -> Result<()> {
             println!("Synced {synced} files to {device_name}:{remote_path} ({skipped} ignored).");
         }
 
-        Commands::Exec { machine, command } => {
+        Commands::Exec { machine, image, cwd, command } => {
             if command.is_empty() {
-                return Err(anyhow!("specify a command to run, e.g. ce exec desktop cargo build"));
+                return Err(anyhow!("specify a command to run, e.g. ce exec desktop --image rust:latest cargo build"));
             }
 
             let identity_dir = data_dir.join("identity");
@@ -354,8 +361,11 @@ async fn main() -> Result<()> {
             let (_, addr) = devices.get(&machine)?;
 
             let url = format!("http://{addr}/exec");
-            let body_json = serde_json::json!({ "cmd": command });
-            let body_bytes = serde_json::to_vec(&body_json)?;
+            let mut body = serde_json::json!({ "image": image, "cmd": command });
+            if let Some(c) = cwd {
+                body["cwd"] = serde_json::Value::String(c);
+            }
+            let body_bytes = serde_json::to_vec(&body)?;
             let auth = make_auth_headers(&identity, "POST", "/exec", &body_bytes);
             let client = reqwest::Client::new();
             let mut req = client.post(&url).body(body_bytes).header("content-type", "application/json");

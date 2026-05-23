@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use bollard::container::{
-    CreateContainerOptions, ListContainersOptions, StartContainerOptions, StatsOptions,
-    WaitContainerOptions,
+    CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
+    RemoveContainerOptions, StartContainerOptions, StatsOptions, WaitContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
@@ -9,6 +9,7 @@ use bollard::Docker;
 use ce_identity::NodeId;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -150,6 +151,112 @@ impl ContainerManager {
                 }
             }
         }
+    }
+}
+
+/// Parameters for a sandboxed remote exec.
+pub struct ExecSpec {
+    /// Docker image to run the command in.
+    pub image: String,
+    /// Command and arguments.
+    pub cmd: Vec<String>,
+    /// Working directory. Interpreted relative to `~/` (e.g., `~/code/ce` or `code/ce`).
+    /// Defaults to the workspace root (`~/`) when None.
+    pub cwd: Option<String>,
+}
+
+/// Run a command in a temporary sandboxed container and return (stdout, stderr, exit_code).
+///
+/// The caller's home directory is bind-mounted read-write at `/workspace` inside the
+/// container, giving the command access to synced files without touching the host
+/// process or the rest of the filesystem.
+///
+/// Isolation: gVisor when available, network=none, 1 CPU / 512 MB limits, auto-removed.
+pub async fn exec_in_container(
+    docker: &Docker,
+    spec: &ExecSpec,
+    home_dir: &Path,
+) -> Result<(String, String, i64)> {
+    // Pull image if not cached.
+    let mut pull = docker.create_image(
+        Some(CreateImageOptions { from_image: spec.image.as_str(), ..Default::default() }),
+        None,
+        None,
+    );
+    while let Some(ev) = pull.next().await {
+        ev?;
+    }
+
+    // Resolve cwd inside the container. Everything maps into /workspace.
+    let working_dir = resolve_container_cwd(spec.cwd.as_deref());
+
+    let home_str = home_dir.to_string_lossy().to_string();
+    let runtime = detect_runtime(docker).await;
+
+    let config = bollard::container::Config {
+        image: Some(spec.image.clone()),
+        cmd: if spec.cmd.is_empty() { None } else { Some(spec.cmd.clone()) },
+        working_dir: Some(working_dir),
+        host_config: Some(HostConfig {
+            runtime,
+            // Home directory bind-mounted at /workspace — synced files are accessible.
+            binds: Some(vec![format!("{home_str}:/workspace:rw")]),
+            network_mode: Some("none".to_string()),
+            nano_cpus: Some(1_000_000_000),
+            memory: Some(512 * 1024 * 1024),
+            auto_remove: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let opts = CreateContainerOptions::<String> { name: String::new(), platform: None };
+    let container = docker.create_container(Some(opts), config).await?;
+    let cid = container.id;
+
+    docker.start_container(&cid, None::<StartContainerOptions<String>>).await?;
+
+    let exit_code = wait_for_exit_impl(docker, &cid).await.unwrap_or(-1);
+
+    // Collect stdout/stderr after the container exits.
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut log_stream = docker.logs(
+        &cid,
+        Some(LogsOptions::<String> { stdout: true, stderr: true, ..Default::default() }),
+    );
+    while let Some(chunk) = log_stream.next().await {
+        match chunk? {
+            LogOutput::StdOut { message } => stdout.push_str(&String::from_utf8_lossy(&message)),
+            LogOutput::StdErr { message } => stderr.push_str(&String::from_utf8_lossy(&message)),
+            _ => {}
+        }
+    }
+
+    let _ = docker
+        .remove_container(&cid, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+        .await;
+
+    Ok((stdout, stderr, exit_code))
+}
+
+/// Map a caller-supplied cwd into a path inside /workspace.
+/// Handles `~/foo`, `foo` (relative), and `/absolute` paths.
+fn resolve_container_cwd(cwd: Option<&str>) -> String {
+    match cwd {
+        None => "/workspace".into(),
+        Some(c) if c == "~" || c == "~/" => "/workspace".into(),
+        Some(c) if c.starts_with("~/") => format!("/workspace/{}", &c[2..]),
+        Some(c) if c.starts_with('/') => {
+            // Absolute host path — strip a leading /workspace prefix if given,
+            // otherwise map directly (best-effort; container may not find it).
+            if let Some(rest) = c.strip_prefix("/workspace") {
+                format!("/workspace{rest}")
+            } else {
+                c.to_string()
+            }
+        }
+        Some(c) => format!("/workspace/{c}"),
     }
 }
 
