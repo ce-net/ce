@@ -1,7 +1,11 @@
 use anyhow::{anyhow, Result};
-use bollard::container::{ListContainersOptions, StatsOptions};
+use bollard::container::{
+    CreateContainerOptions, ListContainersOptions, StartContainerOptions, StatsOptions,
+    WaitContainerOptions,
+};
+use bollard::image::CreateImageOptions;
+use bollard::models::HostConfig;
 use bollard::Docker;
-use ce_chain::TxKind;
 use ce_identity::NodeId;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -23,15 +27,86 @@ pub struct MeterReading {
     pub cost: u64,
 }
 
+/// Parameters for launching a CE-managed container.
+#[derive(Debug, Clone)]
+pub struct JobSpec {
+    pub job_id: [u8; 32],
+    pub image: String,
+    pub cmd: Vec<String>,
+    /// Key-value pairs passed as environment variables.
+    pub env: Vec<(String, String)>,
+    pub cpu_cores: u32,
+    pub mem_mb: u64,
+    pub payer: NodeId,
+}
+
+#[derive(Clone)]
 pub struct ContainerManager {
-    docker: Docker,
+    pub docker: Docker,
     host_node_id: NodeId,
+    /// "runsc" when gVisor is detected; None uses the default runc runtime.
+    runtime: Option<String>,
 }
 
 impl ContainerManager {
-    pub fn new(host_node_id: NodeId) -> Result<Self> {
+    pub async fn new(host_node_id: NodeId) -> Result<Self> {
         let docker = Docker::connect_with_socket_defaults()?;
-        Ok(Self { docker, host_node_id })
+        let runtime = detect_runtime(&docker).await;
+        Ok(Self { docker, host_node_id, runtime })
+    }
+
+    /// Pull the image (if not cached) and start a sandboxed container for the job.
+    /// Returns the Docker container ID.
+    pub async fn launch_job(&self, spec: &JobSpec) -> Result<String> {
+        let mut pull_stream = self.docker.create_image(
+            Some(CreateImageOptions { from_image: spec.image.as_str(), ..Default::default() }),
+            None,
+            None,
+        );
+        while let Some(ev) = pull_stream.next().await {
+            ev?;
+        }
+
+        let env_list: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut labels: HashMap<String, String> = HashMap::new();
+        labels.insert("ce.payer".into(), hex::encode(spec.payer));
+        labels.insert("ce.host".into(), hex::encode(self.host_node_id));
+        labels.insert("ce.job_id".into(), hex::encode(spec.job_id));
+
+        let cmd: Option<Vec<String>> =
+            if spec.cmd.is_empty() { None } else { Some(spec.cmd.clone()) };
+
+        let config = bollard::container::Config {
+            image: Some(spec.image.clone()),
+            env: Some(env_list),
+            cmd,
+            labels: Some(labels),
+            host_config: Some(HostConfig {
+                runtime: self.runtime.clone(),
+                nano_cpus: Some(spec.cpu_cores as i64 * 1_000_000_000),
+                memory: Some((spec.mem_mb * 1024 * 1024) as i64),
+                // No direct internet; all traffic must route through CE.
+                network_mode: Some("none".to_string()),
+                auto_remove: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let create_opts = CreateContainerOptions::<String> { name: String::new(), platform: None };
+        let container = self.docker.create_container(Some(create_opts), config).await?;
+        let container_id = container.id;
+
+        self.docker
+            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .await?;
+
+        Ok(container_id)
+    }
+
+    /// Block until a container exits and return its exit code.
+    pub async fn wait_for_exit(&self, container_id: &str) -> Result<i64> {
+        wait_for_exit_impl(&self.docker, container_id).await
     }
 
     /// Runs the metering loop indefinitely. Call this in a spawned task.
@@ -41,7 +116,10 @@ impl ContainerManager {
             interval.tick().await;
             let containers = match list_ce_containers(&self.docker).await {
                 Ok(c) => c,
-                Err(e) => { warn!("list containers: {e}"); continue; }
+                Err(e) => {
+                    warn!("list containers: {e}");
+                    continue;
+                }
             };
             for (container_id, payer) in containers {
                 match snapshot_stats(&self.docker, &container_id).await {
@@ -63,6 +141,35 @@ impl ContainerManager {
                 }
             }
         }
+    }
+}
+
+/// Probe Docker info for the "runsc" (gVisor) runtime entry.
+/// Always logs a warning when gVisor is absent so operators are clearly notified.
+async fn detect_runtime(docker: &Docker) -> Option<String> {
+    let has_runsc = docker
+        .info()
+        .await
+        .ok()
+        .and_then(|i| i.runtimes)
+        .map(|r| r.contains_key("runsc"))
+        .unwrap_or(false);
+
+    if has_runsc {
+        Some("runsc".to_string())
+    } else {
+        warn!("gVisor not available, falling back to runc — NOT recommended for production");
+        None
+    }
+}
+
+async fn wait_for_exit_impl(docker: &Docker, container_id: &str) -> Result<i64> {
+    let mut stream =
+        docker.wait_container(container_id, None::<WaitContainerOptions<String>>);
+    match stream.next().await {
+        Some(Ok(resp)) => Ok(resp.status_code),
+        Some(Err(e)) => Err(anyhow!("wait_container {container_id}: {e}")),
+        None => Err(anyhow!("wait_container stream ended without result for {container_id}")),
     }
 }
 
@@ -99,7 +206,8 @@ async fn snapshot_stats(docker: &Docker, container_id: &str) -> Result<(u64, u64
         container_id,
         Some(StatsOptions { stream: false, one_shot: true }),
     );
-    let stats = stream.next().await.ok_or_else(|| anyhow!("no stats for {container_id}"))??;
+    let stats =
+        stream.next().await.ok_or_else(|| anyhow!("no stats for {container_id}"))??;
 
     let cpu_delta = stats
         .cpu_stats
@@ -118,15 +226,4 @@ fn compute_cost(cpu_ms: u64, mem_mb: u64, interval_secs: u64) -> u64 {
     let mem_gb_secs = (mem_mb * interval_secs) / 1024;
     let mem_credits = mem_gb_secs * CREDITS_PER_GB_SECOND;
     cpu_credits + mem_credits
-}
-
-pub fn meter_reading_to_tx_kind(r: &MeterReading) -> TxKind {
-    TxKind::Meter {
-        job_id: r.job_id.clone(),
-        payer: r.payer,
-        host: r.host,
-        cpu_ms: r.cpu_ms,
-        mem_mb: r.mem_mb,
-        cost: r.cost,
-    }
 }

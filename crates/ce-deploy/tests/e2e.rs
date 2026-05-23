@@ -143,24 +143,18 @@ async fn run_propagation_test(cluster: &Cluster) -> anyhow::Result<()> {
         }
     }
 
-    // POST /jobs/run with node 0's node_id as payer on node 0.
-    #[derive(serde::Deserialize)]
-    struct Status { node_id: String }
-    let s: Status = client
-        .get(format!("{}/status", node0.api_url()))
-        .send()
-        .await?
-        .json()
-        .await?;
-
+    // POST /jobs/bid — the calling node (node 0) is the payer.
     let body = serde_json::json!({
         "image": "alpine:latest",
-        "payer": s.node_id,
-        "cmd": ["sleep", "30"]
+        "cmd": ["sleep", "30"],
+        "cpu_cores": 1,
+        "mem_mb": 128,
+        "duration_secs": 60,
+        "bid": 100
     });
 
     let resp = client
-        .post(format!("{}/jobs/run", node0.api_url()))
+        .post(format!("{}/jobs/bid", node0.api_url()))
         .json(&body)
         .send()
         .await?;
@@ -169,7 +163,7 @@ async fn run_propagation_test(cluster: &Cluster) -> anyhow::Result<()> {
     #[derive(serde::Deserialize)]
     struct JobResp { job_id: String }
     let job: JobResp = resp.json().await?;
-    info!("job started: {}", job.job_id);
+    info!("job bid submitted: {}", job.job_id);
 
     // Stop the job.
     let stop_resp = client

@@ -61,7 +61,9 @@ Each test allocates ports from an atomic counter starting at 14100 to avoid conf
 - `tx_pool_propagates` — transactions flow between nodes
 - `api_health_check` — GET /health returns 200
 - `api_status_endpoint` — GET /status returns valid JSON
-- `api_job_run_rejects_zero_balance` — POST /jobs/run returns 402 for zero-balance payer
+- `api_job_bid_rejects_zero_balance` — POST /jobs/bid returns 402 when the calling node has zero balance (mine: false)
+- `signal_propagates_between_nodes` — node A POSTs /signals/send with a burn_proof referencing one of its mined txs; non-mining node B sees the signal at GET /signals within 5 s of post (full CEP-1 + ce-mesh + chain-validation round trip)
+- `job_lifecycle` (**ignored**, requires Docker) — full two-node job lifecycle: bid → host starts container → container exits → payer co-signs settlement → JobSettle confirmed on-chain → balances verified
 
 ---
 

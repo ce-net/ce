@@ -61,6 +61,8 @@ async fn main() -> Result<()> {
                 bootstrap_peers: bootstrap,
                 data_dir,
                 api_port,
+                mine: true,
+                ..Default::default()
             };
             let node = Node::start(config).await?;
             let status = node.status().await;

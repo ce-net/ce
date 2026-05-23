@@ -8,6 +8,7 @@ ce-identity = { path = "../ce-identity" }
 ce-chain = { path = "../ce-chain" }
 ce-mesh = { path = "../ce-mesh" }
 ce-container = { path = "../ce-container" }
+ce-protocol = { path = "../ce-protocol" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 tracing = "0.1"
@@ -18,6 +19,7 @@ axum = "0.7"
 bollard = "0.17"
 futures = "0.3"
 hex = "0.4"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
@@ -25,3 +27,5 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 ce-mesh = { path = "../ce-mesh" }
 ce-identity = { path = "../ce-identity" }
+ce-protocol = { path = "../ce-protocol" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
