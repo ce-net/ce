@@ -1,4 +1,5 @@
 mod api;
+pub mod auth;
 pub mod devices;
 
 use anyhow::Result;

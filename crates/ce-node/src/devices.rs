@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use ce_identity::NodeId;
+use ce_identity::{Identity, NodeId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -78,5 +78,132 @@ impl Devices {
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("ce-devices-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn make_identity(tag: &str) -> Identity {
+        Identity::load_or_generate(&tmpdir(tag)).unwrap()
+    }
+
+    #[test]
+    fn add_and_get_roundtrip() {
+        let id = make_identity("add-get");
+        let mut d = Devices::default();
+        d.add("server", id.node_id(), "10.0.0.1:8080");
+
+        let (nid, addr) = d.get("server").unwrap();
+        assert_eq!(nid, id.node_id());
+        assert_eq!(addr, "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn get_unknown_returns_error() {
+        let d = Devices::default();
+        assert!(d.get("ghost").is_err());
+    }
+
+    #[test]
+    fn is_trusted_after_add() {
+        let id = make_identity("trust");
+        let mut d = Devices::default();
+        assert!(!d.is_trusted(&id.node_id()));
+        d.add("laptop", id.node_id(), "192.168.1.5:8080");
+        assert!(d.is_trusted(&id.node_id()));
+    }
+
+    #[test]
+    fn is_not_trusted_for_unknown_node() {
+        let id = make_identity("untrusted");
+        let id2 = make_identity("untrusted2");
+        let mut d = Devices::default();
+        d.add("server", id.node_id(), "1.2.3.4:8080");
+        assert!(!d.is_trusted(&id2.node_id()), "unregistered node must not be trusted");
+    }
+
+    #[test]
+    fn remove_clears_trust() {
+        let id = make_identity("remove");
+        let mut d = Devices::default();
+        d.add("server", id.node_id(), "1.2.3.4:8080");
+        assert!(d.is_trusted(&id.node_id()));
+        let removed = d.remove("server");
+        assert!(removed);
+        assert!(!d.is_trusted(&id.node_id()), "trust must clear after remove");
+    }
+
+    #[test]
+    fn remove_nonexistent_returns_false() {
+        let mut d = Devices::default();
+        assert!(!d.remove("nope"));
+    }
+
+    #[test]
+    fn list_sorted_by_name() {
+        let a = make_identity("list-a");
+        let b = make_identity("list-b");
+        let c = make_identity("list-c");
+        let mut d = Devices::default();
+        d.add("zebra", c.node_id(), "1.1.1.1:1");
+        d.add("alpha", a.node_id(), "2.2.2.2:2");
+        d.add("middle", b.node_id(), "3.3.3.3:3");
+
+        let list = d.list();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].0, "alpha");
+        assert_eq!(list[1].0, "middle");
+        assert_eq!(list[2].0, "zebra");
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = tmpdir("saveload");
+        let path = dir.join("machines.toml");
+
+        let id1 = make_identity("sl-id1");
+        let id2 = make_identity("sl-id2");
+
+        let mut d = Devices::default();
+        d.add("desktop", id1.node_id(), "192.168.1.10:8080");
+        d.add("server", id2.node_id(), "10.0.0.1:9090");
+        d.save(&path).unwrap();
+
+        let loaded = Devices::load(&path).unwrap();
+        assert_eq!(loaded.devices.len(), 2);
+        assert!(loaded.is_trusted(&id1.node_id()));
+        assert!(loaded.is_trusted(&id2.node_id()));
+
+        let (nid, addr) = loaded.get("desktop").unwrap();
+        assert_eq!(nid, id1.node_id());
+        assert_eq!(addr, "192.168.1.10:8080");
+    }
+
+    #[test]
+    fn load_or_empty_on_missing_file() {
+        let d = Devices::load_or_empty(std::path::Path::new("/nonexistent/machines.toml"));
+        assert_eq!(d.devices.len(), 0);
+    }
+
+    #[test]
+    fn add_overwrites_existing_name() {
+        let id1 = make_identity("overwrite1");
+        let id2 = make_identity("overwrite2");
+        let mut d = Devices::default();
+        d.add("mybox", id1.node_id(), "1.1.1.1:1");
+        d.add("mybox", id2.node_id(), "2.2.2.2:2"); // overwrite
+        assert!(!d.is_trusted(&id1.node_id()), "old entry must be gone");
+        assert!(d.is_trusted(&id2.node_id()), "new entry must be present");
+        let (_, addr) = d.get("mybox").unwrap();
+        assert_eq!(addr, "2.2.2.2:2");
     }
 }

@@ -15,14 +15,19 @@ use ce_protocol::{BurnProof, Capability, CellAddress, CellSignal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, Mutex};
 
 use crate::{CeJobStatus, JobRecord, JobStore, SignalRing, TxPool};
+
+/// Per-sender last-accepted timestamp (ms). Used to enforce strictly increasing
+/// nonces and close replay attacks within the 5-minute freshness window.
+type NonceCache = Arc<StdMutex<HashMap<NodeId, u64>>>;
 
 #[derive(Clone)]
 struct ApiState {
@@ -39,6 +44,8 @@ struct ApiState {
     settle_notify_tx: mpsc::Sender<()>,
     /// CE data directory; used to load devices.toml for sync/exec auth.
     data_dir: PathBuf,
+    /// Anti-replay: last accepted timestamp per sender NodeId.
+    nonce_cache: NonceCache,
 }
 
 #[derive(Debug, Serialize)]
@@ -440,26 +447,19 @@ fn tx_value(tx: &ce_chain::Tx) -> Option<u64> {
 
 // ----- Device auth -----
 
-/// Canonical bytes the client signs for authenticated sync/exec requests.
-/// scheme: b"ce-auth-v1" SP method SP path SP timestamp_le_u64
-fn auth_bytes(method: &str, path: &str, timestamp_ms: u64) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"ce-auth-v1 ");
-    buf.extend_from_slice(method.as_bytes());
-    buf.push(b' ');
-    buf.extend_from_slice(path.as_bytes());
-    buf.push(b' ');
-    buf.extend_from_slice(&timestamp_ms.to_le_bytes());
-    buf
-}
-
-/// Extract and verify CE device auth headers. Returns the verified sender NodeId on success.
-/// Headers: X-CE-From (64 hex), X-CE-Timestamp (unix ms u64), X-CE-Sig (128 hex).
+/// Verify CE device auth headers against the request body and the devices registry.
+///
+/// - `body`: the raw request body bytes (already read by the caller).
+///   The signature commits to SHA256(body), so a tampered body invalidates the sig.
+/// - `nonce_cache`: per-sender last-accepted timestamp; enforces strictly
+///   increasing nonces to prevent replay within the 5-minute window.
 fn verify_device_auth(
     headers: &HeaderMap,
     method: &str,
     path: &str,
     data_dir: &std::path::Path,
+    body: &[u8],
+    nonce_cache: &NonceCache,
 ) -> Result<NodeId, Response> {
     let from_hex = headers
         .get("x-ce-from")
@@ -474,11 +474,8 @@ fn verify_device_auth(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing X-CE-Sig"))?;
 
-    let from_bytes = hex::decode(from_hex)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad X-CE-From"))?;
-    let from: NodeId = from_bytes
-        .try_into()
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "X-CE-From must be 64 hex chars"))?;
+    let from: NodeId = crate::auth::parse_from_header(from_hex)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "X-CE-From must be 64 hex chars"))?;
 
     let ts_ms: u64 = ts_str
         .parse()
@@ -490,20 +487,40 @@ fn verify_device_auth(
         .try_into()
         .map_err(|_| err(StatusCode::BAD_REQUEST, "X-CE-Sig must be 128 hex chars"))?;
 
-    // Timestamp must be within ±5 minutes of server time.
+    // Freshness: timestamp must be within ±5 minutes of server time.
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let diff = now_ms.abs_diff(ts_ms);
-    if diff > 5 * 60 * 1000 {
+    if now_ms.abs_diff(ts_ms) > 5 * 60 * 1000 {
         return Err(err(StatusCode::UNAUTHORIZED, "X-CE-Timestamp out of range"));
     }
 
-    let bytes = auth_bytes(method, path, ts_ms);
-    verify(&from, &bytes, &sig)
-        .map_err(|_| err(StatusCode::UNAUTHORIZED, "invalid CE signature"))?;
+    // Anti-replay: require strictly increasing timestamp per sender.
+    {
+        let mut cache = nonce_cache.lock().expect("nonce cache poisoned");
+        if let Some(&last) = cache.get(&from) {
+            if ts_ms <= last {
+                return Err(err(
+                    StatusCode::UNAUTHORIZED,
+                    format!("replayed request: ts {ts_ms} <= last accepted {last}"),
+                ));
+            }
+        }
+        // Update before signature check so a burst of replays can't race through.
+        cache.insert(from, ts_ms);
+    }
 
+    // Signature covers method + path + timestamp + SHA256(body).
+    let bytes = crate::auth::auth_bytes(method, path, ts_ms, body);
+    if let Err(_) = verify(&from, &bytes, &sig) {
+        // On bad sig, roll back the nonce update so the client can retry with a newer ts.
+        let mut cache = nonce_cache.lock().expect("nonce cache poisoned");
+        cache.remove(&from);
+        return Err(err(StatusCode::UNAUTHORIZED, "invalid CE signature"));
+    }
+
+    // Trust check: sender must be in the local device registry.
     let devices = crate::devices::Devices::load_or_empty(&data_dir.join("machines.toml"));
     if !devices.is_trusted(&from) {
         return Err(err(StatusCode::FORBIDDEN, "sender is not a trusted device"));
@@ -520,17 +537,25 @@ async fn sync_put(
     req: Request,
 ) -> Response {
     let path = req.uri().path().to_string();
-    if let Err(resp) = verify_device_auth(&headers, "PUT", &path, &state.data_dir) {
+
+    // Read body FIRST — auth signature commits to SHA256(body).
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 256 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("read body: {e}")),
+    };
+
+    if let Err(resp) =
+        verify_device_auth(&headers, "PUT", &path, &state.data_dir, &body_bytes, &state.nonce_cache)
+    {
         return resp;
     }
 
-    // Strip the leading "/sync/" prefix to get the relative path.
-    let rel = req.uri().path().trim_start_matches("/sync/");
+    // Resolve the target path under the user's home directory.
+    let rel = path.trim_start_matches("/sync/");
     let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let target = home.join(rel);
-
-    // Prevent path traversal outside the home directory.
     let canonical_home = home.canonicalize().unwrap_or(home.clone());
+
     let canonical_target = match target.parent() {
         Some(p) => {
             let _ = std::fs::create_dir_all(p);
@@ -546,11 +571,6 @@ async fn sync_put(
     if !canonical_target.starts_with(&canonical_home) {
         return err(StatusCode::BAD_REQUEST, "path traversal not allowed");
     }
-
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 256 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("read body: {e}")),
-    };
 
     if let Some(parent) = canonical_target.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -573,11 +593,14 @@ async fn sync_get(
     req: Request,
 ) -> Response {
     let path = req.uri().path().to_string();
-    if let Err(resp) = verify_device_auth(&headers, "GET", &path, &state.data_dir) {
+    // GET has no body; sign against empty bytes.
+    if let Err(resp) =
+        verify_device_auth(&headers, "GET", &path, &state.data_dir, b"", &state.nonce_cache)
+    {
         return resp;
     }
 
-    let rel = req.uri().path().trim_start_matches("/sync/");
+    let rel = path.trim_start_matches("/sync/");
     let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let target = home.join(rel);
     let canonical_home = home.canonicalize().unwrap_or(home.clone());
@@ -589,12 +612,10 @@ async fn sync_get(
         return err(StatusCode::BAD_REQUEST, "path traversal not allowed");
     }
 
-    let data = match std::fs::read(&canonical_target) {
-        Ok(d) => d,
-        Err(_) => return err(StatusCode::NOT_FOUND, "file not found"),
-    };
-
-    (StatusCode::OK, Body::from(data)).into_response()
+    match std::fs::read(&canonical_target) {
+        Ok(data) => (StatusCode::OK, Body::from(data)).into_response(),
+        Err(_) => err(StatusCode::NOT_FOUND, "file not found"),
+    }
 }
 
 // ----- POST /exec -----
@@ -603,7 +624,7 @@ async fn sync_get(
 pub struct ExecRequest {
     /// Command to run, e.g. ["cargo", "build", "--release"].
     pub cmd: Vec<String>,
-    /// Working directory (relative to home dir or absolute). Defaults to home.
+    /// Working directory (relative to `~/` or absolute). Defaults to `~/`.
     #[serde(default)]
     pub cwd: Option<String>,
 }
@@ -615,16 +636,23 @@ struct ExecResponse {
     exit_code: i32,
 }
 
-async fn exec_command(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(req): Json<ExecRequest>,
-) -> Response {
-    // Build the path string for auth (fixed, not from URI since body carries the command).
-    let path = "/exec";
-    if let Err(resp) = verify_device_auth(&headers, "POST", path, &state.data_dir) {
+async fn exec_command(State(state): State<ApiState>, headers: HeaderMap, req: Request) -> Response {
+    // Read body first — auth signature must commit to the body hash.
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("read body: {e}")),
+    };
+
+    if let Err(resp) =
+        verify_device_auth(&headers, "POST", "/exec", &state.data_dir, &body_bytes, &state.nonce_cache)
+    {
         return resp;
     }
+
+    let req: ExecRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")),
+    };
 
     if req.cmd.is_empty() {
         return err(StatusCode::BAD_REQUEST, "cmd must not be empty");
@@ -632,35 +660,31 @@ async fn exec_command(
 
     let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let cwd = match &req.cwd {
-        Some(c) => {
-            let p = if c.starts_with('~') {
-                home.join(c.trim_start_matches("~/").trim_start_matches('~'))
-            } else {
-                PathBuf::from(c)
-            };
-            p
+        Some(c) if c.starts_with('~') => {
+            home.join(c.trim_start_matches("~/").trim_start_matches('~'))
         }
+        Some(c) => PathBuf::from(c),
         None => home,
     };
 
-    let result = tokio::process::Command::new(&req.cmd[0])
+    match tokio::process::Command::new(&req.cmd[0])
         .args(&req.cmd[1..])
         .current_dir(&cwd)
         .output()
-        .await;
-
-    match result {
+        .await
+    {
         Ok(output) => {
             let exit_code = output.status.code().unwrap_or(-1);
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            tracing::info!(
-                "exec {:?} in {} → exit {}",
-                req.cmd,
-                cwd.display(),
-                exit_code
-            );
-            (StatusCode::OK, Json(ExecResponse { stdout, stderr, exit_code })).into_response()
+            tracing::info!("exec {:?} in {} → exit {exit_code}", req.cmd, cwd.display());
+            (
+                StatusCode::OK,
+                Json(ExecResponse {
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    exit_code,
+                }),
+            )
+                .into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("exec failed: {e}")),
     }
@@ -686,6 +710,7 @@ pub async fn start(
         tracing::warn!("Docker unavailable — job routes will return 503");
     }
     let host_node_id = identity.node_id();
+    let nonce_cache: NonceCache = Arc::new(StdMutex::new(HashMap::new()));
     let state = ApiState {
         docker,
         chain,
@@ -698,6 +723,7 @@ pub async fn start(
         pool,
         settle_notify_tx,
         data_dir,
+        nonce_cache,
     };
 
     let app = Router::new()

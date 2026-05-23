@@ -1,13 +1,10 @@
 use anyhow::{anyhow, Result};
 use ce_chain::Chain;
 use ce_identity::Identity;
-use ce_node::{devices::Devices, Node, NodeConfig};
+use ce_node::{auth::make_auth_headers, devices::Devices, Node, NodeConfig};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
-use std::{
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -89,30 +86,6 @@ fn devices_path(data_dir: &PathBuf) -> PathBuf {
     data_dir.join("machines.toml")
 }
 
-/// Build CE identity auth headers for a request.
-/// Signs: b"ce-auth-v1" SP method SP path SP timestamp_le_u64
-fn auth_headers(identity: &Identity, method: &str, path: &str) -> Result<Vec<(String, String)>> {
-    let ts_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"ce-auth-v1 ");
-    buf.extend_from_slice(method.as_bytes());
-    buf.push(b' ');
-    buf.extend_from_slice(path.as_bytes());
-    buf.push(b' ');
-    buf.extend_from_slice(&ts_ms.to_le_bytes());
-
-    let sig = identity.sign(&buf);
-
-    Ok(vec![
-        ("X-CE-From".to_string(), hex::encode(identity.node_id())),
-        ("X-CE-Timestamp".to_string(), ts_ms.to_string()),
-        ("X-CE-Sig".to_string(), hex::encode(sig)),
-    ])
-}
 
 /// Default paths to skip during sync.
 fn should_ignore(rel: &std::path::Path) -> bool {
@@ -290,9 +263,9 @@ async fn main() -> Result<()> {
                 let url = format!("http://{addr}{api_path}");
 
                 let file_bytes = std::fs::read(entry.path())?;
-                let headers = auth_headers(&identity, "PUT", &api_path)?;
+                let auth = make_auth_headers(&identity, "PUT", &api_path, &file_bytes);
                 let mut req = client.put(&url).body(file_bytes);
-                for (k, v) in &headers {
+                for (k, v) in &auth {
                     req = req.header(k, v);
                 }
 
@@ -322,13 +295,12 @@ async fn main() -> Result<()> {
             let (_, addr) = devices.get(&machine)?;
 
             let url = format!("http://{addr}/exec");
-            let api_path = "/exec";
-            let headers = auth_headers(&identity, "POST", api_path)?;
-
-            let body = serde_json::json!({ "cmd": command });
+            let body_json = serde_json::json!({ "cmd": command });
+            let body_bytes = serde_json::to_vec(&body_json)?;
+            let auth = make_auth_headers(&identity, "POST", "/exec", &body_bytes);
             let client = reqwest::Client::new();
-            let mut req = client.post(&url).json(&body);
-            for (k, v) in &headers {
+            let mut req = client.post(&url).body(body_bytes).header("content-type", "application/json");
+            for (k, v) in &auth {
                 req = req.header(k, v);
             }
 

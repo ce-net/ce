@@ -48,6 +48,47 @@ The foundation — identity, chain, mesh, protocol, containers, job economy — 
 
 **TrustGrant not broadcast on mesh** — `ce devices add` stores the trust relationship locally in `machines.toml`. Broadcasting a `TrustGrant` tx to the mesh (so other nodes can discover trust) is planned but not yet wired to the CLI.
 
+**Transport encryption (TLS) not yet implemented** — CE auth provides authenticity and body integrity but NOT confidentiality. Plain HTTP means file contents are visible on the wire. TLS is required for production use; see security model below.
+
+---
+
+## Security model — sync/exec
+
+### What the current auth scheme provides
+
+Every sync/exec request is authenticated with the sender's Ed25519 identity key. The signature covers:
+
+```
+b"ce-auth-v1 " || METHOD || " " || PATH || " " || timestamp_le_u64 || " " || SHA256(body)
+```
+
+| Property | Mechanism |
+|---|---|
+| **Authenticity** | Only the holder of the private key can produce a valid signature |
+| **Body integrity** | Signature commits to SHA256(body); swapping file contents invalidates it |
+| **Freshness** | Timestamp must be within ±5 minutes of server time |
+| **Replay prevention** | Server tracks last-accepted timestamp per sender; strictly increasing requirement |
+| **Explicit trust** | Sender must appear in `machines.toml` before any request is accepted |
+
+### What SSH provides that CE currently lacks
+
+| Property | SSH | CE current | CE target |
+|---|---|---|---|
+| Transport encryption | ✅ AES/ChaCha20 | ❌ plain HTTP | ✅ TLS from CE identity key |
+| Server authentication | ⚠️ TOFU on first connect | n/a | ✅ cert pinned against registered NodeId |
+| Client authentication | ✅ public key | ✅ Ed25519 signature | ✅ same |
+| Session integrity (MITM) | ✅ MAC on all data | ✅ body-hash signature | ✅ TLS adds MAC on transport |
+| Key management | Separate SSH keys | Same CE identity key | Same CE identity key |
+| Trust model | TOFU (first-connect) | Explicit registry | Explicit registry |
+
+### Path to full encryption
+
+**Interim**: Put the API behind a TLS-terminating reverse proxy (nginx/caddy). Standard practice; zero code changes required.
+
+**CE-native (planned)**: Derive a self-signed TLS certificate from the CE Ed25519 identity key using `rcgen`. Clients pin the certificate against the registered NodeId (the cert's embedded public key equals the node's identity). This eliminates TOFU entirely: you register the NodeId before connecting, and TLS verifies the server is who you think it is.
+
+**Ideal**: Route sync/exec through the existing libp2p mesh connection, which uses the Noise protocol for encrypted + mutually authenticated transport. No separate TLS layer needed; encryption is free from the mesh infrastructure already in place.
+
 ---
 
 ## Phase 1 — Chain hardening
