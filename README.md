@@ -1,23 +1,23 @@
 # CE
 
-Pronounced "Sea" is a compute substrate and economy which gives people the ability to donate compute to the network in order to use the network. A peer to peer supercomputer + economy. Like if bitcoin would run doom.
+Pronounced "Sea". A peer-to-peer compute mesh and economy. Donate compute to the network, earn credits, spend credits on compute. Like if Bitcoin ran Docker.
 
-A Byzantine-fault-tolerant compute marketplace where credit is the only resource allocation mechanism. Every node is assumed hostile. The honest majority wins.
+Every node is assumed hostile. The honest majority wins. No trusted parties.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     CE Node                             │
-│                                                         │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐ │
-│  │ ce-mesh  │  │ ce-chain │  │ce-contain│  │ce-prot │ │
-│  │ libp2p   │  │ PoW ledg │  │ Docker   │  │  CEP-1  │ │
-│  │ gossip   │  │ balance  │  │ metering │  │ signal │ │
-│  └──────────┘  └──────────┘  └──────────┘  └────────┘ │
-│        │              │                                  │
-│        └──────── ce-node (orchestrator) ────────────────┤
-│                        │                                 │
-│               HTTP API :8080                            │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                          CE Node                            │
+│                                                             │
+│  ┌──────────┐  ┌──────────┐  ┌────────────┐  ┌─────────┐  │
+│  │ ce-mesh  │  │ ce-chain │  │ ce-container│  │ce-proto │  │
+│  │  libp2p  │  │ uptime   │  │   Docker/   │  │  CEP-1  │  │
+│  │ gossip   │  │ emission │  │   gVisor    │  │ signals │  │
+│  └──────────┘  └──────────┘  └────────────┘  └─────────┘  │
+│        │              │                                      │
+│        └───────── ce-node (orchestrator) ───────────────────┤
+│                          │                                   │
+│                HTTP API :8080                               │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Quick Start
@@ -26,89 +26,132 @@ A Byzantine-fault-tolerant compute marketplace where credit is the only resource
 # Build
 cargo build --release
 
-# Start a node (mines immediately, API on :8080, P2P on :4001)
+# Start a node (mines blocks, API on :8080, P2P on :4001)
 ./target/release/ce start
 
-# Check status
+# Check status and balance
 ./target/release/ce status
 
 # Join an existing network
 ./target/release/ce start --port 4002 --api-port 8081 \
   --bootstrap /ip4/1.2.3.4/tcp/4001/p2p/<peer-id>
 
-# Submit a container job (payer must have positive balance)
-curl -X POST http://localhost:8080/jobs/run \
+# Submit a container job (node must have positive balance)
+curl -X POST http://localhost:8080/jobs/bid \
   -H 'Content-Type: application/json' \
-  -d '{"image":"alpine:latest","payer":"<64-hex-node-id>"}'
+  -d '{"image":"alpine:latest","cpu_cores":1,"mem_mb":128,"duration_secs":30,"bid":100}'
 ```
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) for the full design.
-
-### Three components
-
-| Component | What it does |
-|---|---|
-| **Mesh** (`ce-mesh`) | libp2p 0.53: Kademlia DHT + Gossipsub. Five topics: txs, blocks, heights, syncreq, syncresp. |
-| **Economy** (`ce-chain`) | PoW blockchain. Two tx types: `Transfer` and `Meter`. Block reward halves every 210k blocks. |
-| **Container** (`ce-container`) | Docker metering via bollard. Reads `ce.payer` label, meters CPU + memory every 10s. |
-
-### Credit model
-
-- Mining a block earns the block reward (starts at 1,000 credits, halves every 210,000 blocks)
-- The earlier you join and the longer you run, the more credits you accumulate
-- Running a job deducts credits from the payer; the host node earns them
-- No credits → no jobs run → no network access
-
-### ce-protocol-1 (CEP-1)
-
-Containers that implement `ce-protocol` (`CellSignal`) get first-class status in the mesh:
-they can signal other cells and attach burn proofs. Foreign containers run but can't communicate
-through CE. See [docs/protocol.md](docs/protocol.md).
-
-## Crates
+### Crates
 
 | Crate | Description |
 |---|---|
-| `ce-identity` | Ed25519 keypair, node ID, signing, verification |
-| `ce-chain` | Blockchain, PoW, transactions, balance, persistence |
-| `ce-mesh` | libp2p networking layer (gossip, DHT, chain sync) |
-| `ce-container` | Docker container management and credit metering |
-| `ce-node` | Orchestrator: ties all crates together, HTTP API |
-| `ce-protocol` | ce-protocol-1 (CEP-1) wire format |
-| `ce-deploy` | Hetzner provisioning + SSH deployment for E2E tests |
+| `ce-identity` | Ed25519 keypair, node ID, sign, verify |
+| `ce-chain` | Blockchain, uptime emission, transactions, balance, persistence |
+| `ce-mesh` | libp2p networking — Kademlia DHT + Gossipsub, chain sync |
+| `ce-container` | Docker container management, gVisor isolation, resource limits |
+| `ce-node` | Orchestrator: ties everything together, HTTP API, mining loop |
+| `ce-protocol` | ce-protocol-1 (CEP-1) cell signaling wire format |
+| `ce-deploy` | Hetzner provisioning and SSH deployment for E2E tests |
+
+### Credit model
+
+Nodes earn credits by staying online and mining blocks. Credits are spent to run containers on other nodes.
+
+- Block production: every 10 seconds, the node seals a block and includes one `UptimeReward` tx for itself
+- Emission starts at 1,000 credits/block, halves every 210,000 blocks, hard cap 21 billion
+- Running a job debits the payer; the host earns the settlement cost
+- No balance → `POST /jobs/bid` returns 402
+
+### Transaction types
+
+| Type | Who signs | Effect |
+|---|---|---|
+| `Transfer` | sender | Move credits between nodes |
+| `UptimeReward` | miner | Mint credits for the block producer |
+| `JobBid` | payer | Broadcast an open offer for compute |
+| `JobSettle` | host (+ payer co-sig) | Confirm job completion, transfer cost |
+
+### Job lifecycle
+
+```
+Payer: POST /jobs/bid          → JobBid tx broadcast on mesh
+Any host with capacity:        → accepts bid, pulls image, starts container
+Container runs...
+Container exits:               → host marks job awaiting_settlement
+Payer: POST /jobs/:id/settle   → payer signs (job_id, cost)
+Host:                          → builds JobSettle tx, broadcasts
+Next block:                    → chain confirms, balances updated
+```
+
+Chain validation enforces: payer != host, payer_sig valid, matching JobBid in prior block, no double-settle, payer balance >= cost.
+
+### Cell protocol (CEP-1)
+
+Containers that implement `ce-protocol` can signal other nodes through the mesh. Every signal is Ed25519-signed and requires a `BurnProof` (on-chain tx reference) for non-empty payloads — prevents free-riding.
+
+```
+ce-protocol-1 gossip topic
+  inbound:  decode → verify sig → burn-proof check against chain → expose via GET /signals
+  outbound: POST /signals/send → sign → broadcast
+```
+
+### Container isolation
+
+All containers run with:
+- **Runtime**: `runsc` (gVisor) when available; falls back to runc with a logged warning
+- **CPU**: cgroup v2 hard limit (`nano_cpus`)
+- **Memory**: cgroup v2 hard limit
+- **Network**: `none` — no direct internet; all traffic must route through CE
+
+### Mesh
+
+libp2p 0.53, six Gossipsub topics:
+
+| Topic | Purpose |
+|---|---|
+| `ce-transactions` | Broadcast pending txs |
+| `ce-blocks` | Broadcast newly mined blocks |
+| `ce-heights` | Height announcements for sync triggering |
+| `ce-syncreq` | Request blocks from a given height |
+| `ce-syncresp` | Serve blocks to syncing nodes (up to 500/batch, 4MB max) |
+| `ce-protocol-1` | CEP-1 cell signals |
 
 ## Testing
 
 ```bash
-# Unit tests (no infrastructure needed)
+# Unit tests — no infrastructure needed
 cargo test --workspace
 
 # Local multi-node integration tests
 cargo test -p ce-node -- --nocapture
 
-# Hetzner E2E tests (requires API token and SSH key)
-export HETZNER_API_TOKEN=hcloud-...
-export CE_SSH_KEY_NAME=my-hetzner-key
-export CE_SSH_KEY_PATH=~/.ssh/id_ed25519
+# Job lifecycle test — requires Docker
+cargo test -p ce-node job_lifecycle -- --ignored --nocapture
+
+# Hetzner E2E tests — requires HETZNER_API_TOKEN, CE_SSH_KEY_NAME, CE_SSH_KEY_PATH
 cargo build --release
 cargo test -p ce-deploy -- --ignored --nocapture
 ```
 
-See [docs/deployment.md](docs/deployment.md) for full deployment instructions.
+See [docs/testing.md](docs/testing.md) for full test instructions.
 
 ## API Reference
 
-See [docs/api.md](docs/api.md).
+See [docs/api.md](docs/api.md) for the complete reference.
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | Liveness probe |
 | GET | `/status` | Node ID, chain height, balance |
-| POST | `/jobs/run` | Start a container job |
-| GET | `/jobs/:id` | Inspect a running job |
-| DELETE | `/jobs/:id` | Stop and remove a job |
+| POST | `/jobs/bid` | Broadcast a container job bid |
+| GET | `/jobs/:id` | Job status (pending/running/awaiting_settlement/settled/failed) |
+| POST | `/jobs/:id/settle` | Payer co-signs the settlement |
+| DELETE | `/jobs/:id` | Force-stop a container |
+| GET | `/signals` | Last 100 validated CEP-1 signals |
+| POST | `/signals/send` | Sign and broadcast a CEP-1 signal |
 
 ## Data Directory
 
@@ -120,4 +163,13 @@ Default: `~/.local/share/ce/`
 │   └── node.key          # Ed25519 secret key (chmod 600)
 └── chain/
     └── chain.json        # Full blockchain (JSON)
+```
+
+## CLI
+
+```
+ce start [--port 4001] [--api-port 8080] [--bootstrap <multiaddr>]
+ce status
+ce balance
+ce id
 ```

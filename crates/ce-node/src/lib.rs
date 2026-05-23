@@ -386,6 +386,9 @@ async fn mesh_event_loop(
     signal_tx: broadcast::Sender<CellSignal>,
     bid_notify_tx: mpsc::Sender<Tx>,
 ) {
+    // Tracks the highest accepted nonce per sender to prevent replays.
+    let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
+
     while let Some(event) = rx.recv().await {
         match event {
             MeshEvent::NewBlock(block) => {
@@ -468,6 +471,20 @@ async fn mesh_event_loop(
             MeshEvent::PeerConnected(peer) => info!("peer connected: {peer}"),
             MeshEvent::PeerDisconnected(peer) => info!("peer disconnected: {peer}"),
             MeshEvent::CellSignal(signal) => {
+                // Reject replays: nonce must strictly increase per sender.
+                // Only enforced once we've seen at least one signal from them.
+                if let Some(&prev) = last_nonce.get(&signal.from) {
+                    if signal.nonce <= prev {
+                        warn!(
+                            "dropping replay from {}: nonce {} <= last {}",
+                            hex::encode(&signal.from[..4]),
+                            signal.nonce,
+                            prev,
+                        );
+                        continue;
+                    }
+                }
+
                 if signal.requires_burn() {
                     warn!(
                         "dropping ce-protocol-1 signal from {}: payload without burn_proof",
@@ -495,6 +512,7 @@ async fn mesh_event_loop(
                         continue;
                     }
                 }
+                last_nonce.insert(signal.from, signal.nonce);
                 {
                     let mut ring = signals.lock().await;
                     push_signal(&mut ring, signal.clone());

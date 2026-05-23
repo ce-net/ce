@@ -35,7 +35,7 @@ Node status snapshot.
 |---|---|---|
 | `node_id` | string | 64-hex-char Ed25519 public key (= this node's identity) |
 | `height` | integer | Index of the tip block (0 = only genesis) |
-| `difficulty` | integer | Current PoW difficulty |
+| `difficulty` | integer | Vestigial PoW field, always 0 in uptime-emission model |
 | `balance` | integer | This node's credit balance |
 
 ---

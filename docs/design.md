@@ -26,12 +26,12 @@ Bitcoin proved that honest-majority PoW works when the incentive is to be honest
 ```
 Time →
 
-Node mines block:  +block_reward(height)       ← early adopter multiplier
-Node hosts job:    +cost of job                 ← Meter tx credits host
-Node runs job:     -cost of job                 ← Meter tx debits payer
+Node seals block:  +emission_rate(height)       ← early adopter multiplier (UptimeReward tx)
+Node hosts job:    +cost of job                 ← JobSettle tx credits host
+Node runs job:     -cost of job                 ← JobSettle tx debits payer
 ```
 
-The block reward halves every 210,000 blocks so early nodes accumulate disproportionately more credit for the same compute — same economic design as Bitcoin mining.
+The uptime emission starts at 1,000 credits/block, halves every 210,000 blocks (hard cap 21B). Early nodes accumulate disproportionately more credit — same economic design as Bitcoin mining, without the hash grinding.
 
 ### Chain sync
 
@@ -54,7 +54,7 @@ start
  ├─ announce our height to peers
  │
  ├─ [task] mining loop
- │     build block → spawn_blocking(mine) → append → broadcast → announce height
+ │     10s ticker → build block with UptimeReward → seal (sign) → append → broadcast → announce height
  │
  ├─ [task] mesh event loop
  │     NewTx → verify → add to pool
@@ -76,7 +76,7 @@ start
 |---|---|
 | Identity integrity | Ed25519 keys; same key seeds both chain and libp2p identity |
 | Tx authenticity | Every tx signed by origin node; chain validates before accepting |
-| Block integrity | SHA256 PoW; chain validates prev_hash, index, difficulty, tx sigs |
-| Ledger consensus | Longest valid chain wins; honest majority > 50% required |
+| Block integrity | Ed25519 block seal; chain validates prev_hash, index, tx sigs, emission amount |
+| Ledger consensus | First valid chain wins currently; honest majority > 50% required |
 | Replay prevention | CellSignal carries monotone nonce per sender |
 | Credit enforcement | No credits → API returns 402 before touching Docker |
