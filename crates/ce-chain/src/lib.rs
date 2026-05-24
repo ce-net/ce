@@ -155,6 +155,21 @@ pub struct Chain {
     pub blocks: Vec<Block>,
     /// Retained for forward compatibility; not used for validation in the uptime model.
     pub difficulty: u8,
+
+    // Incremental caches — NOT persisted to disk (rebuilt on load).
+    // These turn O(n) full-chain scans into O(1) lookups.
+
+    /// Net balance per node: debits and credits accumulated over all confirmed blocks.
+    #[serde(skip, default)]
+    balances: std::collections::HashMap<NodeId, i64>,
+
+    /// Highest confirmed Heartbeat epoch per (cell, host) pair.
+    #[serde(skip, default)]
+    heartbeat_max_epoch: std::collections::HashMap<(NodeId, NodeId), u64>,
+
+    /// tx_id → (block.index, position-in-block-txs): O(1) tx lookup.
+    #[serde(skip, default)]
+    tx_index: std::collections::HashMap<[u8; 32], (u64, usize)>,
 }
 
 impl Chain {
@@ -168,7 +183,52 @@ impl Chain {
             miner: [0u8; 32],
             sig: [0u8; 64],
         };
-        Self { blocks: vec![genesis], difficulty: 0 }
+        Self {
+            blocks: vec![genesis],
+            difficulty: 0,
+            balances: std::collections::HashMap::new(),
+            heartbeat_max_epoch: std::collections::HashMap::new(),
+            tx_index: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Rebuild all incremental caches from the current block list.
+    /// Called once after loading from disk.
+    pub fn rebuild_caches(&mut self) {
+        self.balances.clear();
+        self.heartbeat_max_epoch.clear();
+        self.tx_index.clear();
+        let blocks = self.blocks.clone();
+        for block in &blocks {
+            self.apply_block_to_cache(block);
+        }
+    }
+
+    /// Apply one block's transactions to the incremental caches.
+    fn apply_block_to_cache(&mut self, block: &Block) {
+        for (pos, tx) in block.transactions.iter().enumerate() {
+            match &tx.kind {
+                TxKind::Transfer { from, to, amount } => {
+                    *self.balances.entry(*from).or_insert(0) -= *amount as i64;
+                    *self.balances.entry(*to).or_insert(0) += *amount as i64;
+                }
+                TxKind::UptimeReward { node, amount, .. } => {
+                    *self.balances.entry(*node).or_insert(0) += *amount as i64;
+                }
+                TxKind::JobSettle { host, payer, cost, .. } => {
+                    *self.balances.entry(*payer).or_insert(0) -= *cost as i64;
+                    *self.balances.entry(*host).or_insert(0) += *cost as i64;
+                }
+                TxKind::Heartbeat { cell, host, amount, epoch } => {
+                    *self.balances.entry(*cell).or_insert(0) -= *amount as i64;
+                    *self.balances.entry(*host).or_insert(0) += *amount as i64;
+                    let e = self.heartbeat_max_epoch.entry((*cell, *host)).or_insert(0);
+                    if *epoch >= *e { *e = *epoch; }
+                }
+                TxKind::JobBid { .. } | TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => {}
+            }
+            self.tx_index.insert(tx.id(), (block.index, pos));
+        }
     }
 
     pub fn tip(&self) -> &Block {
@@ -421,6 +481,7 @@ impl Chain {
                 }
             }
         }
+        self.apply_block_to_cache(&block);
         self.blocks.push(block);
         true
     }
@@ -490,46 +551,25 @@ impl Chain {
         let mut reorg_chain = Chain {
             blocks: self.blocks[..=fork_pos].to_vec(),
             difficulty: self.difficulty,
+            balances: std::collections::HashMap::new(),
+            heartbeat_max_epoch: std::collections::HashMap::new(),
+            tx_index: std::collections::HashMap::new(),
         };
+        reorg_chain.rebuild_caches();
         for block in new_suffix {
             if !reorg_chain.append(block) {
                 return false; // invalid block in candidate chain; abort
             }
         }
 
+        reorg_chain.rebuild_caches();
         *self = reorg_chain;
         true
     }
 
+    /// O(1) balance lookup via the incremental cache.
     pub fn balance(&self, node: &NodeId) -> i64 {
-        let mut bal: i64 = 0;
-        for block in &self.blocks {
-            for tx in &block.transactions {
-                match &tx.kind {
-                    TxKind::Transfer { from, to, amount } => {
-                        if from == node { bal -= *amount as i64; }
-                        if to == node { bal += *amount as i64; }
-                    }
-                    TxKind::UptimeReward { node: n, amount, .. } => {
-                        if n == node { bal += *amount as i64; }
-                    }
-                    TxKind::JobBid { .. } => {
-                        // Bids lock credits but don't affect the ledger balance until settled.
-                    }
-                    TxKind::JobSettle { host, payer, cost, .. } => {
-                        if payer == node { bal -= *cost as i64; }
-                        if host == node { bal += *cost as i64; }
-                    }
-                    TxKind::Heartbeat { cell, host, amount, .. } => {
-                        if cell == node { bal -= *amount as i64; }
-                        if host == node { bal += *amount as i64; }
-                    }
-                    // JobExpire and TrustGrant have no direct balance effect.
-                    TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => {}
-                }
-            }
-        }
-        bal
+        self.balances.get(node).copied().unwrap_or(0)
     }
 
     /// Credits locked in open bids (no matching JobSettle or JobExpire yet) for a node.
@@ -555,37 +595,19 @@ impl Chain {
             .sum()
     }
 
-    /// Highest confirmed Heartbeat epoch for a given (cell, host) pair across all blocks.
+    /// O(1) lookup for the highest confirmed Heartbeat epoch for a (cell, host) pair.
     /// Returns None if no Heartbeat has been confirmed for this pair yet.
     pub fn last_heartbeat_epoch(&self, cell: &NodeId, host: &NodeId) -> Option<u64> {
-        let mut max_epoch: Option<u64> = None;
-        for block in &self.blocks {
-            for tx in &block.transactions {
-                if let TxKind::Heartbeat { cell: c, host: h, epoch, .. } = &tx.kind {
-                    if c == cell && h == host {
-                        max_epoch = Some(match max_epoch {
-                            Some(m) => m.max(*epoch),
-                            None => *epoch,
-                        });
-                    }
-                }
-            }
-        }
-        max_epoch
+        self.heartbeat_max_epoch.get(&(*cell, *host)).copied()
     }
 
-    /// Linear scan of all blocks for a transaction with the given id.
-    /// Returns the tx together with the block height and block hash that
-    /// confirmed it. Used by signal verification to validate a `BurnProof`.
+    /// O(1) transaction lookup via the tx index.
+    /// Returns the tx together with the block height and block hash.
     pub fn tx_by_id(&self, tx_id: &[u8; 32]) -> Option<(Tx, u64, [u8; 32])> {
-        for block in &self.blocks {
-            for tx in &block.transactions {
-                if &tx.id() == tx_id {
-                    return Some((tx.clone(), block.index, block.hash()));
-                }
-            }
-        }
-        None
+        let &(blk_idx, tx_pos) = self.tx_index.get(tx_id)?;
+        let block = self.blocks.get(blk_idx as usize)?;
+        let tx = block.transactions.get(tx_pos)?;
+        Some((tx.clone(), block.index, block.hash()))
     }
 
     pub fn next_block(&self, transactions: Vec<Tx>, miner: NodeId) -> Block {
@@ -605,10 +627,11 @@ impl Chain {
 
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path)?;
-        let chain: Chain = serde_json::from_str(&data)?;
+        let mut chain: Chain = serde_json::from_str(&data)?;
         if chain.blocks.is_empty() {
             return Err(anyhow!("chain file is empty"));
         }
+        chain.rebuild_caches();
         Ok(chain)
     }
 

@@ -24,7 +24,8 @@ Run with `cargo test --workspace`. These are fast (sub-second) and test logic in
 - `node_id_hex_roundtrips` — hex decode roundtrip
 
 ### ce-chain tests
-- `try_reorg_switches_to_longer_fork` — longer competing chain replaces ours
+- `try_reorg_switches_to_longer_fork` — longer competing chain replaces ours (longest-chain rule)
+- Balance, heartbeat epoch, and tx lookups now use O(1) incremental caches instead of O(n) full scans
 - `try_reorg_ignores_equal_length_fork` — equal-length fork does not trigger reorg
 - `try_reorg_rejects_invalid_block_in_fork` — corrupt block in fork aborts reorg
 - `try_reorg_no_connection_returns_false` — orphaned blocks with no common ancestor rejected
