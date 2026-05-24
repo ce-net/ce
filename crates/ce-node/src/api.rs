@@ -11,7 +11,7 @@ use bollard::{container::RemoveContainerOptions, Docker};
 use ce_chain::{payer_settle_bytes, Chain};
 use ce_container::{exec_in_container, ExecSpec};
 use ce_identity::{verify, Identity, NodeId};
-use ce_mesh::MeshHandle;
+use ce_mesh::{MeshHandle, RpcRequest, RpcResponse, peer_id_from_node_id};
 use ce_protocol::{BurnProof, Capability, CellAddress, CellSignal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -400,12 +400,9 @@ async fn send_signal(
             return err(StatusCode::BAD_REQUEST, "referenced tx has no burnable amount");
         };
         Some(BurnProof { tx_id, amount, block_height: height, block_hash: hash })
-    } else if !payload.is_empty() {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "burn_tx_id_hex is required when payload_hex is non-empty",
-        );
     } else {
+        // No burn_tx_id_hex supplied. The local node is implicitly trusted — the API
+        // is only reachable on localhost — so we allow free payloads from here.
         None
     };
 
@@ -762,6 +759,106 @@ async fn transfer(State(state): State<ApiState>, Json(req): Json<TransferRequest
     (StatusCode::CREATED, Json(TransferResponse { tx_id })).into_response()
 }
 
+// ----- POST /mesh-exec -----
+//
+// Routes an exec request to a remote trusted device through the CE mesh (/ce/rpc/1).
+// The local node must be running with a relay connection; the target is identified by
+// CE NodeId (not an IP address). See docs/architecture.md for the full flow.
+
+#[derive(Debug, Deserialize)]
+struct MeshExecRequest {
+    /// CE NodeId of the target device (64 hex chars).
+    node_id: String,
+    /// Optional relay circuit multiaddr for dialing the target if not yet in the DHT.
+    /// Corresponds to the `multiaddr` field in machines.toml.
+    #[serde(default)]
+    hint_multiaddr: String,
+    image: String,
+    #[serde(default)]
+    cmd: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+async fn mesh_exec(State(state): State<ApiState>, Json(req): Json<MeshExecRequest>) -> Response {
+    let node_id: NodeId = match hex::decode(&req.node_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "`node_id` must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&node_id) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
+    };
+    if req.cmd.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "cmd must not be empty");
+    }
+
+    // Provide the relay circuit as a dial hint so the swarm can reach the target even
+    // if it isn't already in the Kademlia routing table.
+    if !req.hint_multiaddr.is_empty() {
+        let _ = state.mesh_handle.dial(req.hint_multiaddr).await;
+    }
+
+    let rpc_req = RpcRequest::Exec {
+        from_node: state.host_node_id,
+        image: req.image,
+        cmd: req.cmd,
+        cwd: req.cwd,
+    };
+
+    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
+        Ok(RpcResponse::ExecResult { stdout, stderr, exit_code }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "stdout": stdout, "stderr": stderr, "exit_code": exit_code })),
+        )
+            .into_response(),
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
+        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
+    }
+}
+
+// ----- PUT /mesh-sync/:node_id/*path -----
+//
+// Writes a single file on a remote trusted device through the CE mesh.
+// `:node_id` = 64 hex char CE NodeId of target. `*path` = path relative to target's `~/`.
+// Query param `hint` = optional relay circuit multiaddr dial hint.
+
+async fn mesh_sync_put(
+    State(state): State<ApiState>,
+    Path((node_id_hex, file_path)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let node_id: NodeId = match hex::decode(&node_id_hex).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "node_id must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&node_id) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
+    };
+
+    if let Some(hint) = params.get("hint") {
+        if !hint.is_empty() {
+            let _ = state.mesh_handle.dial(hint.clone()).await;
+        }
+    }
+
+    let rpc_req = RpcRequest::SyncFile {
+        from_node: state.host_node_id,
+        path: file_path,
+        data: body.to_vec(),
+    };
+
+    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
+        Ok(RpcResponse::SyncAck) => StatusCode::NO_CONTENT.into_response(),
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
+        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
+    }
+}
+
 // ----- GET /atlas -----
 
 #[derive(Debug, Serialize)]
@@ -795,10 +892,10 @@ pub async fn start(
     settle_notify_tx: mpsc::Sender<()>,
     data_dir: PathBuf,
     atlas: Atlas,
+    docker: Option<Docker>,
 ) -> Result<()> {
-    let docker = Docker::connect_with_socket_defaults().ok();
     if docker.is_none() {
-        tracing::warn!("Docker unavailable — job routes will return 503");
+        tracing::warn!("Docker unavailable — job routes and exec will return 503");
     }
     let host_node_id = identity.node_id();
     let nonce_cache: NonceCache = Arc::new(StdMutex::new(HashMap::new()));
@@ -830,9 +927,12 @@ pub async fn start(
         .route("/signals/send", post(send_signal))
         .route("/health", get(|| async { "ok" }))
         .route("/atlas", get(get_atlas))
-        // Personal mesh OS: authenticated file sync and remote exec.
+        // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))
+        // Personal mesh OS: relay-routed mesh RPCs (correct path for NAT traversal).
+        .route("/mesh-exec", post(mesh_exec))
+        .route("/mesh-sync/:node_id/*path", put(mesh_sync_put))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");

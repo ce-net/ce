@@ -617,7 +617,13 @@ async fn mesh_event_loop(
                     }
                 }
 
-                if signal.requires_burn() {
+                // Trusted devices (registered in machines.toml) may send payloads
+                // without burn proof — they proved identity via noise transport.
+                let sender_is_trusted = {
+                    let path = data_dir.join("machines.toml");
+                    crate::devices::Devices::load_or_empty(&path).is_trusted(&signal.from)
+                };
+                if signal.requires_burn() && !sender_is_trusted {
                     warn!(
                         "dropping ce-protocol-1 signal from {}: payload without burn_proof",
                         hex::encode(&signal.from[..4]),
