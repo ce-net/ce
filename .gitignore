@@ -1,4 +1,20 @@
+# Build output
 /target
+/dist
+*.update-tmp
+
+# Dev noise
 trash
 .claude
+
+# Environment / secrets — never commit these
 .env
+.env.*
+*.secret
+*.pem
+*.p12
+ce-release-key.secret
+
+# Personal machine config — stays local, not for the public repo
+LAPTOP_SETUP.txt
+machines.toml
