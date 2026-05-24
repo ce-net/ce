@@ -1,18 +1,21 @@
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use ce_chain::{Block, Tx};
 use ce_identity::NodeId;
 use ce_protocol::{CellSignal, GOSSIP_TOPIC as PROTOCOL_TOPIC};
+use futures::io::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{
     autonat, dcutr,
     futures::StreamExt,
     gossipsub, identify, kad, mdns,
-    noise, relay,
+    noise, relay, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +30,19 @@ pub fn peer_id_from_secret(secret: [u8; 32]) -> anyhow::Result<libp2p::PeerId> {
     Ok(kp.public().to_peer_id())
 }
 
-// ----- Wire types for sync protocol -----
+/// Compute the libp2p PeerId from a CE node's 32-byte public key (NodeId).
+///
+/// CE NodeId IS the Ed25519 public key. libp2p PeerId is derived from the same key,
+/// so this conversion is deterministic and lossless. Used to verify that the sender
+/// of an incoming mesh RPC actually controls the claimed CE NodeId.
+pub fn peer_id_from_node_id(node_id: &NodeId) -> Result<PeerId> {
+    let pk = libp2p::identity::ed25519::PublicKey::try_from_bytes(node_id)
+        .map_err(|e| anyhow!("invalid node_id as ed25519 public key: {e}"))?;
+    let pk = libp2p::identity::PublicKey::from(pk);
+    Ok(pk.to_peer_id())
+}
+
+// ----- Wire types for chain sync -----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HeightAnnounce {
@@ -40,6 +55,8 @@ struct HeightAnnounce {
 struct SyncReqMsg {
     from_node: NodeId,
     from_height: u64,
+    // Unique nonce prevents gossipsub content-hash dedup from swallowing repeated requests.
+    nonce: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +65,118 @@ struct SyncRespMsg {
     blocks: Vec<Block>,
 }
 
-const MAX_BLOCKS_PER_SYNC: usize = 500;
+// Large enough to cover the full chain in a single batch so try_reorg always
+// has enough history to find a common ancestor and produce a longer fork.
+const MAX_BLOCKS_PER_SYNC: usize = 10_000;
+
+// ----- Mesh RPC protocol (/ce/rpc/1) -----
+//
+// Device-to-device exec and file sync travel over this request-response protocol.
+// The transport layer (noise) authenticates the sender's identity; no separate
+// signature is needed. See docs/architecture.md for the full security model.
+
+/// Request payload for the /ce/rpc/1 protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcRequest {
+    /// Run a sandboxed command on the remote node. The caller's CE NodeId is included
+    /// so the receiver can cross-check it against the noise-authenticated PeerId.
+    Exec {
+        from_node: NodeId,
+        image: String,
+        cmd: Vec<String>,
+        cwd: Option<String>,
+    },
+    /// Write a single file on the remote node's home directory.
+    /// `path` is relative to `~/` — the receiver rejects any `..` components.
+    SyncFile {
+        from_node: NodeId,
+        path: String,
+        data: Vec<u8>,
+    },
+}
+
+impl RpcRequest {
+    pub fn from_node(&self) -> NodeId {
+        match self {
+            Self::Exec { from_node, .. } | Self::SyncFile { from_node, .. } => *from_node,
+        }
+    }
+}
+
+/// Response payload for the /ce/rpc/1 protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcResponse {
+    ExecResult { stdout: String, stderr: String, exit_code: i32 },
+    SyncAck,
+    /// The remote node rejected the request (trust failure, Docker error, etc.).
+    Error(String),
+}
+
+// 256 MB hard cap per RPC message (covers large file syncs; exec output is bounded separately).
+const MAX_RPC_BYTES: usize = 256 * 1024 * 1024;
+
+/// Length-prefixed bincode codec for /ce/rpc/1.
+#[derive(Clone)]
+pub struct CeRpcCodec;
+
+#[async_trait]
+impl request_response::Codec for CeRpcCodec {
+    type Protocol = &'static str;
+    type Request = RpcRequest;
+    type Response = RpcResponse;
+
+    async fn read_request<T>(&mut self, _: &&'static str, io: &mut T)
+        -> std::io::Result<Self::Request>
+    where T: futures::AsyncRead + Unpin + Send
+    {
+        let mut len_buf = [0u8; 4];
+        io.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_RPC_BYTES {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "rpc request too large"));
+        }
+        let mut buf = vec![0u8; len];
+        io.read_exact(&mut buf).await?;
+        bincode::deserialize(&buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    async fn read_response<T>(&mut self, _: &&'static str, io: &mut T)
+        -> std::io::Result<Self::Response>
+    where T: futures::AsyncRead + Unpin + Send
+    {
+        let mut len_buf = [0u8; 4];
+        io.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_RPC_BYTES {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "rpc response too large"));
+        }
+        let mut buf = vec![0u8; len];
+        io.read_exact(&mut buf).await?;
+        bincode::deserialize(&buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    async fn write_request<T>(&mut self, _: &&'static str, io: &mut T, req: Self::Request)
+        -> std::io::Result<()>
+    where T: futures::AsyncWrite + Unpin + Send
+    {
+        let buf = bincode::serialize(&req)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        io.write_all(&(buf.len() as u32).to_be_bytes()).await?;
+        io.write_all(&buf).await
+    }
+
+    async fn write_response<T>(&mut self, _: &&'static str, io: &mut T, res: Self::Response)
+        -> std::io::Result<()>
+    where T: futures::AsyncWrite + Unpin + Send
+    {
+        let buf = bincode::serialize(&res)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        io.write_all(&(buf.len() as u32).to_be_bytes()).await?;
+        io.write_all(&buf).await
+    }
+}
 
 // ----- Command channel -----
 
@@ -59,6 +187,19 @@ enum MeshCommand {
     SendSyncRequest { from_node: NodeId, from_height: u64 },
     SendSyncResponse { for_node: NodeId, blocks: Vec<Block> },
     PublishSignal(Vec<u8>),
+    /// Dial a multiaddr to add a peer as a swarm connection hint.
+    Dial(String),
+    /// Send an RPC request to a specific peer; reply is delivered via `reply_tx`.
+    SendRpc {
+        peer_id: PeerId,
+        request: RpcRequest,
+        reply_tx: oneshot::Sender<RpcResponse>,
+    },
+    /// Deliver a response for an incoming RPC identified by `correlation_id`.
+    RespondRpc {
+        correlation_id: u64,
+        response: RpcResponse,
+    },
 }
 
 // ----- Public event type -----
@@ -73,6 +214,18 @@ pub enum MeshEvent {
     SyncRequest { from_node: NodeId, from_height: u64 },
     SyncBlocks { for_node: NodeId, blocks: Vec<Block> },
     CellSignal(CellSignal),
+    /// An incoming RPC request from a mesh peer.
+    ///
+    /// The receiver MUST call `MeshHandle::respond_rpc(correlation_id, response)` exactly
+    /// once, even on error. Not responding leaks the `ResponseChannel` and may stall the
+    /// remote caller until the request-response timeout fires (10 min).
+    IncomingRpc {
+        /// Noise-authenticated sender identity. Cannot be spoofed.
+        from_peer: PeerId,
+        /// Opaque ID for delivering the response via `MeshHandle::respond_rpc`.
+        correlation_id: u64,
+        request: RpcRequest,
+    },
 }
 
 // ----- Topic names -----
@@ -96,6 +249,8 @@ struct CeBehaviour {
     dcutr: dcutr::Behaviour,
     relay_client: relay::client::Behaviour,
     relay_server: relay::Behaviour,
+    /// /ce/rpc/1 — device-to-device exec and file sync, relay-routed.
+    rpc: request_response::Behaviour<CeRpcCodec>,
 }
 
 // ----- Topic hash bundle -----
@@ -144,6 +299,28 @@ impl MeshHandle {
         self.send(MeshCommand::PublishSignal(bytes)).await
     }
 
+    /// Add a dial hint so the swarm can find and connect to a peer.
+    /// The `addr` is a libp2p multiaddr, e.g. a relay circuit address.
+    /// Silently ignores invalid multiaddrs (logs a warning instead).
+    pub async fn dial(&self, addr: String) -> Result<()> {
+        self.send(MeshCommand::Dial(addr)).await
+    }
+
+    /// Send an RPC request to `peer_id` and await the response.
+    ///
+    /// The peer must be reachable via the swarm (direct or relay-routed).
+    /// Exec RPCs may take up to 10 minutes; the request-response timeout is set accordingly.
+    pub async fn send_rpc(&self, peer_id: PeerId, request: RpcRequest) -> Result<RpcResponse> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send(MeshCommand::SendRpc { peer_id, request, reply_tx }).await?;
+        reply_rx.await.map_err(|_| anyhow!("mesh rpc: actor dropped before response"))
+    }
+
+    /// Deliver a response for an incoming RPC. `correlation_id` comes from `MeshEvent::IncomingRpc`.
+    pub async fn respond_rpc(&self, correlation_id: u64, response: RpcResponse) -> Result<()> {
+        self.send(MeshCommand::RespondRpc { correlation_id, response }).await
+    }
+
     async fn send(&self, cmd: MeshCommand) -> Result<()> {
         self.cmd_tx.send(cmd).await.map_err(|_| anyhow!("mesh actor gone"))
     }
@@ -162,7 +339,15 @@ pub struct Mesh {
     cmd_rx: mpsc::Receiver<MeshCommand>,
     event_tx: mpsc::Sender<MeshEvent>,
     /// Relay nodes: peer_id → full multiaddr. On connect, listen on the circuit addr.
-    relay_peers: std::collections::HashMap<PeerId, Multiaddr>,
+    relay_peers: HashMap<PeerId, Multiaddr>,
+    /// Pending outbound RPC calls: libp2p request ID → oneshot sender for the response.
+    pending_outbound: HashMap<request_response::OutboundRequestId, oneshot::Sender<RpcResponse>>,
+    /// Pending inbound RPC calls: correlation_id → libp2p response channel.
+    pending_inbound: HashMap<u64, request_response::ResponseChannel<RpcResponse>>,
+    next_inbound_id: u64,
+    /// Monotonic counter for sync request nonces — prevents gossipsub from deduplicating
+    /// identical requests (same from_node + from_height) sent on repeated sync intervals.
+    sync_nonce: u64,
 }
 
 impl Mesh {
@@ -221,9 +406,18 @@ impl Mesh {
                 ));
 
                 let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
-
                 let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
                 let dcutr = dcutr::Behaviour::new(peer_id);
+
+                // /ce/rpc/1 — exec and sync between trusted devices.
+                // 10-minute timeout: exec may run a full cargo build or similar long task.
+                let rpc_cfg = request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(600));
+                let rpc = request_response::Behaviour::with_codec(
+                    CeRpcCodec,
+                    std::iter::once(("/ce/rpc/1", request_response::ProtocolSupport::Full)),
+                    rpc_cfg,
+                );
 
                 Ok(CeBehaviour {
                     gossipsub,
@@ -234,6 +428,7 @@ impl Mesh {
                     dcutr,
                     relay_client,
                     relay_server: relay::Behaviour::new(peer_id, relay::Config::default()),
+                    rpc,
                 })
             })?
             .build();
@@ -251,7 +446,11 @@ impl Mesh {
             protocol_topic,
             cmd_rx,
             event_tx,
-            relay_peers: std::collections::HashMap::new(),
+            relay_peers: HashMap::new(),
+            pending_outbound: HashMap::new(),
+            pending_inbound: HashMap::new(),
+            next_inbound_id: 0,
+            sync_nonce: 0,
         };
 
         let handle = MeshHandle { cmd_tx };
@@ -278,11 +477,9 @@ impl Mesh {
     }
 
     pub async fn run(mut self, listen_port: u16) -> Result<()> {
-        // Listen on TCP
         let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?;
         self.swarm.listen_on(tcp_addr)?;
 
-        // Listen on QUIC-v1 (same port number, different protocol)
         let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
         if let Err(e) = self.swarm.listen_on(quic_addr) {
             debug!("QUIC listen: {e}");
@@ -315,59 +512,98 @@ impl Mesh {
                 }
                 event = self.swarm.next() => {
                     let Some(event) = event else { break };
-
-                    // mDNS: dial discovered local peers and add them to kademlia.
-                    if let SwarmEvent::Behaviour(CeBehaviourEvent::Mdns(
-                        mdns::Event::Discovered(ref peers)
-                    )) = event {
-                        let peers: Vec<_> = peers.clone();
-                        for (peer_id, addr) in peers {
-                            info!("mDNS discovered {peer_id} at {addr}");
-                            self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                            let _ = self.swarm.dial(peer_id);
-                        }
-                    }
-
-                    // Relay: when we connect to a registered relay, start listening on its circuit.
-                    if let SwarmEvent::ConnectionEstablished { ref peer_id, .. } = event {
-                        if let Some(relay_ma) = self.relay_peers.get(peer_id).cloned() {
-                            // Full circuit addr: <relay-transport>/p2p/<relay-id>/p2p-circuit
-                            let circuit: Multiaddr = format!("{relay_ma}/p2p-circuit").parse()
-                                .expect("valid circuit multiaddr");
-                            match self.swarm.listen_on(circuit) {
-                                Ok(_) => info!("relay circuit listening via {peer_id}"),
-                                Err(e) => warn!("relay circuit listen error: {e}"),
-                            }
-                        }
-                    }
-
-                    // AutoNAT: log NAT status changes.
-                    if let SwarmEvent::Behaviour(CeBehaviourEvent::Autonat(
-                        autonat::Event::StatusChanged { old, new }
-                    )) = event {
-                        info!("NAT status: {old:?} → {new:?}");
-                        continue;
-                    }
-
-                    // DCUtR: log hole-punch outcomes.
-                    if let SwarmEvent::Behaviour(CeBehaviourEvent::Dcutr(
-                        ref ev
-                    )) = event {
-                        debug!("DCUtR: {ev:?}");
-                    }
-
-                    let mesh_event = handle_swarm_event(
-                        event,
-                        &topics,
-                        self.swarm.behaviour_mut(),
-                    );
-                    if let Some(ev) = mesh_event {
-                        let _ = self.event_tx.send(ev).await;
-                    }
+                    self.handle_event(event, &topics).await;
                 }
             }
         }
         Ok(())
+    }
+
+    async fn handle_event(&mut self, event: SwarmEvent<CeBehaviourEvent>, topics: &Topics) {
+        // Relay: when we connect to a registered relay, start listening on its circuit.
+        if let SwarmEvent::ConnectionEstablished { ref peer_id, .. } = event {
+            if let Some(relay_ma) = self.relay_peers.get(peer_id).cloned() {
+                let circuit: Multiaddr = format!("{relay_ma}/p2p-circuit").parse()
+                    .expect("valid circuit multiaddr");
+                match self.swarm.listen_on(circuit) {
+                    Ok(_) => info!("relay circuit listening via {peer_id}"),
+                    Err(e) => warn!("relay circuit listen error: {e}"),
+                }
+            }
+        }
+
+        match event {
+            // mDNS: dial discovered local peers and add them to kademlia.
+            SwarmEvent::Behaviour(CeBehaviourEvent::Mdns(
+                mdns::Event::Discovered(peers)
+            )) => {
+                for (peer_id, addr) in peers {
+                    info!("mDNS discovered {peer_id} at {addr}");
+                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    let _ = self.swarm.dial(peer_id);
+                }
+            }
+
+            // AutoNAT: log NAT status changes.
+            SwarmEvent::Behaviour(CeBehaviourEvent::Autonat(
+                autonat::Event::StatusChanged { old, new }
+            )) => {
+                info!("NAT status: {old:?} → {new:?}");
+            }
+
+            // DCUtR: log hole-punch outcomes.
+            SwarmEvent::Behaviour(CeBehaviourEvent::Dcutr(ref ev)) => {
+                debug!("DCUtR: {ev:?}");
+            }
+
+            // /ce/rpc/1 — device exec/sync protocol.
+            SwarmEvent::Behaviour(CeBehaviourEvent::Rpc(rpc_event)) => {
+                self.handle_rpc_event(rpc_event).await;
+            }
+
+            // Everything else: decode and forward to the node.
+            other => {
+                if let Some(ev) = decode_swarm_event(other, topics, self.swarm.behaviour_mut()) {
+                    let _ = self.event_tx.send(ev).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_rpc_event(
+        &mut self,
+        event: request_response::Event<RpcRequest, RpcResponse>,
+    ) {
+        use request_response::{Event, Message};
+        match event {
+            Event::Message { peer, message } => match message {
+                Message::Request { request, channel, .. } => {
+                    let id = self.next_inbound_id;
+                    self.next_inbound_id += 1;
+                    self.pending_inbound.insert(id, channel);
+                    let _ = self.event_tx.send(MeshEvent::IncomingRpc {
+                        from_peer: peer,
+                        correlation_id: id,
+                        request,
+                    }).await;
+                }
+                Message::Response { request_id, response } => {
+                    if let Some(tx) = self.pending_outbound.remove(&request_id) {
+                        let _ = tx.send(response);
+                    }
+                }
+            },
+            Event::OutboundFailure { request_id, error, .. } => {
+                warn!("rpc outbound failure: {error}");
+                if let Some(tx) = self.pending_outbound.remove(&request_id) {
+                    let _ = tx.send(RpcResponse::Error(format!("outbound failure: {error}")));
+                }
+            }
+            Event::InboundFailure { peer, error, .. } => {
+                warn!("rpc inbound failure from {peer}: {error}");
+            }
+            Event::ResponseSent { .. } => {}
+        }
     }
 
     fn handle_command(&mut self, cmd: MeshCommand) {
@@ -394,18 +630,25 @@ impl Mesh {
                 }
             }
             MeshCommand::SendSyncRequest { from_node, from_height } => {
-                let msg = SyncReqMsg { from_node, from_height };
+                self.sync_nonce += 1;
+                let msg = SyncReqMsg { from_node, from_height, nonce: self.sync_nonce };
                 if let Ok(bytes) = bincode::serialize(&msg) {
-                    let _ = self.swarm.behaviour_mut().gossipsub
-                        .publish(self.syncreq_topic.clone(), bytes);
+                    if let Err(e) = self.swarm.behaviour_mut().gossipsub
+                        .publish(self.syncreq_topic.clone(), bytes)
+                    {
+                        debug!("sync request publish: {e}");
+                    }
                 }
             }
             MeshCommand::SendSyncResponse { for_node, blocks } => {
                 for chunk in blocks.chunks(MAX_BLOCKS_PER_SYNC) {
                     let msg = SyncRespMsg { for_node, blocks: chunk.to_vec() };
                     if let Ok(bytes) = bincode::serialize(&msg) {
-                        let _ = self.swarm.behaviour_mut().gossipsub
-                            .publish(self.syncresp_topic.clone(), bytes);
+                        if let Err(e) = self.swarm.behaviour_mut().gossipsub
+                            .publish(self.syncresp_topic.clone(), bytes)
+                        {
+                            debug!("sync response publish: {e}");
+                        }
                     }
                 }
             }
@@ -416,11 +659,37 @@ impl Mesh {
                     debug!("publish signal: {e}");
                 }
             }
+            MeshCommand::Dial(addr) => {
+                match addr.parse::<Multiaddr>() {
+                    Ok(ma) => {
+                        if let Err(e) = self.swarm.dial(ma) {
+                            debug!("dial {addr}: {e}");
+                        }
+                    }
+                    Err(e) => warn!("dial: bad multiaddr {addr}: {e}"),
+                }
+            }
+            MeshCommand::SendRpc { peer_id, request, reply_tx } => {
+                let req_id = self.swarm.behaviour_mut().rpc
+                    .send_request(&peer_id, request);
+                self.pending_outbound.insert(req_id, reply_tx);
+            }
+            MeshCommand::RespondRpc { correlation_id, response } => {
+                if let Some(channel) = self.pending_inbound.remove(&correlation_id) {
+                    if let Err(_) = self.swarm.behaviour_mut().rpc
+                        .send_response(channel, response)
+                    {
+                        warn!("rpc: failed to send response for correlation_id {correlation_id} (channel closed)");
+                    }
+                } else {
+                    warn!("rpc: no pending inbound for correlation_id {correlation_id}");
+                }
+            }
         }
     }
 }
 
-fn handle_swarm_event(
+fn decode_swarm_event(
     event: SwarmEvent<CeBehaviourEvent>,
     topics: &Topics,
     behaviour: &mut CeBehaviour,

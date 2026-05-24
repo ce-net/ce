@@ -8,15 +8,16 @@ pub fn peer_id_from_identity(identity: &ce_identity::Identity) -> anyhow::Result
 }
 
 use anyhow::Result;
+use bollard::Docker;
 use ce_chain::{Block, Chain, Tx, TxKind};
-use ce_container::{ContainerManager, JobSpec};
+use ce_container::{ContainerManager, ExecSpec, JobSpec, exec_in_container};
 use ce_identity::{Identity, NodeId};
-use ce_mesh::{Mesh, MeshEvent, MeshHandle};
+use ce_mesh::{Mesh, MeshEvent, MeshHandle, RpcRequest, RpcResponse, peer_id_from_node_id};
 use ce_protocol::{CellSignal, Capability};
 use directories::ProjectDirs;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +26,9 @@ use tracing::{info, warn};
 
 /// Max number of recently-validated signals retained for GET /signals.
 const SIGNAL_RING_CAPACITY: usize = 100;
+
+/// Must match MAX_BLOCKS_PER_SYNC in ce-mesh. Used when serving sync responses.
+const MAX_BLOCKS_PER_SYNC: usize = 10_000;
 
 pub(crate) type SignalRing = Arc<Mutex<VecDeque<CellSignal>>>;
 
@@ -178,6 +182,11 @@ impl Node {
             info!("chain height: {}", c.height());
         }
 
+        let docker = Docker::connect_with_socket_defaults().ok();
+        if docker.is_none() {
+            warn!("Docker unavailable — exec RPCs and job routes will be disabled");
+        }
+
         let (mesh, mesh_handle, mesh_rx) = Mesh::new(identity.secret_bytes())?;
 
         let mut mesh = mesh;
@@ -249,6 +258,8 @@ impl Node {
             let signals = signals.clone();
             let signal_tx = signal_tx.clone();
             let atlas2 = atlas.clone();
+            let data_dir2 = node.config.data_dir.clone();
+            let docker2 = docker.clone();
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain,
@@ -261,6 +272,8 @@ impl Node {
                     signal_tx,
                     bid_notify_tx,
                     atlas2,
+                    data_dir2,
+                    docker2,
                 )
                 .await;
             });
@@ -310,6 +323,7 @@ impl Node {
             let pool = pool.clone();
             let data_dir = node.config.data_dir.clone();
             let atlas3 = atlas.clone();
+            let docker3 = docker.clone();
             tokio::spawn(async move {
                 if let Err(e) = api::start(
                     chain,
@@ -323,6 +337,7 @@ impl Node {
                     settle_notify_tx,
                     data_dir,
                     atlas3,
+                    docker3,
                 )
                 .await
                 {
@@ -448,9 +463,13 @@ async fn mesh_event_loop(
     signal_tx: broadcast::Sender<CellSignal>,
     bid_notify_tx: mpsc::Sender<Tx>,
     atlas: Atlas,
+    data_dir: PathBuf,
+    docker: Option<Docker>,
 ) {
     // Tracks the highest accepted nonce per sender to prevent replays.
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
+    // Tracks the best known height of each peer, used to decide whether to retry sync.
+    let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -482,6 +501,7 @@ async fn mesh_event_loop(
                 }
             }
             MeshEvent::PeerHeight { node_id, height, tip_hash } => {
+                peer_heights.insert(node_id, height);
                 let (our_height, our_tip) = {
                     let c = chain.lock().await;
                     (c.height(), c.tip_hash())
@@ -508,7 +528,7 @@ async fn mesh_event_loop(
                     c.blocks
                         .iter()
                         .filter(|b| b.index > from_height)
-                        .take(500)
+                        .take(MAX_BLOCKS_PER_SYNC)
                         .cloned()
                         .collect()
                 };
@@ -528,9 +548,8 @@ async fn mesh_event_loop(
                 }
                 let mut c = chain.lock().await;
                 let height_before = c.height();
-                // Highest block index in the candidate set — used to detect true forks
-                // vs. stale sync responses that arrived after gossip already applied the block.
                 let max_candidate = blocks.iter().map(|b| b.index).max().unwrap_or(0);
+                info!("sync response: {} blocks, candidate tip {}", blocks.len(), max_candidate);
 
                 // Fast path: blocks extend the current tip in order.
                 let mut applied = 0u64;
@@ -555,18 +574,34 @@ async fn mesh_event_loop(
                     if let Err(e) = c.save(&chain_path) {
                         warn!("save chain after sync: {e}");
                     }
-                } else if max_candidate > c.height() {
-                    // The candidate set contains blocks higher than us but neither path
-                    // worked — we're on a competing fork and the reorg didn't have ancestors.
-                    // Request from genesis so try_reorg can find the common ancestor.
+                } else {
+                    // Neither fast-path nor reorg applied the candidate set.
+                    // Check if any known peer is still ahead of us; if so keep requesting.
                     let our_height = c.height();
+                    let best_peer_height = peer_heights.values().copied().max().unwrap_or(0);
                     drop(c);
-                    warn!("sync blocks didn't apply (fork at height {our_height}, peer tip {max_candidate}); requesting full resync");
-                    let _ = mesh_handle.send_sync_request(our_node_id, 0).await;
+                    if best_peer_height > our_height {
+                        warn!(
+                            "sync blocks didn't apply (our height {our_height}, \
+                             best peer {best_peer_height}, candidate tip {max_candidate}); \
+                             requesting full resync"
+                        );
+                        let _ = mesh_handle.send_sync_request(our_node_id, 0).await;
+                    }
                 }
             }
             MeshEvent::PeerConnected(peer) => info!("peer connected: {peer}"),
             MeshEvent::PeerDisconnected(peer) => info!("peer disconnected: {peer}"),
+            MeshEvent::IncomingRpc { from_peer, correlation_id, request } => {
+                handle_incoming_rpc(
+                    from_peer,
+                    correlation_id,
+                    request,
+                    &data_dir,
+                    docker.clone(),
+                    mesh_handle.clone(),
+                );
+            }
             MeshEvent::CellSignal(signal) => {
                 // Reject replays: nonce must strictly increase per sender.
                 // Only enforced once we've seen at least one signal from them.
@@ -622,6 +657,118 @@ async fn mesh_event_loop(
                 }
                 let _ = signal_tx.send(signal);
             }
+        }
+    }
+}
+
+// ----- Incoming mesh RPC handler -----
+
+/// Verify and dispatch a /ce/rpc/1 request from a remote peer.
+///
+/// Spawns a tokio task so exec (potentially minutes) doesn't block the mesh event loop.
+/// Always calls `mesh_handle.respond_rpc` exactly once, even on failure.
+fn handle_incoming_rpc(
+    from_peer: ce_mesh::CePeerId,
+    correlation_id: u64,
+    request: RpcRequest,
+    data_dir: &Path,
+    docker: Option<Docker>,
+    mesh_handle: MeshHandle,
+) {
+    // Verify the claimed CE NodeId matches the noise-authenticated libp2p PeerId.
+    // This is the trust check: noise proved the sender holds the Ed25519 private key;
+    // we confirm the same key is registered as a trusted device.
+    let from_node = request.from_node();
+    let trust_ok = match peer_id_from_node_id(&from_node) {
+        Ok(expected) if expected == from_peer => {
+            let devices = crate::devices::Devices::load_or_empty(
+                &data_dir.join("machines.toml")
+            );
+            devices.is_trusted(&from_node)
+        }
+        Ok(_) => {
+            warn!("rpc: from_node/from_peer mismatch — dropping");
+            false
+        }
+        Err(e) => {
+            warn!("rpc: invalid from_node: {e}");
+            false
+        }
+    };
+
+    if !trust_ok {
+        let handle = mesh_handle.clone();
+        tokio::spawn(async move {
+            let _ = handle.respond_rpc(
+                correlation_id,
+                RpcResponse::Error("sender is not a trusted device".into()),
+            ).await;
+        });
+        return;
+    }
+
+    match request {
+        RpcRequest::Exec { image, cmd, cwd, .. } => {
+            let Some(docker) = docker else {
+                tokio::spawn(async move {
+                    let _ = mesh_handle.respond_rpc(
+                        correlation_id,
+                        RpcResponse::Error("Docker not available on this node".into()),
+                    ).await;
+                });
+                return;
+            };
+            tokio::spawn(async move {
+                let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                let spec = ExecSpec { image, cmd, cwd };
+                let resp = match exec_in_container(&docker, &spec, &home).await {
+                    Ok((stdout, stderr, exit_code)) => RpcResponse::ExecResult {
+                        stdout,
+                        stderr,
+                        exit_code: exit_code as i32,
+                    },
+                    Err(e) => RpcResponse::Error(format!("exec failed: {e}")),
+                };
+                let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
+            });
+        }
+        RpcRequest::SyncFile { path, data, .. } => {
+            let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+            let home_canon = home.canonicalize().unwrap_or(home.clone());
+
+            let resp = (|| -> RpcResponse {
+                // Reject path traversal.
+                if path.contains("..") {
+                    return RpcResponse::Error("path traversal not allowed".into());
+                }
+                let target = home.join(&path);
+                let canonical = match target.parent() {
+                    Some(p) => {
+                        let _ = std::fs::create_dir_all(p);
+                        match p.canonicalize().ok().map(|cp| {
+                            cp.join(target.file_name().unwrap_or_default())
+                        }) {
+                            Some(c) => c,
+                            None => return RpcResponse::Error("cannot resolve target path".into()),
+                        }
+                    }
+                    None => return RpcResponse::Error("invalid path".into()),
+                };
+                if !canonical.starts_with(&home_canon) {
+                    return RpcResponse::Error("path traversal not allowed".into());
+                }
+                match std::fs::write(&canonical, &data) {
+                    Ok(()) => {
+                        info!("mesh sync: wrote {} ({} bytes)", canonical.display(), data.len());
+                        RpcResponse::SyncAck
+                    }
+                    Err(e) => RpcResponse::Error(format!("write failed: {e}")),
+                }
+            })();
+
+            tokio::spawn(async move {
+                let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
+            });
         }
     }
 }
