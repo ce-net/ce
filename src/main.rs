@@ -196,10 +196,26 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Start { port, api_port, bootstrap, relay } => {
+            // CE_BOOTSTRAP_PEERS: colon-separated list of bootstrap multiaddrs.
+            // Useful for Docker/systemd deployments where CLI flags are inconvenient.
+            let mut bootstrap_peers = bootstrap;
+            if let Ok(env_peers) = std::env::var("CE_BOOTSTRAP_PEERS") {
+                for peer in env_peers.split(':').map(str::trim).filter(|s| !s.is_empty()) {
+                    bootstrap_peers.push(peer.to_string());
+                }
+            }
+            // CE_RELAY_PEERS: colon-separated list of relay multiaddrs.
+            let mut relay_peers = relay;
+            if let Ok(env_relays) = std::env::var("CE_RELAY_PEERS") {
+                for peer in env_relays.split(':').map(str::trim).filter(|s| !s.is_empty()) {
+                    relay_peers.push(peer.to_string());
+                }
+            }
+
             let config = NodeConfig {
                 listen_port: port,
-                bootstrap_peers: bootstrap,
-                relay_peers: relay,
+                bootstrap_peers,
+                relay_peers,
                 data_dir,
                 api_port,
                 mine: true,

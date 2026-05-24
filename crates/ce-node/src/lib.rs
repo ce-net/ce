@@ -505,13 +505,29 @@ async fn mesh_event_loop(
                 if for_node != our_node_id {
                     continue;
                 }
-                let mut applied = 0u64;
                 let mut c = chain.lock().await;
-                for block in blocks {
+                let height_before = c.height();
+
+                // Fast path: blocks extend the current tip in order.
+                let mut applied = 0u64;
+                for block in blocks.clone() {
                     if c.append(block) {
                         applied += 1;
                     }
                 }
+
+                // Slow path: if nothing appended, try a reorg (longest-chain rule).
+                // This handles the case where we received blocks from a competing fork
+                // that is now longer than ours.
+                if applied == 0 && c.try_reorg(blocks) {
+                    info!(
+                        "reorg: switched to longer chain at height {} (was {})",
+                        c.height(),
+                        height_before
+                    );
+                    applied = c.height() - height_before;
+                }
+
                 if applied > 0 {
                     info!("sync applied {applied} blocks, now at height {}", c.height());
                     if let Err(e) = c.save(&chain_path) {

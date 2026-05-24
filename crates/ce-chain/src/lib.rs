@@ -425,6 +425,82 @@ impl Chain {
         true
     }
 
+    /// Attempt a chain reorganisation using a batch of candidate blocks.
+    ///
+    /// Finds the highest common ancestor between the candidate set and our chain,
+    /// then checks whether the candidate suffix is strictly longer than ours from
+    /// that fork point. If so, validates every candidate block in order and replaces
+    /// our chain. Returns true if a reorg occurred.
+    ///
+    /// This enforces the longest-chain rule: the network converges on whichever
+    /// branch accumulates more blocks, regardless of which arrived first.
+    pub fn try_reorg(&mut self, mut candidate: Vec<Block>) -> bool {
+        candidate.sort_by_key(|b| b.index);
+        if candidate.is_empty() {
+            return false;
+        }
+
+        // Build a map: block_hash → position in our chain.
+        let our_hash_to_pos: std::collections::HashMap<[u8; 32], usize> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.hash(), i))
+            .collect();
+
+        // Find the deepest fork point: the highest position in our chain whose
+        // hash appears as a prev_hash of any candidate block.
+        let mut fork_pos: Option<usize> = None;
+        for cand in &candidate {
+            if let Some(&pos) = our_hash_to_pos.get(&cand.prev_hash) {
+                fork_pos = Some(match fork_pos {
+                    None => pos,
+                    Some(prev) => prev.max(pos),
+                });
+            }
+        }
+        let fork_pos = match fork_pos {
+            Some(p) => p,
+            None => return false, // no connection to our chain
+        };
+
+        // Walk the candidates in chain order starting from the fork point.
+        let mut new_suffix: Vec<Block> = Vec::new();
+        let mut expected_prev = self.blocks[fork_pos].hash();
+        let mut remaining: Vec<Block> = candidate;
+        loop {
+            let next = remaining.iter().position(|b| b.prev_hash == expected_prev);
+            match next {
+                None => break,
+                Some(i) => {
+                    let block = remaining.remove(i);
+                    expected_prev = block.hash();
+                    new_suffix.push(block);
+                }
+            }
+        }
+
+        // Only reorg if the candidate suffix is strictly longer.
+        let our_suffix_len = self.blocks.len().saturating_sub(fork_pos + 1);
+        if new_suffix.len() <= our_suffix_len {
+            return false;
+        }
+
+        // Validate every candidate block against the chain up to the fork point.
+        let mut reorg_chain = Chain {
+            blocks: self.blocks[..=fork_pos].to_vec(),
+            difficulty: self.difficulty,
+        };
+        for block in new_suffix {
+            if !reorg_chain.append(block) {
+                return false; // invalid block in candidate chain; abort
+            }
+        }
+
+        *self = reorg_chain;
+        true
+    }
+
     pub fn balance(&self, node: &NodeId) -> i64 {
         let mut bal: i64 = 0;
         for block in &self.blocks {
@@ -1315,5 +1391,109 @@ mod tests {
         let mut block = chain.next_block(vec![bad_bid], host.node_id());
         block.seal(&host);
         assert!(!chain.append(block), "bid signed by non-payer must be rejected");
+    }
+
+    // ----- Fork choice / reorg tests -----
+
+    /// Build N signed blocks on top of `base`, returning the new blocks (not the chain).
+    fn build_fork(base: &Chain, miner: &Identity, count: usize) -> Vec<Block> {
+        let mut fork = base.clone();
+        let mut new_blocks = Vec::new();
+        for _ in 0..count {
+            let next_idx = fork.tip().index + 1;
+            let reward = signed_uptime_reward(miner, next_idx);
+            let mut block = fork.next_block(vec![reward], miner.node_id());
+            block.seal(miner);
+            assert!(fork.append(block.clone()), "fork block must be valid");
+            new_blocks.push(block);
+        }
+        new_blocks
+    }
+
+    #[test]
+    fn try_reorg_ignores_equal_length_fork() {
+        let a = make_identity("reorg-eq-a");
+        let b = make_identity("reorg-eq-b");
+        let mut chain = Chain::genesis();
+        seal_and_append(&mut chain, &a);
+
+        // Build an alternate block 2 from the same base.
+        let fork_blocks = build_fork(&chain, &b, 1);
+        // Our chain also has one block past genesis.
+        seal_and_append(&mut chain, &a); // chain: genesis → a1 → a2
+
+        // Fork has same length as our suffix from fork point; no reorg.
+        assert!(!chain.try_reorg(fork_blocks));
+        assert_eq!(chain.tip().miner, a.node_id());
+    }
+
+    #[test]
+    fn try_reorg_switches_to_longer_fork() {
+        let a = make_identity("reorg-long-a");
+        let b = make_identity("reorg-long-b");
+        let mut chain = Chain::genesis();
+        seal_and_append(&mut chain, &a); // block 1 on both
+
+        let common = chain.clone();
+
+        // Our chain has one more block.
+        seal_and_append(&mut chain, &a); // block 2a
+
+        // Alternate chain has two more blocks — longer.
+        let fork_blocks = build_fork(&common, &b, 2); // block 2b, 3b
+
+        // Reorg should succeed: fork is one block longer.
+        assert!(chain.try_reorg(fork_blocks));
+        assert_eq!(chain.height(), 3);
+        assert_eq!(chain.tip().miner, b.node_id());
+    }
+
+    #[test]
+    fn try_reorg_rejects_invalid_block_in_fork() {
+        let a = make_identity("reorg-inv-a");
+        let b = make_identity("reorg-inv-b");
+        let mut chain = Chain::genesis();
+        seal_and_append(&mut chain, &a);
+
+        let common = chain.clone();
+        seal_and_append(&mut chain, &a);
+
+        // Build a valid fork that is longer, then corrupt the last block.
+        let mut fork_blocks = build_fork(&common, &b, 2);
+        fork_blocks.last_mut().unwrap().sig = [0xff; 64]; // corrupt seal
+
+        // Should be rejected — invalid block in candidate chain.
+        assert!(!chain.try_reorg(fork_blocks));
+        // Chain is unchanged.
+        assert_eq!(chain.tip().miner, a.node_id());
+    }
+
+    #[test]
+    fn try_reorg_no_connection_returns_false() {
+        let a = make_identity("reorg-nocon-a");
+        let b = make_identity("reorg-nocon-b");
+        let mut chain = Chain::genesis();
+        seal_and_append(&mut chain, &a);
+
+        // Build blocks that have no connection to our chain.
+        let mut orphan = Chain::genesis();
+        let orphan_blocks = build_fork(&orphan, &b, 3);
+        // Override block 1 so it won't share genesis hash.
+        // (genesis hash is deterministic — these blocks will have the right
+        // prev_hash for genesis, so let's use a totally detached starting point.)
+        let _ = orphan; // suppress warning
+        // Blocks from a fresh chain DO connect at genesis (index 0), so use
+        // blocks that reference an unknown prev_hash.
+        let mut ghost = Block {
+            index: 1,
+            prev_hash: [0xde; 32], // unknown hash
+            timestamp: 0,
+            transactions: vec![],
+            nonce: 0,
+            miner: b.node_id(),
+            sig: [0u8; 64],
+        };
+        ghost.seal(&b);
+        assert!(!chain.try_reorg(vec![ghost]));
     }
 }

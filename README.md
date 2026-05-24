@@ -20,10 +20,19 @@ Every node is assumed hostile. The honest majority wins. No trusted parties.
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Install
+
+```bash
+# One-liner (Linux/macOS — downloads the latest release binary)
+curl -sSL https://raw.githubusercontent.com/ce-net/ce/main/install.sh | bash
+```
+
+On Linux with systemd the installer also creates a `ce.service` that starts automatically at boot.
+
 ## Quick Start
 
 ```bash
-# Build
+# Build from source
 cargo build --release
 
 # Start a node (mines blocks, API on :8080, P2P on :4001)
@@ -40,6 +49,10 @@ cargo build --release
 # Join from behind NAT via a relay node (makes you reachable from the internet)
 ./target/release/ce start \
   --relay /ip4/1.2.3.4/tcp/4001/p2p/<relay-peer-id>
+
+# Docker / systemd — configure bootstrap peers via environment variables
+CE_BOOTSTRAP_PEERS=/ip4/1.2.3.4/tcp/4001/p2p/<peer-id> ce start
+CE_RELAY_PEERS=/ip4/1.2.3.4/tcp/4001/p2p/<relay-id> ce start
 
 # Submit a container job (node must have positive balance)
 curl -X POST http://localhost:8080/jobs/bid \
