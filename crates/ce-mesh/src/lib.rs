@@ -11,7 +11,6 @@ use libp2p::{
     tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -96,6 +95,7 @@ struct CeBehaviour {
     autonat: autonat::Behaviour,
     dcutr: dcutr::Behaviour,
     relay_client: relay::client::Behaviour,
+    relay_server: relay::Behaviour,
 }
 
 // ----- Topic hash bundle -----
@@ -161,8 +161,8 @@ pub struct Mesh {
     protocol_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<MeshCommand>,
     event_tx: mpsc::Sender<MeshEvent>,
-    /// Peers we've designated as relay nodes. On connect, we listen on their circuit addr.
-    relay_peers: HashSet<PeerId>,
+    /// Relay nodes: peer_id → full multiaddr. On connect, listen on the circuit addr.
+    relay_peers: std::collections::HashMap<PeerId, Multiaddr>,
 }
 
 impl Mesh {
@@ -233,6 +233,7 @@ impl Mesh {
                     autonat,
                     dcutr,
                     relay_client,
+                    relay_server: relay::Behaviour::new(peer_id, relay::Config::default()),
                 })
             })?
             .build();
@@ -250,7 +251,7 @@ impl Mesh {
             protocol_topic,
             cmd_rx,
             event_tx,
-            relay_peers: HashSet::new(),
+            relay_peers: std::collections::HashMap::new(),
         };
 
         let handle = MeshHandle { cmd_tx };
@@ -270,7 +271,7 @@ impl Mesh {
     pub fn add_relay(&mut self, addr: &str) -> Result<()> {
         let ma: Multiaddr = addr.parse()?;
         let peer_id = peer_id_from_multiaddr(&ma)?;
-        self.relay_peers.insert(peer_id);
+        self.relay_peers.insert(peer_id, ma.clone());
         self.swarm.behaviour_mut().kademlia.add_address(&peer_id, ma.clone());
         self.swarm.dial(ma)?;
         Ok(())
@@ -329,10 +330,10 @@ impl Mesh {
 
                     // Relay: when we connect to a registered relay, start listening on its circuit.
                     if let SwarmEvent::ConnectionEstablished { ref peer_id, .. } = event {
-                        if self.relay_peers.contains(peer_id) {
-                            let circuit: Multiaddr =
-                                format!("/p2p/{peer_id}/p2p-circuit").parse()
-                                    .expect("valid circuit multiaddr");
+                        if let Some(relay_ma) = self.relay_peers.get(peer_id).cloned() {
+                            // Full circuit addr: <relay-transport>/p2p/<relay-id>/p2p-circuit
+                            let circuit: Multiaddr = format!("{relay_ma}/p2p-circuit").parse()
+                                .expect("valid circuit multiaddr");
                             match self.swarm.listen_on(circuit) {
                                 Ok(_) => info!("relay circuit listening via {peer_id}"),
                                 Err(e) => warn!("relay circuit listen error: {e}"),
@@ -456,6 +457,10 @@ fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(CeBehaviourEvent::RelayClient(ev)) => {
             debug!("relay client: {ev:?}");
+            None
+        }
+        SwarmEvent::Behaviour(CeBehaviourEvent::RelayServer(ev)) => {
+            debug!("relay server: {ev:?}");
             None
         }
         _ => None,
