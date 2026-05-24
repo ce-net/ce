@@ -170,6 +170,12 @@ pub struct Chain {
     /// tx_id → (block.index, position-in-block-txs): O(1) tx lookup.
     #[serde(skip, default)]
     tx_index: std::collections::HashMap<[u8; 32], (u64, usize)>,
+
+    /// Open (unsettled, unexpired) JobBids: job_id → (payer, bid_amount).
+    /// Entries are removed when a matching JobSettle or JobExpire is confirmed.
+    /// Drives O(open_jobs) locked_balance() instead of O(all_blocks).
+    #[serde(skip, default)]
+    open_bids: std::collections::HashMap<[u8; 32], (NodeId, u64)>,
 }
 
 impl Chain {
@@ -189,6 +195,7 @@ impl Chain {
             balances: std::collections::HashMap::new(),
             heartbeat_max_epoch: std::collections::HashMap::new(),
             tx_index: std::collections::HashMap::new(),
+            open_bids: std::collections::HashMap::new(),
         }
     }
 
@@ -215,9 +222,10 @@ impl Chain {
                 TxKind::UptimeReward { node, amount, .. } => {
                     *self.balances.entry(*node).or_insert(0) += *amount as i64;
                 }
-                TxKind::JobSettle { host, payer, cost, .. } => {
+                TxKind::JobSettle { job_id, host, payer, cost, .. } => {
                     *self.balances.entry(*payer).or_insert(0) -= *cost as i64;
                     *self.balances.entry(*host).or_insert(0) += *cost as i64;
+                    self.open_bids.remove(job_id);
                 }
                 TxKind::Heartbeat { cell, host, amount, epoch } => {
                     *self.balances.entry(*cell).or_insert(0) -= *amount as i64;
@@ -225,7 +233,13 @@ impl Chain {
                     let e = self.heartbeat_max_epoch.entry((*cell, *host)).or_insert(0);
                     if *epoch >= *e { *e = *epoch; }
                 }
-                TxKind::JobBid { .. } | TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => {}
+                TxKind::JobBid { job_id, payer, bid, .. } => {
+                    self.open_bids.insert(*job_id, (*payer, *bid));
+                }
+                TxKind::JobExpire { job_id, .. } => {
+                    self.open_bids.remove(job_id);
+                }
+                TxKind::TrustGrant { .. } => {}
             }
             self.tx_index.insert(tx.id(), (block.index, pos));
         }
@@ -554,6 +568,7 @@ impl Chain {
             balances: std::collections::HashMap::new(),
             heartbeat_max_epoch: std::collections::HashMap::new(),
             tx_index: std::collections::HashMap::new(),
+            open_bids: std::collections::HashMap::new(),
         };
         reorg_chain.rebuild_caches();
         for block in new_suffix {
@@ -574,24 +589,12 @@ impl Chain {
 
     /// Credits locked in open bids (no matching JobSettle or JobExpire yet) for a node.
     /// Free balance = `balance(node) - locked_balance(node)`.
+    /// O(open_jobs) via the open_bids cache.
     pub fn locked_balance(&self, node: &NodeId) -> u64 {
-        let closed: std::collections::HashSet<[u8; 32]> = self.blocks.iter()
-            .flat_map(|b| &b.transactions)
-            .filter_map(|tx| match &tx.kind {
-                TxKind::JobSettle { job_id, .. } => Some(*job_id),
-                TxKind::JobExpire { job_id, .. } => Some(*job_id),
-                _ => None,
-            })
-            .collect();
-        self.blocks.iter()
-            .flat_map(|b| &b.transactions)
-            .filter_map(|tx| {
-                if let TxKind::JobBid { job_id, payer, bid, .. } = &tx.kind {
-                    if payer == node && !closed.contains(job_id) { Some(*bid) } else { None }
-                } else {
-                    None
-                }
-            })
+        self.open_bids
+            .values()
+            .filter(|(payer, _)| payer == node)
+            .map(|(_, bid)| *bid)
             .sum()
     }
 
