@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use ce_identity::{Identity, NodeId};
+use ce_identity::NodeId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -84,6 +84,7 @@ impl Devices {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ce_identity::Identity;
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir()

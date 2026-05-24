@@ -81,7 +81,6 @@ pub fn parse_from_header(hex: &str) -> Option<NodeId> {
 mod tests {
     use super::*;
     use ce_identity::Identity;
-    use std::path::PathBuf;
 
     fn test_identity(tag: &str) -> Identity {
         let dir = std::env::temp_dir()

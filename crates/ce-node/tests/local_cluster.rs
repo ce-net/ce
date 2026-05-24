@@ -357,6 +357,7 @@ async fn job_lifecycle() {
     let node_payer = Node::start(NodeConfig {
         listen_port: p2p_payer,
         bootstrap_peers: vec![],
+        relay_peers: vec![],
         data_dir: dir_payer.clone(),
         api_port: api_payer,
         mine: true,
@@ -381,6 +382,7 @@ async fn job_lifecycle() {
     let node_host = Node::start(NodeConfig {
         listen_port: p2p_host,
         bootstrap_peers: vec![bs],
+        relay_peers: vec![],
         data_dir: dir_host.clone(),
         api_port: api_host,
         mine: true,

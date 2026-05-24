@@ -3,12 +3,15 @@ use ce_chain::{Block, Tx};
 use ce_identity::NodeId;
 use ce_protocol::{CellSignal, GOSSIP_TOPIC as PROTOCOL_TOPIC};
 use libp2p::{
+    autonat, dcutr,
     futures::StreamExt,
-    gossipsub, identify, kad,
-    noise, swarm::{NetworkBehaviour, SwarmEvent},
+    gossipsub, identify, kad, mdns,
+    noise, relay,
+    swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -18,10 +21,10 @@ pub use ce_identity::NodeId as CeNodeId;
 pub use libp2p::PeerId as CePeerId;
 
 /// Compute the libp2p PeerId from a CE node's 32-byte secret key.
-/// Useful in tests to compute bootstrap multiaddrs before a node starts.
 pub fn peer_id_from_secret(secret: [u8; 32]) -> anyhow::Result<libp2p::PeerId> {
     let sec = libp2p::identity::ed25519::SecretKey::try_from_bytes(secret)?;
-    let kp = libp2p::identity::Keypair::from(libp2p::identity::ed25519::Keypair::from(sec));
+    let kp = libp2p::identity::ed25519::Keypair::from(sec);
+    let kp = libp2p::identity::Keypair::from(kp);
     Ok(kp.public().to_peer_id())
 }
 
@@ -67,14 +70,9 @@ pub enum MeshEvent {
     NewBlock(Block),
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
-    /// A peer announced their chain height — node uses this to decide if it needs to sync.
     PeerHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32] },
-    /// A peer is requesting blocks from `from_height` onward — node should call send_sync_response.
     SyncRequest { from_node: NodeId, from_height: u64 },
-    /// Incoming block batch from a sync response, addressed to `for_node`.
     SyncBlocks { for_node: NodeId, blocks: Vec<Block> },
-    /// A peer published a CEP-1 signal that decoded and passed signature verification.
-    /// Burn-proof / chain-side validation still happens in ce-node.
     CellSignal(CellSignal),
 }
 
@@ -85,7 +83,6 @@ const TOPIC_BLOCKS: &str = "ce-blocks";
 const TOPIC_HEIGHTS: &str = "ce-heights";
 const TOPIC_SYNCREQ: &str = "ce-syncreq";
 const TOPIC_SYNCRESP: &str = "ce-syncresp";
-// CEP-1 cell signaling topic; the actual string lives in ce-protocol.
 const TOPIC_PROTOCOL: &str = PROTOCOL_TOPIC;
 
 // ----- Network behaviour -----
@@ -95,9 +92,13 @@ struct CeBehaviour {
     gossipsub: gossipsub::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
+    mdns: mdns::tokio::Behaviour,
+    autonat: autonat::Behaviour,
+    dcutr: dcutr::Behaviour,
+    relay_client: relay::client::Behaviour,
 }
 
-// ----- Topic hash bundle (passed to free handler fn) -----
+// ----- Topic hash bundle -----
 
 struct Topics {
     tx: gossipsub::TopicHash,
@@ -138,9 +139,6 @@ impl MeshHandle {
         self.send(MeshCommand::SendSyncResponse { for_node, blocks }).await
     }
 
-    /// Publish a (locally-signed) CEP-1 signal to the `ce-protocol-1` topic.
-    /// Caller is responsible for building and signing the signal; this just
-    /// serializes and broadcasts.
     pub async fn broadcast_signal(&self, signal: &CellSignal) -> Result<()> {
         let bytes = signal.encode()?;
         self.send(MeshCommand::PublishSignal(bytes)).await
@@ -163,6 +161,8 @@ pub struct Mesh {
     protocol_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<MeshCommand>,
     event_tx: mpsc::Sender<MeshEvent>,
+    /// Peers we've designated as relay nodes. On connect, we listen on their circuit addr.
+    relay_peers: HashSet<PeerId>,
 }
 
 impl Mesh {
@@ -187,28 +187,28 @@ impl Mesh {
                 noise::Config::new,
                 yamux::Config::default,
             )?
-            .with_behaviour(|key| {
+            .with_quic()
+            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_behaviour(|key, relay_client| {
+                let peer_id = key.public().to_peer_id();
+
                 let message_id_fn = |msg: &gossipsub::Message| {
                     let hash = Sha256::digest(&msg.data);
                     gossipsub::MessageId::from(hash.to_vec())
                 };
-
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(1))
                     .validation_mode(gossipsub::ValidationMode::Strict)
                     .message_id_fn(message_id_fn)
-                    // Sync responses can be large — allow up to 4MB per message.
                     .max_transmit_size(4 * 1024 * 1024)
                     .build()
                     .expect("valid gossipsub config");
-
                 let gossipsub = gossipsub::Behaviour::new(
                     gossipsub::MessageAuthenticity::Signed(key.clone()),
                     gossipsub_config,
                 )
                 .expect("valid gossipsub");
 
-                let peer_id = key.public().to_peer_id();
                 let mut kademlia = kad::Behaviour::new(
                     peer_id,
                     kad::store::MemoryStore::new(peer_id),
@@ -220,7 +220,20 @@ impl Mesh {
                     key.public(),
                 ));
 
-                Ok(CeBehaviour { gossipsub, kademlia, identify })
+                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
+
+                let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
+                let dcutr = dcutr::Behaviour::new(peer_id);
+
+                Ok(CeBehaviour {
+                    gossipsub,
+                    kademlia,
+                    identify,
+                    mdns,
+                    autonat,
+                    dcutr,
+                    relay_client,
+                })
             })?
             .build();
 
@@ -237,6 +250,7 @@ impl Mesh {
             protocol_topic,
             cmd_rx,
             event_tx,
+            relay_peers: HashSet::new(),
         };
 
         let handle = MeshHandle { cmd_tx };
@@ -251,9 +265,27 @@ impl Mesh {
         Ok(())
     }
 
+    /// Register a relay node. After connecting, we will listen on its circuit address,
+    /// making this node reachable even behind NAT.
+    pub fn add_relay(&mut self, addr: &str) -> Result<()> {
+        let ma: Multiaddr = addr.parse()?;
+        let peer_id = peer_id_from_multiaddr(&ma)?;
+        self.relay_peers.insert(peer_id);
+        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, ma.clone());
+        self.swarm.dial(ma)?;
+        Ok(())
+    }
+
     pub async fn run(mut self, listen_port: u16) -> Result<()> {
-        let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?;
-        self.swarm.listen_on(listen_addr)?;
+        // Listen on TCP
+        let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?;
+        self.swarm.listen_on(tcp_addr)?;
+
+        // Listen on QUIC-v1 (same port number, different protocol)
+        let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
+        if let Err(e) = self.swarm.listen_on(quic_addr) {
+            debug!("QUIC listen: {e}");
+        }
 
         for topic in [
             &self.tx_topic,
@@ -282,6 +314,47 @@ impl Mesh {
                 }
                 event = self.swarm.next() => {
                     let Some(event) = event else { break };
+
+                    // mDNS: dial discovered local peers and add them to kademlia.
+                    if let SwarmEvent::Behaviour(CeBehaviourEvent::Mdns(
+                        mdns::Event::Discovered(ref peers)
+                    )) = event {
+                        let peers: Vec<_> = peers.clone();
+                        for (peer_id, addr) in peers {
+                            info!("mDNS discovered {peer_id} at {addr}");
+                            self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                            let _ = self.swarm.dial(peer_id);
+                        }
+                    }
+
+                    // Relay: when we connect to a registered relay, start listening on its circuit.
+                    if let SwarmEvent::ConnectionEstablished { ref peer_id, .. } = event {
+                        if self.relay_peers.contains(peer_id) {
+                            let circuit: Multiaddr =
+                                format!("/p2p/{peer_id}/p2p-circuit").parse()
+                                    .expect("valid circuit multiaddr");
+                            match self.swarm.listen_on(circuit) {
+                                Ok(_) => info!("relay circuit listening via {peer_id}"),
+                                Err(e) => warn!("relay circuit listen error: {e}"),
+                            }
+                        }
+                    }
+
+                    // AutoNAT: log NAT status changes.
+                    if let SwarmEvent::Behaviour(CeBehaviourEvent::Autonat(
+                        autonat::Event::StatusChanged { old, new }
+                    )) = event {
+                        info!("NAT status: {old:?} → {new:?}");
+                        continue;
+                    }
+
+                    // DCUtR: log hole-punch outcomes.
+                    if let SwarmEvent::Behaviour(CeBehaviourEvent::Dcutr(
+                        ref ev
+                    )) = event {
+                        debug!("DCUtR: {ev:?}");
+                    }
+
                     let mesh_event = handle_swarm_event(
                         event,
                         &topics,
@@ -327,7 +400,6 @@ impl Mesh {
                 }
             }
             MeshCommand::SendSyncResponse { for_node, blocks } => {
-                // Chunk into batches to stay under max_transmit_size.
                 for chunk in blocks.chunks(MAX_BLOCKS_PER_SYNC) {
                     let msg = SyncRespMsg { for_node, blocks: chunk.to_vec() };
                     if let Ok(bytes) = bincode::serialize(&msg) {
@@ -380,6 +452,10 @@ fn handle_swarm_event(
             kad::Event::RoutingUpdated { peer, .. },
         )) => {
             debug!("kademlia routing updated: {peer}");
+            None
+        }
+        SwarmEvent::Behaviour(CeBehaviourEvent::RelayClient(ev)) => {
+            debug!("relay client: {ev:?}");
             None
         }
         _ => None,

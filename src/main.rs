@@ -28,6 +28,11 @@ enum Commands {
         /// Bootstrap peer multiaddrs: /ip4/1.2.3.4/tcp/4001/p2p/<peer-id>
         #[arg(short, long)]
         bootstrap: Vec<String>,
+        /// Relay node multiaddrs for NAT traversal: /ip4/1.2.3.4/tcp/4001/p2p/<peer-id>
+        /// The node connects to each relay and listens on its circuit address,
+        /// becoming reachable from the internet even behind NAT.
+        #[arg(long)]
+        relay: Vec<String>,
     },
     /// Show this node's credit balance.
     Balance,
@@ -190,10 +195,11 @@ async fn main() -> Result<()> {
     let data_dir = data_dir(cli.data_dir);
 
     match cli.command {
-        Commands::Start { port, api_port, bootstrap } => {
+        Commands::Start { port, api_port, bootstrap, relay } => {
             let config = NodeConfig {
                 listen_port: port,
                 bootstrap_peers: bootstrap,
+                relay_peers: relay,
                 data_dir,
                 api_port,
                 mine: true,

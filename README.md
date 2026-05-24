@@ -27,6 +27,7 @@ Every node is assumed hostile. The honest majority wins. No trusted parties.
 cargo build --release
 
 # Start a node (mines blocks, API on :8080, P2P on :4001)
+# mDNS finds peers on the same LAN automatically — no config needed.
 ./target/release/ce start
 
 # Check status and balance
@@ -35,6 +36,10 @@ cargo build --release
 # Join an existing network
 ./target/release/ce start --port 4002 --api-port 8081 \
   --bootstrap /ip4/1.2.3.4/tcp/4001/p2p/<peer-id>
+
+# Join from behind NAT via a relay node (makes you reachable from the internet)
+./target/release/ce start \
+  --relay /ip4/1.2.3.4/tcp/4001/p2p/<relay-peer-id>
 
 # Submit a container job (node must have positive balance)
 curl -X POST http://localhost:8080/jobs/bid \
@@ -122,6 +127,20 @@ libp2p 0.53, six Gossipsub topics:
 | `ce-syncresp` | Serve blocks to syncing nodes (up to 500/batch, 4MB max) |
 | `ce-protocol-1` | CEP-1 cell signals |
 
+#### NAT traversal
+
+Nodes use four complementary strategies to reach each other across the internet:
+
+| Mechanism | What it does |
+|---|---|
+| **mDNS** | Zero-config LAN discovery — nodes on the same network find each other without any bootstrap peer |
+| **QUIC** | UDP transport alongside TCP; punches through many cone NATs and reduces round-trips |
+| **AutoNAT** | Probes external reachability and logs NAT type, used by other behaviours to decide strategy |
+| **DCUtR** | Direct Connection Upgrade through Relay — hole-punches a direct path between two NAT'd nodes once they share a relay |
+| **Relay client** | Falls back to routing traffic through a public relay node when direct dialing is impossible |
+
+Specify relay nodes with `--relay /ip4/<ip>/tcp/<port>/p2p/<peer-id>`. The node connects to the relay, obtains a reservation, and announces the circuit address so peers behind NAT can reach it.
+
 ## Testing
 
 ```bash
@@ -177,7 +196,7 @@ Default: `~/.local/share/ce/`
 ## CLI
 
 ```
-ce start [--port 4001] [--api-port 8080] [--bootstrap <multiaddr>]
+ce start [--port 4001] [--api-port 8080] [--bootstrap <multiaddr>] [--relay <multiaddr>]
 ce status
 ce balance
 ce id

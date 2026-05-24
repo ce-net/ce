@@ -111,6 +111,9 @@ pub(crate) type JobStore = Arc<Mutex<HashMap<[u8; 32], JobRecord>>>;
 pub struct NodeConfig {
     pub listen_port: u16,
     pub bootstrap_peers: Vec<String>,
+    /// Circuit relay nodes (multiaddrs with /p2p/<peer-id>). On connect, the node
+    /// listens on their circuit address to become reachable through NAT.
+    pub relay_peers: Vec<String>,
     pub data_dir: PathBuf,
     pub api_port: u16,
     /// Disable the mining loop. Tests that need a non-mining observer set this to `false`.
@@ -124,6 +127,7 @@ impl Default for NodeConfig {
         Self {
             listen_port: 0,
             bootstrap_peers: vec![],
+            relay_peers: vec![],
             data_dir: Self::default_data_dir(),
             api_port: 0,
             mine: true,
@@ -175,6 +179,11 @@ impl Node {
         for peer in &config.bootstrap_peers {
             if let Err(e) = mesh.add_bootstrap(peer) {
                 warn!("bootstrap {peer}: {e}");
+            }
+        }
+        for relay in &config.relay_peers {
+            if let Err(e) = mesh.add_relay(relay) {
+                warn!("relay {relay}: {e}");
             }
         }
 
