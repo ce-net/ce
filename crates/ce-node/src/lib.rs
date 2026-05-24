@@ -481,16 +481,25 @@ async fn mesh_event_loop(
                     Err(e) => warn!("invalid tx from mesh: {e}"),
                 }
             }
-            MeshEvent::PeerHeight { node_id, height, tip_hash: _ } => {
-                let our_height = chain.lock().await.height();
+            MeshEvent::PeerHeight { node_id, height, tip_hash } => {
+                let (our_height, our_tip) = {
+                    let c = chain.lock().await;
+                    (c.height(), c.tip_hash())
+                };
                 if height > our_height {
+                    // If tip hashes differ we might be on a fork: request from genesis
+                    // so the reorg path has ancestors to work with. If we're on the
+                    // same chain (tips would match after the peer catches up), requesting
+                    // from our_height is fine and cheaper — use 0 only when fork is likely.
+                    let from = if tip_hash != our_tip && our_height > 0 { 0 } else { our_height };
                     info!(
-                        "peer {} is at height {}, we're at {} — requesting sync",
+                        "peer {} is at height {}, we're at {} — requesting sync from {}",
                         hex::encode(&node_id[..4]),
                         height,
-                        our_height
+                        our_height,
+                        from,
                     );
-                    let _ = mesh_handle.send_sync_request(our_node_id, our_height).await;
+                    let _ = mesh_handle.send_sync_request(our_node_id, from).await;
                 }
             }
             MeshEvent::SyncRequest { from_node, from_height } => {
@@ -519,6 +528,9 @@ async fn mesh_event_loop(
                 }
                 let mut c = chain.lock().await;
                 let height_before = c.height();
+                // Highest block index in the candidate set — used to detect true forks
+                // vs. stale sync responses that arrived after gossip already applied the block.
+                let max_candidate = blocks.iter().map(|b| b.index).max().unwrap_or(0);
 
                 // Fast path: blocks extend the current tip in order.
                 let mut applied = 0u64;
@@ -528,9 +540,7 @@ async fn mesh_event_loop(
                     }
                 }
 
-                // Slow path: if nothing appended, try a reorg (longest-chain rule).
-                // This handles the case where we received blocks from a competing fork
-                // that is now longer than ours.
+                // Slow path: reorg — handles a competing fork that is now longer.
                 if applied == 0 && c.try_reorg(blocks) {
                     info!(
                         "reorg: switched to longer chain at height {} (was {})",
@@ -545,6 +555,14 @@ async fn mesh_event_loop(
                     if let Err(e) = c.save(&chain_path) {
                         warn!("save chain after sync: {e}");
                     }
+                } else if max_candidate > c.height() {
+                    // The candidate set contains blocks higher than us but neither path
+                    // worked — we're on a competing fork and the reorg didn't have ancestors.
+                    // Request from genesis so try_reorg can find the common ancestor.
+                    let our_height = c.height();
+                    drop(c);
+                    warn!("sync blocks didn't apply (fork at height {our_height}, peer tip {max_candidate}); requesting full resync");
+                    let _ = mesh_handle.send_sync_request(our_node_id, 0).await;
                 }
             }
             MeshEvent::PeerConnected(peer) => info!("peer connected: {peer}"),

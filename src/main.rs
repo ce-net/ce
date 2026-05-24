@@ -44,6 +44,9 @@ enum Commands {
         /// becoming reachable from the internet even behind NAT.
         #[arg(long)]
         relay: Vec<String>,
+        /// Disable block mining. Node will still sync, relay, and serve jobs.
+        #[arg(long)]
+        no_mine: bool,
     },
     /// Show this node's credit balance.
     Balance,
@@ -206,7 +209,7 @@ async fn main() -> Result<()> {
     let data_dir = data_dir(cli.data_dir);
 
     match cli.command {
-        Commands::Start { port, api_port, bootstrap, relay } => {
+        Commands::Start { port, api_port, bootstrap, relay, no_mine } => {
             // CE_BOOTSTRAP_PEERS: colon-separated list of bootstrap multiaddrs.
             // Useful for Docker/systemd deployments where CLI flags are inconvenient.
             let mut bootstrap_peers = bootstrap;
@@ -229,7 +232,7 @@ async fn main() -> Result<()> {
                 relay_peers,
                 data_dir,
                 api_port,
-                mine: true,
+                mine: !no_mine,
                 ..Default::default()
             };
             let node = Node::start(config).await?;
