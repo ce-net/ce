@@ -4,8 +4,19 @@ use ce_identity::Identity;
 use ce_node::{auth::make_auth_headers, devices::Devices, Node, NodeConfig};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
+
+/// Return non-loopback IPv4 addresses on this host. Used to print bootstrap multiaddrs.
+fn local_ip_addrs() -> Result<Vec<IpAddr>> {
+    use std::net::UdpSocket;
+    // UDP connect trick: bind to any addr, check what local IP the OS picks for an external dest.
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?;
+    let addr = socket.local_addr()?;
+    Ok(vec![addr.ip()])
+}
 
 #[derive(Parser)]
 #[command(name = "ce", about = "CE node")]
@@ -225,10 +236,22 @@ async fn main() -> Result<()> {
             let status = node.status().await;
             println!("CE node running");
             println!("  node id  : {}", status.node_id);
+            println!("  peer id  : {}", status.peer_id);
             println!("  height   : {}", status.height);
             println!("  balance  : {}", status.balance);
             println!("  p2p port : {}", status.listen_port);
             println!("  api port : {}", status.api_port);
+            println!();
+            println!("Bootstrap multiaddrs (share with other nodes via --bootstrap):");
+            // Try common interface IPs; mDNS handles LAN automatically.
+            if let Ok(addrs) = local_ip_addrs() {
+                for ip in &addrs {
+                    println!("  /ip4/{ip}/tcp/{port}/p2p/{}", status.peer_id);
+                }
+            } else {
+                println!("  /ip4/<your-ip>/tcp/{port}/p2p/{}", status.peer_id);
+            }
+            println!();
             println!("Press Ctrl-C to stop.");
             tokio::signal::ctrl_c().await?;
             println!("Shutting down.");
@@ -256,7 +279,9 @@ async fn main() -> Result<()> {
         Commands::Id => {
             let identity_dir = data_dir.join("identity");
             let identity = Identity::load_or_generate(&identity_dir)?;
-            println!("{}", identity.node_id_hex());
+            println!("ce node id : {}", identity.node_id_hex());
+            let peer_id = ce_node::peer_id_from_identity(&identity)?;
+            println!("libp2p id  : {peer_id}");
         }
 
         Commands::Devices { command } => {

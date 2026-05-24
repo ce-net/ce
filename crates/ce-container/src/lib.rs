@@ -283,10 +283,17 @@ async fn wait_for_exit_impl(docker: &Docker, container_id: &str) -> Result<i64> 
     let mut stream =
         docker.wait_container(container_id, None::<WaitContainerOptions<String>>);
     match stream.next().await {
-        Some(Ok(resp)) => Ok(resp.status_code),
-        Some(Err(e)) => Err(anyhow!("wait_container {container_id}: {e}")),
-        None => Err(anyhow!("wait_container stream ended without result for {container_id}")),
+        Some(Ok(resp)) => return Ok(resp.status_code),
+        Some(Err(_)) | None => {}
     }
+    // Container may have already exited before wait_container was called.
+    // Fall back to inspect to get the exit code.
+    let info = docker.inspect_container(container_id, None).await?;
+    let code = info
+        .state
+        .and_then(|s| s.exit_code)
+        .unwrap_or(-1);
+    Ok(code)
 }
 
 /// Returns (container_id, payer_node_id) for running CE-managed containers.

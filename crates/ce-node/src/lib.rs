@@ -2,6 +2,11 @@ mod api;
 pub mod auth;
 pub mod devices;
 
+/// Derive the libp2p PeerId string from a CE identity (same Ed25519 key, different encoding).
+pub fn peer_id_from_identity(identity: &ce_identity::Identity) -> anyhow::Result<String> {
+    ce_mesh::peer_id_from_secret(identity.secret_bytes()).map(|p| p.to_string())
+}
+
 use anyhow::Result;
 use ce_chain::{Block, Chain, Tx, TxKind};
 use ce_container::{ContainerManager, JobSpec};
@@ -347,8 +352,12 @@ impl Node {
 
     pub async fn status(&self) -> NodeStatus {
         let chain = self.chain.lock().await;
+        let peer_id = ce_mesh::peer_id_from_secret(self.identity.secret_bytes())
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| "unknown".into());
         NodeStatus {
             node_id: self.identity.node_id_hex(),
+            peer_id,
             height: chain.height(),
             difficulty: chain.difficulty,
             balance: chain.balance(&self.identity.node_id()),
@@ -361,6 +370,9 @@ impl Node {
 #[derive(Debug)]
 pub struct NodeStatus {
     pub node_id: String,
+    /// libp2p PeerId derived from the node's Ed25519 key. Use this in bootstrap multiaddrs:
+    /// /ip4/<ip>/tcp/<port>/p2p/<peer_id>
+    pub peer_id: String,
     pub height: u64,
     pub difficulty: u8,
     pub balance: i64,

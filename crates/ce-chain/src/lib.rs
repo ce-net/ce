@@ -5,6 +5,30 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Difficulty adjustment window (blocks).
+pub const DIFFICULTY_WINDOW: u64 = 2016;
+/// Target inter-block time in seconds.
+pub const TARGET_BLOCK_SECS: u64 = 600;
+
+/// Returns true if `hash` begins with at least `bits` zero bits.
+/// With `bits = 0` this is always true (genesis / test chains).
+pub fn has_leading_zeros(hash: &[u8; 32], bits: u8) -> bool {
+    let full_bytes = (bits / 8) as usize;
+    let rem = bits % 8;
+    for b in hash.iter().take(full_bytes) {
+        if *b != 0 {
+            return false;
+        }
+    }
+    if rem > 0 && full_bytes < 32 {
+        let mask = 0xFFu8 << (8 - rem);
+        if hash[full_bytes] & mask != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 mod sig_serde {
     use serde::{de::Error, Deserializer, Serializer};
 
