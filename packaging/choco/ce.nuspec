@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>ce</id>
+    <version>0.1.0</version>
+    <title>CE — Compute Economy</title>
+    <authors>Leif Rydenfalk</authors>
+    <projectUrl>https://github.com/ce-net/ce</projectUrl>
+    <licenseUrl>https://github.com/ce-net/ce/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>Peer-to-peer compute mesh and economy. Donate compute to the network, earn credits, spend credits on compute. Like if Bitcoin ran Docker.</description>
+    <summary>P2P compute marketplace on a PoW blockchain.</summary>
+    <tags>p2p blockchain compute docker cli</tags>
+    <releaseNotes>https://github.com/ce-net/ce/releases/tag/v0.1.0</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

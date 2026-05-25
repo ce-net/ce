@@ -1,5 +1,82 @@
 # CE — Deployment Guide
 
+## Adding your laptop and desktop to the mesh
+
+This is the two-step process to join your own machines to your CE network.
+
+### Step 1: Install CE on each device
+
+**macOS / Linux:**
+```bash
+curl -sSL https://raw.githubusercontent.com/ce-net/ce/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/ce-net/ce/main/install.ps1 | iex
+```
+
+**Homebrew (macOS / Linux):**
+```bash
+brew install ce-net/ce/ce
+```
+
+### Step 2: Start CE on each device
+
+On each machine, run:
+```bash
+ce start
+```
+
+The node auto-joins the public mesh via `ce-net.com` bootstrap. If your devices are on the same LAN, mDNS will find them automatically — no manual peer config needed.
+
+To verify it is running:
+```bash
+ce status
+# prints: node ID, chain height, balance
+```
+
+### Step 3: Register devices as trusted peers
+
+CE uses on-chain `TrustGrant` transactions to authorize one node to exec/sync on another.
+
+**On the device you want to control remotely, get its node ID:**
+```bash
+ce id
+# output: 7a3f9b2c...  (64 hex chars)
+```
+
+**On your primary machine, register it:**
+```bash
+ce devices add desktop 7a3f9b2c... --addr 192.168.1.10:8844
+ce devices add laptop  4d8e1f0a... --addr 192.168.1.20:8844
+```
+
+If the device is behind NAT (not on the same LAN), use the relay address instead:
+```bash
+ce devices add laptop 4d8e1f0a... --addr <relay-ip>:8844
+```
+
+**Verify the device list:**
+```bash
+ce devices ls
+```
+
+### Step 4: Use the devices
+
+```bash
+# Run a sandboxed command on desktop
+ce exec desktop --image alpine:latest -- echo hello
+
+# Sync a file to laptop
+ce sync ./myfile.txt laptop:/home/user/myfile.txt
+
+# Submit a compute job (any node with capacity will pick it up)
+ce deploy alpine:latest --cpu 2 --mem 512 --duration 60
+```
+
+---
+
 ## Single node (quick start)
 
 ```bash
@@ -7,7 +84,7 @@ cargo build --release
 ./target/release/ce start
 ```
 
-Defaults: P2P on `:4001`, API on `:8080`, data in `~/.local/share/ce/`.
+Defaults: P2P on `:4001`, API on `:8844`, data in `~/.local/share/ce/`.
 
 ```bash
 # Different ports
@@ -23,7 +100,7 @@ Defaults: P2P on `:4001`, API on `:8080`, data in `~/.local/share/ce/`.
 
 **Node 1 (genesis):**
 ```bash
-./ce start --port 4001 --api-port 8080
+./ce start --port 4001 --api-port 8844
 # Note the node ID from the log: "node id: <64 hex>"
 ```
 
@@ -31,7 +108,7 @@ Defaults: P2P on `:4001`, API on `:8080`, data in `~/.local/share/ce/`.
 ```bash
 # Get node 1's peer ID
 N1_ID=$(ssh node1 ce id)
-./ce start --port 4001 --api-port 8080 \
+./ce start --port 4001 --api-port 8844 \
   --bootstrap /ip4/<node1-ip>/tcp/4001/p2p/$N1_ID
 ```
 
@@ -91,7 +168,7 @@ scp target/release/ce root@<server-ip>:/usr/local/bin/ce
 chmod +x /usr/local/bin/ce
 
 # Start
-ce start --port 4001 --api-port 8080 --bootstrap <addr>
+ce start --port 4001 --api-port 8844 --bootstrap <addr>
 ```
 
 ### Systemd service
@@ -103,7 +180,7 @@ Description=CE Compute Economy Node
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/ce start --port 4001 --api-port 8080
+ExecStart=/usr/local/bin/ce start --port 4001 --api-port 8844
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=ce=info
@@ -124,12 +201,12 @@ journalctl -u ce -f
 | Port | Protocol | Direction | Purpose |
 |---|---|---|---|
 | 4001 | TCP | Inbound | libp2p P2P (Kademlia + Gossipsub) |
-| 8080 | TCP | Inbound | HTTP API |
+| 8844 | TCP | Inbound | HTTP API |
 
 ```bash
 # ufw example
 ufw allow 4001/tcp
-ufw allow 8080/tcp
+ufw allow 8844/tcp
 ```
 
 ---
@@ -138,10 +215,10 @@ ufw allow 8080/tcp
 
 ```bash
 # Check node status
-curl http://localhost:8080/status | jq
+curl http://localhost:8844/status | jq
 
 # Watch chain height
-watch -n5 'curl -s http://localhost:8080/status | jq .height'
+watch -n5 'curl -s http://localhost:8844/status | jq .height'
 
 # Logs (if using systemd)
 journalctl -u ce -f

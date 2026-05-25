@@ -16,18 +16,49 @@ Every node is assumed hostile. The honest majority wins. No trusted parties.
 │        │              │                                      │
 │        └───────── ce-node (orchestrator) ───────────────────┤
 │                          │                                   │
-│                HTTP API :8080                               │
+│                HTTP API :8844                               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Install
 
+**macOS / Linux (one-liner):**
 ```bash
-# One-liner (Linux/macOS — downloads the latest release binary)
 curl -sSL https://raw.githubusercontent.com/ce-net/ce/main/install.sh | bash
 ```
-
 On Linux with systemd the installer also creates a `ce.service` that starts automatically at boot.
+
+**Homebrew (macOS / Linux):**
+```bash
+brew install ce-net/ce/ce
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/ce-net/ce/main/install.ps1 | iex
+```
+
+**Scoop (Windows):**
+```powershell
+scoop bucket add ce-net https://github.com/ce-net/scoop-ce
+scoop install ce
+```
+
+**Chocolatey (Windows):**
+```powershell
+choco install ce
+```
+
+**AUR (Arch Linux):**
+```bash
+yay -S ce-bin
+# or: paru -S ce-bin
+```
+
+**Build from source:**
+```bash
+cargo build --release
+```
 
 ## Quick Start
 
@@ -53,7 +84,7 @@ ce id
 # ce node id : 7a3f9b... (copy this)
 
 # On your local machine
-ce devices add desktop 7a3f9b... --addr 192.168.1.10:8080
+ce devices add desktop 7a3f9b... --addr 192.168.1.10:8844
 ```
 
 ### Manual bootstrap (advanced)
@@ -73,7 +104,7 @@ CE_RELAY_PEERS=/ip4/1.2.3.4/tcp/4001/p2p/<relay-id> ce start
 CE_NO_AUTOBOOTSTRAP=1 ce start --bootstrap /ip4/your-relay/tcp/4001/p2p/<peer-id>
 
 # Submit a container job (node must have positive balance)
-curl -X POST http://localhost:8080/jobs/bid \
+curl -X POST http://localhost:8844/jobs/bid \
   -H 'Content-Type: application/json' \
   -d '{"image":"alpine:latest","cpu_cores":1,"mem_mb":128,"duration_secs":30,"bid":100}'
 ```
@@ -230,7 +261,7 @@ Default: `~/.local/share/ce/`
 ## CLI
 
 ```
-ce start [--port 4001] [--api-port 8080] [--bootstrap <multiaddr>] [--relay <multiaddr>]
+ce start [--port 4001] [--api-port 8844] [--bootstrap <multiaddr>] [--relay <multiaddr>]
 ce status
 ce balance
 ce id

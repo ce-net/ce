@@ -42,7 +42,7 @@ fn local_ip_addrs() -> Result<Vec<IpAddr>> {
 }
 
 #[derive(Parser)]
-#[command(name = "ce", about = "CE node")]
+#[command(name = "ce", about = "CE node", version)]
 struct Cli {
     #[arg(long, help = "Override data directory (default: ~/.local/share/ce)")]
     data_dir: Option<PathBuf>,
@@ -57,7 +57,7 @@ enum Commands {
     Start {
         #[arg(short, long, default_value = "4001")]
         port: u16,
-        #[arg(long, default_value = "8080")]
+        #[arg(long, default_value = "8844")]
         api_port: u16,
         /// Bootstrap peer multiaddrs: /ip4/1.2.3.4/tcp/4001/p2p/<peer-id>
         #[arg(short, long)]
@@ -83,7 +83,7 @@ enum Commands {
     Id,
     /// Manage trusted devices (personal mesh OS).
     ///
-    /// Quick add: ce devices add desktop <node-id> --addr 192.168.1.10:8080
+    /// Quick add: ce devices add desktop <node-id> --addr 192.168.1.10:8844
     Devices {
         #[command(subcommand)]
         command: DevicesCommands,
@@ -128,14 +128,14 @@ enum Commands {
         /// Command override for the container.
         #[arg(short, long)]
         cmd: Vec<String>,
-        #[arg(long, default_value = "8080")]
+        #[arg(long, default_value = "8844")]
         api_port: u16,
     },
     /// List jobs on this node (or a remote device).
     ///
     /// Example: ce ps
     Ps {
-        #[arg(long, default_value = "8080")]
+        #[arg(long, default_value = "8844")]
         api_port: u16,
     },
     /// Force-stop a job by CE job ID.
@@ -143,7 +143,7 @@ enum Commands {
     /// Example: ce kill <job-id>
     Kill {
         job_id: String,
-        #[arg(long, default_value = "8080")]
+        #[arg(long, default_value = "8844")]
         api_port: u16,
     },
     /// Install CE as a background service that starts automatically on login.
@@ -175,7 +175,7 @@ enum Commands {
         /// Recipient NodeId (64 hex chars).
         to: String,
         amount: u64,
-        #[arg(long, default_value = "8080")]
+        #[arg(long, default_value = "8844")]
         api_port: u16,
     },
     /// Send a CEP-1 signal to a cell and print the response.
@@ -189,7 +189,7 @@ enum Commands {
         payload_hex: String,
         #[arg(long)]
         burn_tx: Option<String>,
-        #[arg(long, default_value = "8080")]
+        #[arg(long, default_value = "8844")]
         api_port: u16,
     },
 }
@@ -198,7 +198,7 @@ enum Commands {
 enum DevicesCommands {
     /// Add a trusted device.
     ///
-    /// Quick usage: ce devices add desktop <node-id> --addr 192.168.1.10:8080
+    /// Quick usage: ce devices add desktop <node-id> --addr 192.168.1.10:8844
     /// Get the node ID on the target machine with: ce id
     Add {
         /// Friendly name for the device (e.g. "desktop", "laptop").
@@ -590,7 +590,7 @@ async fn main() -> Result<()> {
                     let addr_str = match addr {
                         Some(a) => a,
                         None => {
-                            print!("API address (host:port, e.g. 192.168.1.10:8080): ");
+                            print!("API address (host:port, e.g. 192.168.1.10:8844): ");
                             std::io::stdout().flush()?;
                             let mut s = String::new();
                             std::io::stdin().lock().read_line(&mut s)?;

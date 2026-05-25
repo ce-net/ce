@@ -1,0 +1,37 @@
+# Maintainer: Leif Rydenfalk <ledamecrydenfalk@gmail.com>
+pkgname=ce-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Peer-to-peer compute mesh and economy"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ce-net/ce"
+license=('MIT')
+provides=('ce')
+conflicts=('ce')
+
+source_x86_64=("ce::https://github.com/ce-net/ce/releases/download/v${pkgver}/ce-linux-amd64.tar.gz")
+source_aarch64=("ce::https://github.com/ce-net/ce/releases/download/v${pkgver}/ce-linux-arm64.tar.gz")
+# Update sha256sums after each release (see sha256sums.txt in GitHub release assets)
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    install -Dm755 "${srcdir}/ce" "${pkgdir}/usr/bin/ce"
+
+    install -Dm644 /dev/stdin "${pkgdir}/usr/lib/systemd/system/ce.service" << 'EOF'
+[Unit]
+Description=CE — global compute mesh node
+Documentation=https://github.com/ce-net/ce
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ce start
+Restart=on-failure
+RestartSec=10s
+EnvironmentFile=-/etc/ce/env
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
