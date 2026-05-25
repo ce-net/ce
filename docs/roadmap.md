@@ -24,17 +24,20 @@ These are the same system from two angles. The identity primitive that lets untr
 |---|---|---|
 | `ce-identity` | ✅ Complete | Ed25519 keypair, node ID, sign/verify, benchmarks |
 | `ce-chain` | ✅ Complete | Uptime emission, Transfer/UptimeReward/JobBid/JobSettle/JobExpire/TrustGrant/Heartbeat, supply cap (21B), halving schedule, credit escrow (locked_balance), tx_by_id, last_heartbeat_epoch, full validation, persistence, tests |
-| `ce-mesh` | ✅ Complete | 6 gossip topics, Kademlia DHT, chain sync, CEP-1 signal routing |
+| `ce-mesh` | ✅ Complete | 7 gossip topics (ce-transactions/blocks/heights/syncreq/syncresp/protocol-1/segments), Kademlia DHT, chain sync, CEP-1 signal routing, relay mining |
 | `ce-protocol` | ✅ Complete | CEP-1 wire format, BurnProof, CellSignal build/verify/encode/decode |
 | `ce-container` | ✅ Complete | gVisor detection, CPU/memory/network limits, image pull, wait-for-exit, stop_job |
 | `ce-node` | ✅ Complete | Mining loop, mesh event loop, job manager, heartbeat loop (30s), capacity broadcast (60s), atlas, signal ring buffer, tx pool, nonce replay prevention |
-| HTTP API | ✅ Complete | /jobs/bid, /jobs (list), /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /transfer, /status, /signals, /signals/send, /health, /atlas, /sync/*, /exec, /bootstrap |
+| HTTP API | ✅ Complete | /jobs/bid, /jobs (list), /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /transfer, /status, /signals, /signals/send, /health, /atlas, /sync/*, /exec, /bootstrap, /mesh-exec, /mesh-sync |
 | CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, devices (add/ls/revoke — inline node-id support), sync, exec, deploy, ps, kill, fund, run |
 | Device registry | ✅ Complete | machines.toml, trusted device management, CE identity auth for sync/exec |
 | `ce-deploy` | ✅ Complete | Hetzner provisioning, SSH deploy, E2E tests |
 | Integration tests | ✅ Complete | single node mines, two nodes sync, tx pool propagates, API health/status, signal propagation, job lifecycle (requires Docker, skipped by default) |
+| Chain persistence | ✅ Complete | bincode+zstd (level 3) storage (~8x smaller than JSON), O(1) tip validation, checkpoint pruning, JSON migration on first load |
+| Distributed chain archive | ✅ Complete | Light node mode (`--light`, auto-prune to last 2880 blocks), archive segment distribution via `ce-segments` gossip topic, rendezvous-hash assignment of segments across peers, `SegmentFetch` RPC to retrieve historical blocks from archive nodes, oldest_block routing |
+| Height re-announce on connect | ✅ Complete | On peer connect the node immediately announces its chain height so new peers trigger sync without waiting for the next ticker |
 
-The foundation — identity, chain, mesh, protocol, containers, job economy — is fully implemented and tested. The system can mine blocks, earn credits, accept jobs from other nodes, run containers in gVisor, settle on-chain, route CEP-1 signals, sync files between trusted devices, and execute remote commands.
+The foundation — identity, chain, mesh, protocol, containers, job economy, distributed archive — is fully implemented and tested.
 
 ### Known gaps and correctness issues
 
@@ -332,6 +335,225 @@ Names are self-sovereign (no central authority) — stored in the chain, resolve
 
 ---
 
+## Phase 6 — Real-Time Push (subscription system)
+
+The goal: no polling. Every subscriber gets pushed signals, blocks, and transactions the instant the mesh delivers them.
+
+Currently `GET /signals` is a poll endpoint returning a static ring buffer snapshot. Internally a `tokio::sync::broadcast::Sender<CellSignal>` already fires on every validated signal — it just isn't exposed over HTTP.
+
+### 6a. SSE streams (planned)
+
+Add three Server-Sent Events endpoints. Each streams newline-delimited JSON events as they arrive. Clients connect once and stay connected; the server pushes immediately.
+
+```
+GET /signals/stream        — SSE: one JSON CellSignal per event
+GET /blocks/stream         — SSE: one JSON Block per event
+GET /transactions/stream   — SSE: one JSON Tx per event
+```
+
+Implementation sketch (`ce-node/src/api.rs`):
+
+```rust
+// GET /signals/stream — SSE push, no polling required
+async fn stream_signals(
+    State(state): State<ApiState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut rx = state.signal_tx.subscribe();   // broadcast channel already exists
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(sig) => {
+                    let json = serde_json::to_string(&signal_view(&sig)).unwrap_or_default();
+                    yield Ok(Event::default().data(json));
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // Slow consumer — log and continue
+                    warn!("SSE client lagged {n} signals");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+```
+
+`ApiState` must expose `signal_tx: broadcast::Sender<CellSignal>` (it is already created in `Node::start` but currently the receiver is immediately dropped and it is not threaded into `ApiState`). Wire it in.
+
+The same pattern applies to blocks and transactions — add `block_tx` and `tx_tx` broadcast senders to `MeshEvent` processing and expose them on `ApiState`.
+
+### 6b. WebSocket upgrade (future)
+
+SSE is one-directional (server→client). A WebSocket variant allows bidirectional signalling: clients can also *send* from the stream. Low priority until there is a concrete use case. SSE covers 95% of cases with far less complexity.
+
+### 6c. Filter parameters (future)
+
+```
+GET /signals/stream?from=<node-id>   — only signals from this sender
+GET /signals/stream?to=<node-id>     — only signals addressed to this node
+GET /blocks/stream?min_height=N      — replay from height N then stream live
+```
+
+---
+
+## Phase 7 — Live Mesh Benchmark Suite
+
+The goal: measure actual propagation latency, gossip fanout time, and RPC round-trip on the real ce-net network. Not synthetic — real packets, real NAT, real relay routing.
+
+### 7a. `ce-bench` crate (planned)
+
+New crate `crates/ce-bench`. Built as a binary (`cargo build -p ce-bench --release`) that connects to the live mesh and runs a suite of latency and throughput probes.
+
+```
+cargo run -p ce-bench -- --bootstrap /dns4/relay.ce-net.com/tcp/4001/p2p/<id> --suite all
+```
+
+**Benchmark suite:**
+
+| Benchmark | Measures | Method |
+|---|---|---|
+| `gossip-signal-rtt` | Time from `POST /signals/send` until the SSE stream on a second node fires | Two nodes, one sends, other listens on SSE stream; record wall-clock delta |
+| `gossip-block-rtt` | Time from mining a block until a peer reports it in `GET /status` | Node A mines, Node B polls `/status` until height bumps; record delta |
+| `rpc-exec-rtt` | `/ce/rpc/1` round-trip for a trivial exec (e.g. `echo`) | `send_rpc(Exec { cmd: ["echo", "bench"] })`, record from send to recv |
+| `chain-sync-speed` | Blocks/second during initial sync from 0 | Fresh node connects, time until heights match |
+| `gossip-fanout` | How many hops a signal takes to saturate a 5-node mesh | Instrument signals with hop-count capability; measure saturation time |
+| `tx-pool-propagation` | Time for a `Transfer` tx to appear on all peers | Broadcast tx on Node A, poll tx pool on Node B/C; record delta |
+
+Results printed as a markdown table and optionally as JSON for CI ingestion.
+
+### 7b. Live ce-net test harness (planned)
+
+A separate test target that spins up two temporary nodes connected to the real ce-net bootstrap, runs the full job lifecycle, and asserts latencies are within bounds. Runs manually or from CI with `CE_LIVE_BENCH=1 cargo test -p ce-bench -- --ignored`.
+
+```bash
+# Run against the live mesh — requires network access and a funded node
+CE_LIVE_BENCH=1 cargo test -p ce-bench -- --ignored --nocapture
+```
+
+This is different from the Hetzner E2E tests (which provision fresh VMs) — the live bench tests join the *existing* production mesh and measures real-world performance.
+
+### 7c. Continuous latency tracking (future)
+
+The relay node runs `ce-bench --daemon` which emits metrics every 5 minutes. A Prometheus scrape endpoint at `/metrics` on the relay exposes:
+
+```
+ce_gossip_signal_p50_ms
+ce_gossip_signal_p99_ms
+ce_rpc_exec_p50_ms
+ce_rpc_exec_p99_ms
+ce_connected_peers
+ce_chain_height
+```
+
+Grafana dashboard at grafana.ce-net.com.
+
+---
+
+## Phase 8 — Multi-Bootstrap Resilience
+
+The goal: the network boots even if the primary relay is down. A hundred bootstrap nodes should be able to go offline and the network should still be joinable.
+
+### 8a. Multiple bootstrap domains (planned)
+
+Maintain a fleet of bootstrap nodes across multiple domains and providers so no single point can kill discovery:
+
+```
+relay.ce-net.com       — primary (Hetzner Falkenstein)
+relay-2.ce-net.com     — secondary (DigitalOcean or Vultr)
+bootstrap.ce-net.io    — fallback domain (different TLD)
+bootstrap.ce-network.com — fallback domain
+```
+
+The `ce start` auto-bootstrap logic already tries `CE_BOOTSTRAP_URL` then falls back to mDNS. Extend it to try a prioritised list:
+
+```rust
+const BOOTSTRAP_URLS: &[&str] = &[
+    "https://relay.ce-net.com/bootstrap",
+    "https://relay-2.ce-net.com/bootstrap",
+    "https://bootstrap.ce-net.io/bootstrap",
+];
+```
+
+The `fetch_bootstrap_peers` function in `src/main.rs` already supports a single URL override; extend to try the list in order and merge results.
+
+### 8b. Immutable history guarantee (planned)
+
+The distributed segment archive (done in Phase 6 of chain work) stores history across nodes. For tamper-evidence:
+
+- Every segment is content-addressed by Sha256 of its bincode-encoded blocks.
+- Segment manifests (node → held segments) are gossiped on `ce-segments`.
+- Any node can re-fetch any segment from any holder and verify the hash.
+- Chain checkpoints (Phase 1c) anchor segment boundaries: once a checkpoint is finalised, no segment within it can be silently rewritten.
+
+Minimum replica target: **5 independent peers** per segment (tracked in the atlas). Segments below the threshold trigger a re-replication request on the mesh.
+
+### 8c. One-command relay deploy (planned)
+
+A single script that provisions a relay, deploys CE, sets up nginx, and registers it in DNS — ready to add to the bootstrap list.
+
+```bash
+# Deploy a new relay on Hetzner in one command
+./scripts/deploy-relay.sh \
+  --name relay-2 \
+  --domain relay-2.ce-net.com \
+  --hetzner-token $HETZNER_API_TOKEN \
+  --ssh-key ~/.ssh/id_ed25519
+
+# Output:
+# ✅ Server created: 203.0.113.45
+# ✅ CE deployed and running
+# ✅ nginx configured for relay-2.ce-net.com
+# ✅ Peer ID: 12D3KooW...
+# Add to BOOTSTRAP_URLS and redeploy.
+```
+
+For hackers wanting to run their own relay on any provider:
+
+```bash
+# Generic SSH deploy — any Linux server
+CE_SSH_HOST=1.2.3.4 CE_SSH_USER=root ./scripts/deploy-relay-ssh.sh \
+  --domain myrelay.example.com
+```
+
+### 8d. ce-net.com frontend separation (planned)
+
+`ce-net.com` root serves the marketing/dashboard frontend (Tauri web, or static HTML). Bootstrap lives on `relay.ce-net.com` — separate subdomain, no conflict. The existing `GET /bootstrap` endpoint is only exposed on the relay subdomain, not the root.
+
+---
+
+## Phase 9 — Human-Readable Names
+
+On-chain `NameClaim` tx type. Nodes can claim short names, valid for a fixed period, burned from balance.
+
+```rust
+// ce-chain/src/lib.rs — add to TxKind
+NameClaim {
+    name: String,   // max 32 chars, [a-z0-9-] only
+    node_id: NodeId,
+    expires: u64,   // block height
+},
+NameRelease {
+    name: String,
+    node_id: NodeId,
+},
+```
+
+Resolution is pure chain query — no DNS, no central registry.
+
+```bash
+ce name claim mylaptop   # burns 1000 credits, name valid for 210_000 blocks (~1 year)
+ce name ls               # list names on chain
+ce name resolve mylaptop # print node_id for name
+
+# Use names everywhere a node_id is accepted:
+ce exec mylaptop --image rust:latest cargo build
+ce fund mylaptop 500
+```
+
+Cost: 1000 credits. Duration: 210,000 blocks. Name collision: first-wins per chain ordering.
+
+---
+
 ## Implementation order
 
 1. ~~**Fix nonce replay**~~ ✅ Done
@@ -340,9 +562,16 @@ Names are self-sovereign (no central authority) — stored in the chain, resolve
 4. ~~**Heartbeat economy**~~ ✅ Done — 30s heartbeat loop, epoch replay prevention, cell wallet exhaustion terminates container
 5. ~~**Cell deploy CLI**~~ ✅ Done — `ce deploy`, `ce ps`, `ce kill`, `ce fund`, `ce run`, `GET /jobs`, `POST /transfer`, `GET /atlas`
 6. ~~**Auto-bootstrap from ce-net.com**~~ ✅ Done — `ce start` fetches relay list automatically; `GET /bootstrap` endpoint added; inline `ce devices add <name> <id>` works
-7. **DNS + nginx for relay** — wire relay.ce-net.com → 178.105.145.170, proxy /bootstrap
-8. **Chain checkpoints** — needed before public launch
-9. **Bootstrap / multi-provider deploy** — launch infrastructure
+7. ~~**Chain storage optimisation**~~ ✅ Done — bincode+zstd persistence, O(1) tip validation, transparent JSON migration
+8. ~~**Distributed segment archive**~~ ✅ Done — light node mode, rendezvous-hash segment assignment, `ce-segments` gossip topic, `SegmentFetch` RPC, oldest_block routing
+9. **DNS + nginx for relay** — wire relay.ce-net.com → 178.105.145.170, proxy /bootstrap (30 min ops task)
+10. **Subscription system** (Phase 6) — SSE endpoints `/signals/stream`, `/blocks/stream`, `/transactions/stream`; wire `signal_tx` into `ApiState`
+11. **Live mesh benchmark suite** (Phase 7) — `ce-bench` crate, gossip latency, RPC RTT, chain sync speed
+12. **Chain checkpoints** (Phase 1c) — needed before public launch
+13. **Longest-chain fork selection** — reorg function in `mesh_event_loop`
+14. **Multi-bootstrap resilience** (Phase 8) — multiple domains, one-command relay deploy, replica targets
+15. **Human-readable names** (Phase 9) — on-chain `NameClaim`, CLI `ce name` commands
+16. **Multi-provider deploy** (Phase 4b) — Vultr, DigitalOcean, OVH, generic SSH
 
 ---
 

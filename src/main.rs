@@ -146,6 +146,28 @@ enum Commands {
         #[arg(long, default_value = "8080")]
         api_port: u16,
     },
+    /// Install CE as a background service that starts automatically on login.
+    ///
+    /// macOS: installs a LaunchAgent (~/.local/share/ce/ce.log for logs).
+    /// Linux: installs a systemd user service (journalctl --user -u ce -f for logs).
+    ///
+    /// Run `ce install-service` once — CE will start now and on every login.
+    InstallService {
+        /// Run as a light node (auto-prune chain). Recommended for laptops.
+        #[arg(long, default_value = "true")]
+        light: bool,
+        /// Disable mining. Node will still sync and relay but not earn credits.
+        #[arg(long)]
+        no_mine: bool,
+    },
+    /// Remove the background service installed by `ce install-service`.
+    UninstallService,
+    /// Show CE node logs (works on macOS and Linux).
+    Logs {
+        /// Number of recent lines to show (then follow).
+        #[arg(short, long, default_value = "50")]
+        lines: usize,
+    },
     /// Transfer credits to another node.
     ///
     /// Example: ce fund <node-id> 500
@@ -237,6 +259,201 @@ fn should_ignore(rel: &std::path::Path) -> bool {
     false
 }
 
+// ----- Service install/uninstall -----
+
+fn install_service(light: bool, no_mine: bool) -> Result<()> {
+    let bin = std::env::current_exe()
+        .map_err(|e| anyhow!("cannot determine binary path: {e}"))?;
+    let bin = bin.to_string_lossy();
+
+    let mut args = vec!["start".to_string()];
+    if light   { args.push("--light".into()); }
+    if no_mine { args.push("--no-mine".into()); }
+
+    #[cfg(target_os = "macos")]
+    {
+        let log_dir = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join(".local").join("share").join("ce");
+        std::fs::create_dir_all(&log_dir)?;
+        let log = log_dir.join("ce.log").to_string_lossy().into_owned();
+
+        let plist_dir = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("Library").join("LaunchAgents");
+        std::fs::create_dir_all(&plist_dir)?;
+        let plist_path = plist_dir.join("com.ce-net.ce.plist");
+
+        let arg_xml: String = args.iter()
+            .map(|a| format!("        <string>{a}</string>\n"))
+            .collect();
+
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ce-net.ce</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+{arg_xml}    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#
+        );
+
+        std::fs::write(&plist_path, &plist)?;
+        println!("Wrote {}", plist_path.display());
+
+        // Unload first (idempotent — fails silently if not loaded).
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .output();
+        let out = std::process::Command::new("launchctl")
+            .args(["load", "-w", &plist_path.to_string_lossy()])
+            .output()
+            .map_err(|e| anyhow!("launchctl load: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("launchctl load failed: {err}"));
+        }
+
+        println!("CE service installed and started.");
+        println!();
+        println!("  Logs : tail -f {log}");
+        println!("  Stop : launchctl unload ~/Library/LaunchAgents/com.ce-net.ce.plist");
+        println!("  Remove: ce uninstall-service");
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_dir = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join(".config").join("systemd").join("user");
+        std::fs::create_dir_all(&unit_dir)?;
+        let unit_path = unit_dir.join("ce.service");
+
+        let exec_start = std::iter::once(bin.as_ref())
+            .chain(args.iter().map(|s| s.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let unit = format!(
+            "[Unit]\nDescription=CE — global compute mesh node\nAfter=network.target\n\n\
+             [Service]\nExecStart={exec_start}\nRestart=on-failure\nRestartSec=10\n\n\
+             [Install]\nWantedBy=default.target\n"
+        );
+
+        std::fs::write(&unit_path, &unit)?;
+        println!("Wrote {}", unit_path.display());
+
+        for subcmd in &["daemon-reload", "--now enable ce"] {
+            let out = std::process::Command::new("systemctl")
+                .args(["--user"].iter().chain(subcmd.split_whitespace()))
+                .output()
+                .map_err(|e| anyhow!("systemctl: {e}"))?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                return Err(anyhow!("systemctl --user {subcmd}: {err}"));
+            }
+        }
+
+        println!("CE service installed and started.");
+        println!();
+        println!("  Logs : journalctl --user -u ce -f");
+        println!("  Stop : systemctl --user stop ce");
+        println!("  Remove: ce uninstall-service");
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow!("install-service is not supported on this platform. Start manually with: ce start"))
+}
+
+fn uninstall_service() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("Library").join("LaunchAgents").join("com.ce-net.ce.plist");
+        if plist_path.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .output();
+            std::fs::remove_file(&plist_path)?;
+            println!("CE service stopped and removed.");
+        } else {
+            println!("No CE service found (already uninstalled).");
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "ce"])
+            .output();
+        let unit_path = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join(".config").join("systemd").join("user").join("ce.service");
+        if unit_path.exists() {
+            std::fs::remove_file(&unit_path)?;
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .output();
+        }
+        println!("CE service stopped and removed.");
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow!("uninstall-service is not supported on this platform"))
+}
+
+fn show_logs(lines: usize) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let log = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join(".local").join("share").join("ce").join("ce.log");
+        if !log.exists() {
+            println!("No log file yet. Is the service running? Try: ce install-service");
+            return Ok(());
+        }
+        // Use `tail -n N -f` to show last N lines then follow.
+        let status = std::process::Command::new("tail")
+            .args(["-n", &lines.to_string(), "-f", &log.to_string_lossy()])
+            .status()
+            .map_err(|e| anyhow!("tail: {e}"))?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("journalctl")
+            .args(["--user", "-u", "ce", "-n", &lines.to_string(), "-f"])
+            .status()
+            .map_err(|e| anyhow!("journalctl: {e}"))?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow!("logs not supported on this platform"))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -306,6 +523,18 @@ async fn main() -> Result<()> {
             println!("Press Ctrl-C to stop.");
             tokio::signal::ctrl_c().await?;
             println!("Shutting down.");
+        }
+
+        Commands::InstallService { light, no_mine } => {
+            install_service(light, no_mine)?;
+        }
+
+        Commands::UninstallService => {
+            uninstall_service()?;
+        }
+
+        Commands::Logs { lines } => {
+            show_logs(lines)?;
         }
 
         Commands::Balance => {
