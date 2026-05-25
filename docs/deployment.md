@@ -176,7 +176,7 @@ ce start --port 4001 --api-port 8844 --bootstrap <addr>
 ```ini
 # /etc/systemd/system/ce.service
 [Unit]
-Description=CE Compute Economy Node
+Description=CE Node
 After=network.target
 
 [Service]
