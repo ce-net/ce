@@ -9,6 +9,8 @@ Always document everything for future ai and human dev reference. But dont overd
 
 Always pull latest before you start working so we dont get merge issues! Always commit everything and keep all docs up to date!
 
+No emojis ever in the repo unless told so by a human. This is NOT a playground for llms this is a serious project with serious code quality requirements.
+
 ---
 
 ## CE Project Overview
