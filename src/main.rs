@@ -362,7 +362,7 @@ fn install_service(light: bool, no_mine: bool) -> Result<()> {
 
         for subcmd in &["daemon-reload", "--now enable ce"] {
             let out = std::process::Command::new("systemctl")
-                .args(["--user"].iter().chain(subcmd.split_whitespace()))
+                .args(std::iter::once("--user").chain(subcmd.split_whitespace()))
                 .output()
                 .map_err(|e| anyhow!("systemctl: {e}"))?;
             if !out.status.success() {
