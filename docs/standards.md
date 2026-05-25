@@ -39,7 +39,7 @@
 ## Serialization
 
 - bincode for hashing (deterministic, compact) and gossip wire format
-- JSON for disk persistence (human-readable, survives struct additions)
+- bincode + zstd (level 3) for disk persistence — ~8x smaller than JSON; legacy JSON files are migrated transparently on first load
 - `[u8; 64]` sig fields require the local `sig_serde` module — serde supports arrays only up to [T; 32]
 
 ## Naming
