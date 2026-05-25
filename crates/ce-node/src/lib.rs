@@ -511,12 +511,27 @@ async fn mesh_event_loop(
     // Periodic ticker: re-announce segment manifest every 5 minutes so new peers learn what we hold.
     let mut segment_announce_ticker =
         tokio::time::interval(std::time::Duration::from_secs(300));
+    // Sync retry ticker: if we're still behind the best known peer, re-request every 15 s.
+    // This covers the case where a sync response was lost or applied no blocks.
+    let mut sync_retry_ticker =
+        tokio::time::interval(std::time::Duration::from_secs(15));
 
     loop {
         let event = tokio::select! {
             _ = segment_announce_ticker.tick() => {
                 let held = ce_chain::list_archive_segments(&archive_dir);
                 let _ = mesh_handle.announce_segments(our_node_id, held).await;
+                continue;
+            }
+            _ = sync_retry_ticker.tick() => {
+                // If any peer is ahead of us, re-send a sync request.
+                // This recovers from lost responses and gossipsub message drops.
+                let our_height = chain.lock().await.height();
+                let best = peer_heights.values().copied().max().unwrap_or(0);
+                if best > our_height {
+                    debug!("sync retry: we={our_height}, best peer={best}");
+                    let _ = mesh_handle.send_sync_request(our_node_id, our_height).await;
+                }
                 continue;
             }
             maybe = rx.recv() => match maybe {
@@ -710,7 +725,16 @@ async fn mesh_event_loop(
             }
             MeshEvent::PeerConnected(peer) => {
                 info!("peer connected: {peer}");
-                // Announce our segments to every new peer immediately.
+                // Re-broadcast our current height and segments so any node that connects
+                // after our startup announcement still learns our chain state immediately.
+                // Without this, late-joining nodes never receive a PeerHeight event from us
+                // and their sync loop never triggers.
+                let (h, tip, oldest) = {
+                    let c = chain.lock().await;
+                    let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
+                    (c.height(), c.tip_hash(), oldest)
+                };
+                let _ = mesh_handle.announce_height(our_node_id, h, tip, oldest).await;
                 let held = ce_chain::list_archive_segments(&archive_dir);
                 if !held.is_empty() {
                     let _ = mesh_handle.announce_segments(our_node_id, held).await;
