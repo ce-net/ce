@@ -34,16 +34,27 @@ echo "windows-amd64: ${SHA_WINDOWS}"
 
 # ── Homebrew formula ──────────────────────────────────────────────────────────
 
-FORMULA="Formula/ce.rb"
-sed -i.bak \
-  -e "s|version \".*\"|version \"${VERSION}\"|" \
-  -e "s|PLACEHOLDER_MACOS_ARM64|${SHA_MACOS_ARM64}|" \
-  -e "s|PLACEHOLDER_MACOS_AMD64|${SHA_MACOS_AMD64}|" \
-  -e "s|PLACEHOLDER_LINUX_ARM64|${SHA_LINUX_ARM64}|" \
-  -e "s|PLACEHOLDER_LINUX_AMD64|${SHA_LINUX_AMD64}|" \
-  "${FORMULA}"
-rm -f "${FORMULA}.bak"
-echo "Updated ${FORMULA}"
+update_formula() {
+  local FORMULA="$1"
+  sed -i.bak \
+    -e "s|version \".*\"|version \"${VERSION}\"|" \
+    -e "s|PLACEHOLDER_MACOS_ARM64|${SHA_MACOS_ARM64}|" \
+    -e "s|PLACEHOLDER_MACOS_AMD64|${SHA_MACOS_AMD64}|" \
+    -e "s|PLACEHOLDER_LINUX_ARM64|${SHA_LINUX_ARM64}|" \
+    -e "s|PLACEHOLDER_LINUX_AMD64|${SHA_LINUX_AMD64}|" \
+    "${FORMULA}"
+  rm -f "${FORMULA}.bak"
+  echo "Updated ${FORMULA}"
+}
+
+update_formula "Formula/ce.rb"
+
+# Also update the homebrew-ce tap repo if it's checked out alongside this repo
+TAP_FORMULA="$(dirname "$(pwd)")/homebrew-ce/Formula/ce.rb"
+if [ -f "${TAP_FORMULA}" ]; then
+  update_formula "${TAP_FORMULA}"
+  echo "  (also synced homebrew-ce tap)"
+fi
 
 # ── Scoop manifest ────────────────────────────────────────────────────────────
 
@@ -60,6 +71,13 @@ with open('${SCOOP}', 'w') as f:
     f.write('\n')
 "
 echo "Updated ${SCOOP}"
+
+# Also update the scoop-ce bucket repo if it's checked out alongside this repo
+BUCKET_JSON="$(dirname "$(pwd)")/scoop-ce/bucket/ce.json"
+if [ -f "${BUCKET_JSON}" ]; then
+  cp "${SCOOP}" "${BUCKET_JSON}"
+  echo "  (also synced scoop-ce bucket)"
+fi
 
 # ── Chocolatey ───────────────────────────────────────────────────────────────
 
@@ -90,4 +108,8 @@ echo "Updated ${PKGBUILD}"
 
 echo ""
 echo "All packaging files updated for v${VERSION}."
-echo "Commit and push packaging/ and Formula/ to publish the update."
+echo ""
+echo "Next steps:"
+echo "  1. cd /path/to/ce-net/ce    && git add -A && git commit -m 'chore: bump packaging to v${VERSION}' && git push"
+echo "  2. cd /path/to/homebrew-ce  && git add -A && git commit -m 'chore: bump formula to v${VERSION}' && git push"
+echo "  3. cd /path/to/scoop-ce     && git add -A && git commit -m 'chore: bump manifest to v${VERSION}' && git push"
