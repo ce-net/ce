@@ -49,6 +49,8 @@ struct HeightAnnounce {
     node_id: NodeId,
     height: u64,
     tip_hash: [u8; 32],
+    /// Oldest block index this node can serve (0 = full archive).
+    oldest_block: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,7 +185,7 @@ impl request_response::Codec for CeRpcCodec {
 enum MeshCommand {
     PublishTx(Vec<u8>),
     PublishBlock(Vec<u8>),
-    AnnounceHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32] },
+    AnnounceHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32], oldest_block: u64 },
     SendSyncRequest { from_node: NodeId, from_height: u64 },
     SendSyncResponse { for_node: NodeId, blocks: Vec<Block> },
     PublishSignal(Vec<u8>),
@@ -210,7 +212,7 @@ pub enum MeshEvent {
     NewBlock(Block),
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
-    PeerHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32] },
+    PeerHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32], oldest_block: u64 },
     SyncRequest { from_node: NodeId, from_height: u64 },
     SyncBlocks { for_node: NodeId, blocks: Vec<Block> },
     CellSignal(CellSignal),
@@ -282,8 +284,14 @@ impl MeshHandle {
         self.send(MeshCommand::PublishBlock(bytes)).await
     }
 
-    pub async fn announce_height(&self, node_id: NodeId, height: u64, tip_hash: [u8; 32]) -> Result<()> {
-        self.send(MeshCommand::AnnounceHeight { node_id, height, tip_hash }).await
+    pub async fn announce_height(
+        &self,
+        node_id: NodeId,
+        height: u64,
+        tip_hash: [u8; 32],
+        oldest_block: u64,
+    ) -> Result<()> {
+        self.send(MeshCommand::AnnounceHeight { node_id, height, tip_hash, oldest_block }).await
     }
 
     pub async fn send_sync_request(&self, from_node: NodeId, from_height: u64) -> Result<()> {
@@ -622,8 +630,8 @@ impl Mesh {
                     debug!("publish block: {e}");
                 }
             }
-            MeshCommand::AnnounceHeight { node_id, height, tip_hash } => {
-                let msg = HeightAnnounce { node_id, height, tip_hash };
+            MeshCommand::AnnounceHeight { node_id, height, tip_hash, oldest_block } => {
+                let msg = HeightAnnounce { node_id, height, tip_hash, oldest_block };
                 if let Ok(bytes) = bincode::serialize(&msg) {
                     let _ = self.swarm.behaviour_mut().gossipsub
                         .publish(self.heights_topic.clone(), bytes);
@@ -754,6 +762,7 @@ fn decode_gossip(message: gossipsub::Message, topics: &Topics) -> Option<MeshEve
                 node_id: a.node_id,
                 height: a.height,
                 tip_hash: a.tip_hash,
+                oldest_block: a.oldest_block,
             }),
             Err(e) => { warn!("bad height announce: {e}"); None }
         }

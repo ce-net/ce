@@ -6,7 +6,30 @@ use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
+
+/// Fetch bootstrap peer multiaddrs from the ce-net.com relay or CE_BOOTSTRAP_URL override.
+/// Returns an empty vec on any error so startup is never blocked.
+async fn fetch_bootstrap_peers() -> Vec<String> {
+    let url = std::env::var("CE_BOOTSTRAP_URL")
+        .unwrap_or_else(|_| "https://ce-net.com/bootstrap".to_string());
+
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    #[derive(serde::Deserialize)]
+    struct BootstrapResp {
+        peers: Vec<String>,
+    }
+
+    match client.get(&url).send().await {
+        Ok(resp) => resp.json::<BootstrapResp>().await.map(|b| b.peers).unwrap_or_default(),
+        Err(_) => vec![],
+    }
+}
 
 /// Return non-loopback IPv4 addresses on this host. Used to print bootstrap multiaddrs.
 fn local_ip_addrs() -> Result<Vec<IpAddr>> {
@@ -47,6 +70,10 @@ enum Commands {
         /// Disable block mining. Node will still sync, relay, and serve jobs.
         #[arg(long)]
         no_mine: bool,
+        /// Run as a light node: auto-prune chain to the last 2880 blocks after each sync.
+        /// Archive nodes (relay, desktop) should omit this flag.
+        #[arg(long)]
+        light: bool,
     },
     /// Show this node's credit balance.
     Balance,
@@ -55,6 +82,8 @@ enum Commands {
     /// Print this node's ID.
     Id,
     /// Manage trusted devices (personal mesh OS).
+    ///
+    /// Quick add: ce devices add desktop <node-id> --addr 192.168.1.10:8080
     Devices {
         #[command(subcommand)]
         command: DevicesCommands,
@@ -145,10 +174,19 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DevicesCommands {
-    /// Add a trusted device. Prompts for node ID and API address.
+    /// Add a trusted device.
+    ///
+    /// Quick usage: ce devices add desktop <node-id> --addr 192.168.1.10:8080
+    /// Get the node ID on the target machine with: ce id
     Add {
         /// Friendly name for the device (e.g. "desktop", "laptop").
         name: String,
+        /// Node ID (64 hex chars). Run `ce id` on the target machine to get it.
+        /// If omitted, you will be prompted interactively.
+        node_id: Option<String>,
+        /// API address (host:port). If omitted, you will be prompted interactively.
+        #[arg(long)]
+        addr: Option<String>,
     },
     /// List all registered devices.
     Ls,
@@ -209,7 +247,7 @@ async fn main() -> Result<()> {
     let data_dir = data_dir(cli.data_dir);
 
     match cli.command {
-        Commands::Start { port, api_port, bootstrap, relay, no_mine } => {
+        Commands::Start { port, api_port, bootstrap, relay, no_mine, light } => {
             // CE_BOOTSTRAP_PEERS: colon-separated list of bootstrap multiaddrs.
             // Useful for Docker/systemd deployments where CLI flags are inconvenient.
             let mut bootstrap_peers = bootstrap;
@@ -225,6 +263,15 @@ async fn main() -> Result<()> {
                     relay_peers.push(peer.to_string());
                 }
             }
+            // Auto-bootstrap from ce-net.com when no peers are configured.
+            // Override with CE_BOOTSTRAP_URL or CE_NO_AUTOBOOTSTRAP=1 to disable.
+            if bootstrap_peers.is_empty() && std::env::var("CE_NO_AUTOBOOTSTRAP").is_err() {
+                let auto = fetch_bootstrap_peers().await;
+                if !auto.is_empty() {
+                    println!("Connecting to ce-net.com mesh ({} relay peers)...", auto.len());
+                    bootstrap_peers.extend(auto);
+                }
+            }
 
             let config = NodeConfig {
                 listen_port: port,
@@ -233,6 +280,7 @@ async fn main() -> Result<()> {
                 data_dir,
                 api_port,
                 mine: !no_mine,
+                prune_keep: if light { Some(ce_chain::PRUNE_KEEP_BLOCKS) } else { None },
                 ..Default::default()
             };
             let node = Node::start(config).await?;
@@ -290,28 +338,39 @@ async fn main() -> Result<()> {
         Commands::Devices { command } => {
             let path = devices_path(&data_dir);
             match command {
-                DevicesCommands::Add { name } => {
+                DevicesCommands::Add { name, node_id, addr } => {
                     use std::io::{BufRead, Write};
-                    print!("Node ID (64 hex chars): ");
-                    std::io::stdout().flush()?;
-                    let mut node_id_hex = String::new();
-                    std::io::stdin().lock().read_line(&mut node_id_hex)?;
-                    let node_id_hex = node_id_hex.trim();
 
-                    let bytes = hex::decode(node_id_hex)
+                    let node_id_hex = match node_id {
+                        Some(id) => id,
+                        None => {
+                            print!("Node ID (64 hex chars): ");
+                            std::io::stdout().flush()?;
+                            let mut s = String::new();
+                            std::io::stdin().lock().read_line(&mut s)?;
+                            s.trim().to_string()
+                        }
+                    };
+
+                    let bytes = hex::decode(&node_id_hex)
                         .map_err(|_| anyhow!("node ID must be 64 hex chars"))?;
                     let node_id: [u8; 32] = bytes
                         .try_into()
                         .map_err(|_| anyhow!("node ID must be exactly 32 bytes"))?;
 
-                    print!("API address (host:port, e.g. 192.168.1.10:8080): ");
-                    std::io::stdout().flush()?;
-                    let mut addr = String::new();
-                    std::io::stdin().lock().read_line(&mut addr)?;
-                    let addr = addr.trim();
+                    let addr_str = match addr {
+                        Some(a) => a,
+                        None => {
+                            print!("API address (host:port, e.g. 192.168.1.10:8080): ");
+                            std::io::stdout().flush()?;
+                            let mut s = String::new();
+                            std::io::stdin().lock().read_line(&mut s)?;
+                            s.trim().to_string()
+                        }
+                    };
 
                     let mut devices = Devices::load_or_empty(&path);
-                    devices.add(&name, node_id, addr);
+                    devices.add(&name, node_id, &addr_str);
                     devices.save(&path)?;
                     println!("Added device '{name}'.");
                 }

@@ -16,7 +16,7 @@ These are the same system from two angles. The identity primitive that lets untr
 
 ---
 
-## Current State (as of 2026-05-23)
+## Current State (as of 2026-05-25)
 
 ### What's working
 
@@ -28,8 +28,8 @@ These are the same system from two angles. The identity primitive that lets untr
 | `ce-protocol` | ✅ Complete | CEP-1 wire format, BurnProof, CellSignal build/verify/encode/decode |
 | `ce-container` | ✅ Complete | gVisor detection, CPU/memory/network limits, image pull, wait-for-exit, stop_job |
 | `ce-node` | ✅ Complete | Mining loop, mesh event loop, job manager, heartbeat loop (30s), capacity broadcast (60s), atlas, signal ring buffer, tx pool, nonce replay prevention |
-| HTTP API | ✅ Complete | /jobs/bid, /jobs (list), /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /transfer, /status, /signals, /signals/send, /health, /atlas, /sync/*, /exec |
-| CLI | ✅ Complete | start, balance, status, id, devices (add/ls/revoke), sync, exec, deploy, ps, kill, fund, run |
+| HTTP API | ✅ Complete | /jobs/bid, /jobs (list), /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /transfer, /status, /signals, /signals/send, /health, /atlas, /sync/*, /exec, /bootstrap |
+| CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, devices (add/ls/revoke — inline node-id support), sync, exec, deploy, ps, kill, fund, run |
 | Device registry | ✅ Complete | machines.toml, trusted device management, CE identity auth for sync/exec |
 | `ce-deploy` | ✅ Complete | Hetzner provisioning, SSH deploy, E2E tests |
 | Integration tests | ✅ Complete | single node mines, two nodes sync, tx pool propagates, API health/status, signal propagation, job lifecycle (requires Docker, skipped by default) |
@@ -222,7 +222,7 @@ future enhancement.
 
 ---
 
-## Phase 4 — Bootstrap and network launch
+## Phase 4 — Bootstrap and network launch (planned)
 
 ### 4a. Closed beta mode
 
@@ -250,6 +250,88 @@ No central registry server. No DNS. Pure mesh.
 
 ---
 
+## Phase 5 — Zero-Config Mesh Onboarding (in progress)
+
+The goal: `ce start` just works. No peer IDs, no multiaddrs, no config files.
+
+Domain: **ce-net.com** (registered 2026-05-25). Relay: `178.105.145.170` (Hetzner CX23).
+
+### 5a. Auto-bootstrap from ce-net.com ✅ Done
+
+`ce start` with no `--bootstrap` flags automatically fetches the relay list from `https://ce-net.com/bootstrap` before starting. Falls back gracefully (mDNS still handles LAN). Override with `CE_BOOTSTRAP_URL` env var or disable with `CE_NO_AUTOBOOTSTRAP=1`.
+
+```bash
+ce start   # connects to ce-net.com automatically
+```
+
+### 5b. Bootstrap HTTP endpoint ✅ Done
+
+`GET /bootstrap` on any node returns the multiaddrs callers can use to connect. The relay sets `CE_EXTERNAL_IP=178.105.145.170` and `CE_EXTERNAL_HOST=relay.ce-net.com`; the endpoint returns the correct public multiaddrs.
+
+```bash
+curl https://ce-net.com/bootstrap
+# {"peers":["/dns4/relay.ce-net.com/tcp/4001/p2p/12D3KooW..."]}
+```
+
+### 5c. Inline device registration ✅ Done
+
+`ce devices add <name> <node-id> --addr host:port` — no interactive prompts. Get your ID with `ce id`.
+
+**Before:**
+```
+ce devices add desktop
+> Node ID (64 hex chars): <manual paste>
+> API address (host:port): <manual paste>
+```
+
+**After:**
+```bash
+# On the machine you want to add:
+ce id                         # copy the "ce node id" line
+
+# On your local machine:
+ce devices add desktop <node-id> --addr 192.168.1.10:8080
+```
+
+### 5d. Relay as ce-net.com gateway (pending — needs DNS + nginx)
+
+Set up DNS and nginx on the relay to proxy:
+- `ce-net.com/bootstrap` → `localhost:8080/bootstrap`
+- `ce-net.com/install` → install script
+
+```
+relay.ce-net.com.  A  178.105.145.170
+```
+
+Start relay with:
+```bash
+CE_EXTERNAL_IP=178.105.145.170 CE_EXTERNAL_HOST=relay.ce-net.com ce start
+```
+
+### 5e. Human-readable node names (planned)
+
+On-chain `NameClaim { name, node_id, expires }` tx type. Lets you address nodes by name instead of 64-char hex IDs.
+
+```bash
+ce name claim mylaptop      # burns 1000 credits, name yours for 1 year
+ce exec mylaptop --image rust:latest cargo build
+```
+
+Names are self-sovereign (no central authority) — stored in the chain, resolved by any node.
+
+### 5f. Opportunity gaps (roadmap items from stakeholder review)
+
+| Gap | Plan | Priority |
+|-----|------|----------|
+| No persistent storage primitive | Distributed KV or IPFS bridge as a CE job type | Medium |
+| No HTTP ingress | Reverse-proxy cell routing web traffic to job containers | Medium |
+| No secrets management | HashiCorp Vault integration or custom encrypted secrets job type | Low |
+| CLI-only UI | Tauri dashboard: node status, job queue, atlas, credit balance | Medium |
+| No FaaS ergonomics | `ce deploy --serverless` wrapper that auto-packages handlers | Low |
+| TypeScript SDK is manual | Generate OpenAPI client from axum routes | Low |
+
+---
+
 ## Implementation order
 
 1. ~~**Fix nonce replay**~~ ✅ Done
@@ -257,8 +339,10 @@ No central registry server. No DNS. Pure mesh.
 3. ~~**Credit escrow / JobExpire**~~ ✅ Done
 4. ~~**Heartbeat economy**~~ ✅ Done — 30s heartbeat loop, epoch replay prevention, cell wallet exhaustion terminates container
 5. ~~**Cell deploy CLI**~~ ✅ Done — `ce deploy`, `ce ps`, `ce kill`, `ce fund`, `ce run`, `GET /jobs`, `POST /transfer`, `GET /atlas`
-6. **Chain checkpoints** — needed before public launch
-7. **Bootstrap / multi-provider deploy** — launch infrastructure
+6. ~~**Auto-bootstrap from ce-net.com**~~ ✅ Done — `ce start` fetches relay list automatically; `GET /bootstrap` endpoint added; inline `ce devices add <name> <id>` works
+7. **DNS + nginx for relay** — wire relay.ce-net.com → 178.105.145.170, proxy /bootstrap
+8. **Chain checkpoints** — needed before public launch
+9. **Bootstrap / multi-provider deploy** — launch infrastructure
 
 ---
 

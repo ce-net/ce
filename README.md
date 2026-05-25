@@ -35,24 +35,42 @@ On Linux with systemd the installer also creates a `ce.service` that starts auto
 # Build from source
 cargo build --release
 
-# Start a node (mines blocks, API on :8080, P2P on :4001)
-# mDNS finds peers on the same LAN automatically — no config needed.
+# Start a node — automatically joins the ce-net.com public mesh
 ./target/release/ce start
 
 # Check status and balance
 ./target/release/ce status
 
-# Join an existing network
-./target/release/ce start --port 4002 --api-port 8081 \
-  --bootstrap /ip4/1.2.3.4/tcp/4001/p2p/<peer-id>
+# Print your node ID (share this so others can add you as a device)
+./target/release/ce id
+```
 
-# Join from behind NAT via a relay node (makes you reachable from the internet)
-./target/release/ce start \
-  --relay /ip4/1.2.3.4/tcp/4001/p2p/<relay-peer-id>
+### Adding another device (two-command setup)
 
-# Docker / systemd — configure bootstrap peers via environment variables
+```bash
+# On the machine you want to add — copy the node ID
+ce id
+# ce node id : 7a3f9b... (copy this)
+
+# On your local machine
+ce devices add desktop 7a3f9b... --addr 192.168.1.10:8080
+```
+
+### Manual bootstrap (advanced)
+
+```bash
+# Explicit bootstrap peer
+ce start --bootstrap /ip4/1.2.3.4/tcp/4001/p2p/<peer-id>
+
+# NAT traversal via relay
+ce start --relay /ip4/1.2.3.4/tcp/4001/p2p/<relay-peer-id>
+
+# Docker / systemd
 CE_BOOTSTRAP_PEERS=/ip4/1.2.3.4/tcp/4001/p2p/<peer-id> ce start
 CE_RELAY_PEERS=/ip4/1.2.3.4/tcp/4001/p2p/<relay-id> ce start
+
+# Private mesh (skip ce-net.com auto-discovery)
+CE_NO_AUTOBOOTSTRAP=1 ce start --bootstrap /ip4/your-relay/tcp/4001/p2p/<peer-id>
 
 # Submit a container job (node must have positive balance)
 curl -X POST http://localhost:8080/jobs/bid \

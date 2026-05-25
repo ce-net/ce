@@ -7,6 +7,8 @@ Dont take credit for commits - give all credits to me Leif Rydenfalk - ledamecry
 
 Always document everything for future ai and human dev reference. But dont overdocument to save tokens.
 
+Always pull latest before you start working so we dont get merge issues! Always commit everything and keep all docs up to date!
+
 ---
 
 ## CE Project Overview

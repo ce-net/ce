@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Max number of recently-validated signals retained for GET /signals.
 const SIGNAL_RING_CAPACITY: usize = 100;
@@ -129,6 +129,9 @@ pub struct NodeConfig {
     pub mine: bool,
     /// Mining loop interval in seconds. Default 10; set lower in tests for speed.
     pub mining_interval_secs: u64,
+    /// How many recent blocks to keep after pruning. `None` = archive (never prune).
+    /// Light nodes set this to `PRUNE_KEEP_BLOCKS`. Relay and desktops use `None`.
+    pub prune_keep: Option<u64>,
 }
 
 impl Default for NodeConfig {
@@ -141,6 +144,7 @@ impl Default for NodeConfig {
             api_port: 0,
             mine: true,
             mining_interval_secs: 10,
+            prune_keep: None,
         }
     }
 }
@@ -234,7 +238,8 @@ impl Node {
             let c = chain.lock().await;
             let h = c.height();
             let tip = c.tip_hash();
-            let _ = mesh_handle.announce_height(identity.node_id(), h, tip).await;
+            let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
+            let _ = mesh_handle.announce_height(identity.node_id(), h, tip, oldest).await;
         }
 
         if node.config.mine {
@@ -260,6 +265,7 @@ impl Node {
             let atlas2 = atlas.clone();
             let data_dir2 = node.config.data_dir.clone();
             let docker2 = docker.clone();
+            let prune_keep = node.config.prune_keep;
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain,
@@ -274,6 +280,7 @@ impl Node {
                     atlas2,
                     data_dir2,
                     docker2,
+                    prune_keep,
                 )
                 .await;
             });
@@ -318,6 +325,7 @@ impl Node {
             let mesh_handle = mesh_handle.clone();
             let signals = signals.clone();
             let api_port = node.config.api_port;
+            let p2p_port = node.config.listen_port;
             let send_nonce = send_nonce.clone();
             let js = job_store.clone();
             let pool = pool.clone();
@@ -332,6 +340,7 @@ impl Node {
                     signals,
                     send_nonce,
                     api_port,
+                    p2p_port,
                     js,
                     pool,
                     settle_notify_tx,
@@ -445,7 +454,11 @@ async fn mining_loop(
         };
 
         let _ = mesh_handle.broadcast_block(&block).await;
-        let _ = mesh_handle.announce_height(identity.node_id(), height, tip_hash).await;
+        let oldest = {
+            let c = chain.lock().await;
+            c.blocks.first().map(|b| b.index).unwrap_or(0)
+        };
+        let _ = mesh_handle.announce_height(identity.node_id(), height, tip_hash, oldest).await;
     }
 }
 
@@ -465,11 +478,14 @@ async fn mesh_event_loop(
     atlas: Atlas,
     data_dir: PathBuf,
     docker: Option<Docker>,
+    prune_keep: Option<u64>,
 ) {
     // Tracks the highest accepted nonce per sender to prevent replays.
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
     // Tracks the best known height of each peer, used to decide whether to retry sync.
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
+    // Oldest block index each peer can serve. Used to route sync requests to archive peers.
+    let mut peer_oldest: HashMap<NodeId, u64> = HashMap::new();
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -500,26 +516,35 @@ async fn mesh_event_loop(
                     Err(e) => warn!("invalid tx from mesh: {e}"),
                 }
             }
-            MeshEvent::PeerHeight { node_id, height, tip_hash } => {
+            MeshEvent::PeerHeight { node_id, height, tip_hash, oldest_block } => {
                 peer_heights.insert(node_id, height);
+                peer_oldest.insert(node_id, oldest_block);
                 let (our_height, our_tip) = {
                     let c = chain.lock().await;
                     (c.height(), c.tip_hash())
                 };
                 if height > our_height {
-                    // If tip hashes differ we might be on a fork: request from genesis
-                    // so the reorg path has ancestors to work with. If we're on the
-                    // same chain (tips would match after the peer catches up), requesting
-                    // from our_height is fine and cheaper — use 0 only when fork is likely.
                     let from = if tip_hash != our_tip && our_height > 0 { 0 } else { our_height };
-                    info!(
-                        "peer {} is at height {}, we're at {} — requesting sync from {}",
-                        hex::encode(&node_id[..4]),
-                        height,
-                        our_height,
-                        from,
-                    );
-                    let _ = mesh_handle.send_sync_request(our_node_id, from).await;
+                    // When requesting old blocks, skip peers that have already pruned them.
+                    // If this peer can't serve `from`, skip — another peer (archive node) will.
+                    let peer_can_serve = oldest_block <= from;
+                    if !peer_can_serve && from > 0 {
+                        debug!(
+                            "peer {} is pruned (oldest {}), skipping sync request from {}",
+                            hex::encode(&node_id[..4]),
+                            oldest_block,
+                            from,
+                        );
+                    } else {
+                        info!(
+                            "peer {} is at height {}, we're at {} — requesting sync from {}",
+                            hex::encode(&node_id[..4]),
+                            height,
+                            our_height,
+                            from,
+                        );
+                        let _ = mesh_handle.send_sync_request(our_node_id, from).await;
+                    }
                 }
             }
             MeshEvent::SyncRequest { from_node, from_height } => {
@@ -571,9 +596,23 @@ async fn mesh_event_loop(
 
                 if applied > 0 {
                     info!("sync applied {applied} blocks, now at height {}", c.height());
+                    // Auto-prune on light nodes after every sync batch.
+                    if let Some(keep) = prune_keep {
+                        let h = c.height();
+                        if h > keep + 100 {
+                            c.prune(keep);
+                            let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
+                            info!("pruned to height {}..{} (light mode)", oldest, h);
+                        }
+                    }
+                    let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
                     if let Err(e) = c.save(&chain_path) {
                         warn!("save chain after sync: {e}");
                     }
+                    let tip = c.tip_hash();
+                    let h = c.height();
+                    drop(c);
+                    let _ = mesh_handle.announce_height(our_node_id, h, tip, oldest).await;
                 } else {
                     // Neither fast-path nor reorg applied the candidate set.
                     // Check if any known peer is still ahead of us; if so keep requesting.

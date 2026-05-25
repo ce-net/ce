@@ -49,6 +49,8 @@ struct ApiState {
     nonce_cache: NonceCache,
     /// Peer capacity atlas updated by incoming capacity signals.
     atlas: Atlas,
+    /// libp2p listen port — used by GET /bootstrap to build multiaddrs.
+    listen_port: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -859,6 +861,39 @@ async fn mesh_sync_put(
     }
 }
 
+// ----- GET /bootstrap -----
+
+#[derive(Serialize)]
+struct BootstrapResponse {
+    peers: Vec<String>,
+}
+
+async fn get_bootstrap(State(state): State<ApiState>) -> Response {
+    let peer_id = match ce_mesh::peer_id_from_secret(state.identity.secret_bytes()) {
+        Ok(p) => p.to_string(),
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "peer id unavailable"),
+    };
+    let port = state.listen_port;
+    let mut peers = vec![];
+
+    // CE_EXTERNAL_IP: explicit public IPv4, set on relay nodes.
+    if let Ok(ext_ip) = std::env::var("CE_EXTERNAL_IP") {
+        peers.push(format!("/ip4/{ext_ip}/tcp/{port}/p2p/{peer_id}"));
+    }
+    // CE_EXTERNAL_HOST: DNS hostname for the relay (e.g. relay.ce-net.com).
+    if let Ok(hostname) = std::env::var("CE_EXTERNAL_HOST") {
+        peers.push(format!("/dns4/{hostname}/tcp/{port}/p2p/{peer_id}"));
+    }
+
+    // If neither env var is set, return just the peer_id so clients can at least
+    // learn it from their known host.
+    if peers.is_empty() {
+        peers.push(format!("/p2p/{peer_id}"));
+    }
+
+    (StatusCode::OK, Json(BootstrapResponse { peers })).into_response()
+}
+
 // ----- GET /atlas -----
 
 #[derive(Debug, Serialize)]
@@ -887,6 +922,7 @@ pub async fn start(
     signals: SignalRing,
     send_nonce: Arc<AtomicU64>,
     port: u16,
+    listen_port: u16,
     job_store: JobStore,
     pool: TxPool,
     settle_notify_tx: mpsc::Sender<()>,
@@ -913,6 +949,7 @@ pub async fn start(
         data_dir,
         nonce_cache,
         atlas,
+        listen_port,
     };
 
     let app = Router::new()
@@ -926,6 +963,7 @@ pub async fn start(
         .route("/signals", get(list_signals))
         .route("/signals/send", post(send_signal))
         .route("/health", get(|| async { "ok" }))
+        .route("/bootstrap", get(get_bootstrap))
         .route("/atlas", get(get_atlas))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
