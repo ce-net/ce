@@ -1,6 +1,9 @@
 mod api;
 pub mod auth;
+pub mod chain_actor;
 pub mod devices;
+
+pub use chain_actor::{ChainHandle, ChainStatusSnap, SyncSnap, spawn_chain_actor};
 
 /// Derive the libp2p PeerId string from a CE identity (same Ed25519 key, different encoding).
 pub fn peer_id_from_identity(identity: &ce_identity::Identity) -> anyhow::Result<String> {
@@ -166,7 +169,7 @@ impl NodeConfig {
 
 pub struct Node {
     identity: Arc<Identity>,
-    chain: Arc<Mutex<Chain>>,
+    chain: ChainHandle,
     #[allow(dead_code)]
     mesh_handle: MeshHandle,
     #[allow(dead_code)]
@@ -185,11 +188,10 @@ impl Node {
         let identity = Arc::new(Identity::load_or_generate(&identity_dir)?);
         info!("node id: {}", identity.node_id_hex());
 
-        let chain = Arc::new(Mutex::new(Chain::load_or_genesis(&chain_path)));
-        {
-            let c = chain.lock().await;
-            info!("chain height: {}", c.height());
-        }
+        let raw_chain = Chain::load_or_genesis(&chain_path);
+        info!("chain height: {}", raw_chain.height());
+
+        let chain = spawn_chain_actor(raw_chain);
 
         let docker = Docker::connect_with_socket_defaults().ok();
         if docker.is_none() {
@@ -214,16 +216,13 @@ impl Node {
         let signals: SignalRing =
             Arc::new(Mutex::new(VecDeque::with_capacity(SIGNAL_RING_CAPACITY)));
         let (signal_tx, _signal_rx0) = broadcast::channel::<CellSignal>(64);
-        // Push channels for SSE streams — subscribers never need to poll.
         let (block_tx, _block_rx0) = broadcast::channel::<Block>(32);
         let (tx_tx, _tx_rx0) = broadcast::channel::<Tx>(256);
         let send_nonce = Arc::new(AtomicU64::new(0));
         let job_store: JobStore = Arc::new(Mutex::new(HashMap::new()));
         let atlas: Atlas = Arc::new(Mutex::new(HashMap::new()));
 
-        // Channel: mesh event loop → job manager for incoming JobBid txs.
         let (bid_notify_tx, bid_notify_rx) = mpsc::channel::<Tx>(64);
-        // Channel: settle API endpoint → job manager to trigger immediate settle check.
         let (settle_notify_tx, settle_notify_rx) = mpsc::channel::<()>(16);
 
         let node = Self {
@@ -243,34 +242,34 @@ impl Node {
         });
 
         {
-            let c = chain.lock().await;
-            let h = c.height();
-            let tip = c.tip_hash();
-            let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
-            let _ = mesh_handle.announce_height(identity.node_id(), h, tip, oldest).await;
+            let snap = chain.sync_snap().await;
+            let _ = mesh_handle
+                .announce_height(identity.node_id(), snap.height, snap.tip_hash, snap.oldest)
+                .await;
         }
 
         if node.config.mine {
-            let chain = chain.clone();
-            let identity = identity.clone();
-            let handle = mesh_handle.clone();
+            let chain2 = chain.clone();
+            let identity2 = identity.clone();
+            let handle2 = mesh_handle.clone();
             let chain_path2 = node.config.data_dir.join("chain").join("chain.json");
-            let pool = pool.clone();
+            let pool2 = pool.clone();
             let interval = node.config.mining_interval_secs;
             let block_tx2 = block_tx.clone();
             tokio::spawn(async move {
-                mining_loop(chain, identity, handle, chain_path2, pool, interval, block_tx2).await;
+                mining_loop(chain2, identity2, handle2, chain_path2, pool2, interval, block_tx2)
+                    .await;
             });
         }
 
         {
-            let chain = chain.clone();
+            let chain2 = chain.clone();
             let chain_path2 = node.config.data_dir.join("chain").join("chain.json");
-            let handle = mesh_handle.clone();
+            let handle2 = mesh_handle.clone();
             let node_id = identity.node_id();
-            let pool = pool.clone();
-            let signals = signals.clone();
-            let signal_tx = signal_tx.clone();
+            let pool2 = pool.clone();
+            let signals2 = signals.clone();
+            let signal_tx2 = signal_tx.clone();
             let block_tx3 = block_tx.clone();
             let tx_tx3 = tx_tx.clone();
             let atlas2 = atlas.clone();
@@ -281,14 +280,14 @@ impl Node {
             let archive_dir2 = node.config.data_dir.join("archive");
             tokio::spawn(async move {
                 mesh_event_loop(
-                    chain,
+                    chain2,
                     mesh_rx,
                     chain_path2,
-                    handle,
+                    handle2,
                     node_id,
-                    pool,
-                    signals,
-                    signal_tx,
+                    pool2,
+                    signals2,
+                    signal_tx2,
                     block_tx3,
                     tx_tx3,
                     bid_notify_tx,
@@ -304,19 +303,19 @@ impl Node {
         }
 
         {
-            let chain = chain.clone();
-            let identity = identity.clone();
-            let handle = mesh_handle.clone();
+            let chain2 = chain.clone();
+            let identity2 = identity.clone();
+            let handle2 = mesh_handle.clone();
             let chain_path2 = node.config.data_dir.join("chain").join("chain.json");
-            let pool = pool.clone();
+            let pool2 = pool.clone();
             let js = job_store.clone();
             tokio::spawn(async move {
                 job_manager_loop(
-                    chain,
-                    identity,
-                    handle,
+                    chain2,
+                    identity2,
+                    handle2,
                     chain_path2,
-                    pool,
+                    pool2,
                     js,
                     bid_notify_rx,
                     settle_notify_rx,
@@ -325,7 +324,6 @@ impl Node {
             });
         }
 
-        // Capacity broadcast: every 60s announce CPU/memory/job capacity as a CEP-1 signal.
         if node.config.mine {
             let identity2 = identity.clone();
             let handle2 = mesh_handle.clone();
@@ -337,34 +335,34 @@ impl Node {
         }
 
         {
-            let chain = chain.clone();
-            let identity = identity.clone();
-            let mesh_handle = mesh_handle.clone();
-            let signals = signals.clone();
+            let chain2 = chain.clone();
+            let identity2 = identity.clone();
+            let mesh_handle2 = mesh_handle.clone();
+            let signals2 = signals.clone();
             let api_port = node.config.api_port;
             let p2p_port = node.config.listen_port;
-            let send_nonce = send_nonce.clone();
+            let send_nonce2 = send_nonce.clone();
             let js = job_store.clone();
-            let pool = pool.clone();
-            let data_dir = node.config.data_dir.clone();
+            let pool2 = pool.clone();
+            let data_dir2 = node.config.data_dir.clone();
             let atlas3 = atlas.clone();
             let docker3 = docker.clone();
             tokio::spawn(async move {
                 if let Err(e) = api::start(
-                    chain,
-                    identity,
-                    mesh_handle,
-                    signals,
+                    chain2,
+                    identity2,
+                    mesh_handle2,
+                    signals2,
                     signal_tx,
                     block_tx,
                     tx_tx,
-                    send_nonce,
+                    send_nonce2,
                     api_port,
                     p2p_port,
                     js,
-                    pool,
+                    pool2,
                     settle_notify_tx,
-                    data_dir,
+                    data_dir2,
                     atlas3,
                     docker3,
                 )
@@ -379,32 +377,26 @@ impl Node {
     }
 
     pub async fn balance(&self) -> i64 {
-        self.chain.lock().await.balance(&self.identity.node_id())
+        self.chain.balance(self.identity.node_id()).await
     }
 
     pub async fn any_burnable_tx(&self) -> Option<([u8; 32], u64)> {
-        let chain = self.chain.lock().await;
-        for block in &chain.blocks {
-            for tx in &block.transactions {
-                if let Some(amt) = tx_burn_amount(tx) {
-                    return Some((tx.id(), amt));
-                }
-            }
-        }
-        None
+        self.chain.any_burnable_tx().await
     }
 
     pub async fn status(&self) -> NodeStatus {
-        let chain = self.chain.lock().await;
+        let snap = self.chain.sync_snap().await;
+        let balance = self.chain.balance(self.identity.node_id()).await;
+        let difficulty = self.chain.difficulty().await;
         let peer_id = ce_mesh::peer_id_from_secret(self.identity.secret_bytes())
             .map(|p| p.to_string())
             .unwrap_or_else(|_| "unknown".into());
         NodeStatus {
             node_id: self.identity.node_id_hex(),
             peer_id,
-            height: chain.height(),
-            difficulty: chain.difficulty,
-            balance: chain.balance(&self.identity.node_id()),
+            height: snap.height,
+            difficulty,
+            balance,
             listen_port: self.config.listen_port,
             api_port: self.config.api_port,
         }
@@ -427,7 +419,7 @@ pub struct NodeStatus {
 // ----- Mining loop -----
 
 async fn mining_loop(
-    chain: Arc<Mutex<Chain>>,
+    chain: ChainHandle,
     identity: Arc<Identity>,
     mesh_handle: MeshHandle,
     chain_path: PathBuf,
@@ -442,45 +434,38 @@ async fn mining_loop(
 
         let mut pending = pool.drain(100).await;
 
-        let mut block = {
-            let c = chain.lock().await;
-            let next_index = c.tip().index + 1;
-            let emission = Chain::emission_rate(next_index);
-            if emission > 0 {
-                let kind = TxKind::UptimeReward {
-                    node: identity.node_id(),
-                    amount: emission,
-                    epoch: next_index,
-                };
-                let data = bincode::serialize(&kind).expect("serialize UptimeReward");
-                let sig = identity.sign(&data);
-                pending.insert(0, Tx::new(kind, identity.node_id(), sig));
-            }
-            c.next_block(pending, identity.node_id())
-        };
+        // Build UptimeReward tx for this block's emission.
+        let current_height = chain.height().await;
+        let next_index = current_height + 1;
+        let emission = Chain::emission_rate(next_index);
+        if emission > 0 {
+            let kind = TxKind::UptimeReward {
+                node: identity.node_id(),
+                amount: emission,
+                epoch: next_index,
+            };
+            let data = bincode::serialize(&kind).expect("serialize UptimeReward");
+            let sig = identity.sign(&data);
+            pending.insert(0, Tx::new(kind, identity.node_id(), sig));
+        }
 
+        let mut block = chain.next_block(pending, identity.node_id()).await;
         block.seal(&identity);
-
         info!("sealed block {}", block.index);
 
-        let (height, tip_hash) = {
-            let mut c = chain.lock().await;
-            if c.append(block.clone()) {
-                pool.remove_included(&block).await;
-                if let Err(e) = c.save(&chain_path) {
-                    warn!("save chain: {e}");
-                }
-                let _ = block_tx.send(block.clone());
+        if chain.append(block.clone()).await {
+            pool.remove_included(&block).await;
+            if let Err(e) = chain.save(chain_path.clone()).await {
+                warn!("save chain: {e}");
             }
-            (c.height(), c.tip_hash())
-        };
+            let _ = block_tx.send(block.clone());
+        }
 
         let _ = mesh_handle.broadcast_block(&block).await;
-        let oldest = {
-            let c = chain.lock().await;
-            c.blocks.first().map(|b| b.index).unwrap_or(0)
-        };
-        let _ = mesh_handle.announce_height(identity.node_id(), height, tip_hash, oldest).await;
+        let snap = chain.sync_snap().await;
+        let _ = mesh_handle
+            .announce_height(identity.node_id(), snap.height, snap.tip_hash, snap.oldest)
+            .await;
     }
 }
 
@@ -488,7 +473,7 @@ async fn mining_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn mesh_event_loop(
-    chain: Arc<Mutex<Chain>>,
+    chain: ChainHandle,
     mut rx: mpsc::Receiver<MeshEvent>,
     chain_path: PathBuf,
     mesh_handle: MeshHandle,
@@ -506,16 +491,11 @@ async fn mesh_event_loop(
     archive_density: f64,
     archive_dir: PathBuf,
 ) {
-    // Tracks the highest accepted nonce per sender to prevent replays.
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
-    // Tracks the best known height of each peer, used to decide whether to retry sync.
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
-    // Oldest block index each peer can serve. Used to route sync requests to archive peers.
     let mut peer_oldest: HashMap<NodeId, u64> = HashMap::new();
-    // Which archive segments each peer holds. Used to route SegmentFetch requests.
     let mut peer_segments: HashMap<NodeId, Vec<u64>> = HashMap::new();
 
-    // Announce our current archive segments on startup.
     {
         let held = ce_chain::list_archive_segments(&archive_dir);
         if !held.is_empty() {
@@ -523,11 +503,8 @@ async fn mesh_event_loop(
         }
     }
 
-    // Periodic ticker: re-announce segment manifest every 5 minutes so new peers learn what we hold.
     let mut segment_announce_ticker =
         tokio::time::interval(std::time::Duration::from_secs(300));
-    // Sync retry ticker: if we're still behind the best known peer, re-request every 15 s.
-    // This covers the case where a sync response was lost or applied no blocks.
     let mut sync_retry_ticker =
         tokio::time::interval(std::time::Duration::from_secs(15));
 
@@ -539,9 +516,7 @@ async fn mesh_event_loop(
                 continue;
             }
             _ = sync_retry_ticker.tick() => {
-                // If any peer is ahead of us, re-send a sync request.
-                // This recovers from lost responses and gossipsub message drops.
-                let our_height = chain.lock().await.height();
+                let our_height = chain.height().await;
                 let best = peer_heights.values().copied().max().unwrap_or(0);
                 if best > our_height {
                     debug!("sync retry: we={our_height}, best peer={best}");
@@ -554,13 +529,13 @@ async fn mesh_event_loop(
                 None => break,
             }
         };
+
         match event {
             MeshEvent::NewBlock(block) => {
-                let mut c = chain.lock().await;
-                if c.append(block.clone()) {
+                if chain.append(block.clone()).await {
                     info!("accepted block {} from mesh", block.index);
                     pool.remove_included(&block).await;
-                    if let Err(e) = c.save(&chain_path) {
+                    if let Err(e) = chain.save(chain_path.clone()).await {
                         warn!("save chain: {e}");
                     }
                     let _ = block_tx.send(block.clone());
@@ -574,7 +549,6 @@ async fn mesh_event_loop(
             MeshEvent::NewTx(tx) => {
                 match tx.verify() {
                     Ok(()) => {
-                        // Forward JobBid txs to the job manager before pooling.
                         if matches!(tx.kind, TxKind::JobBid { .. }) {
                             let _ = bid_notify_tx.send(tx.clone()).await;
                         }
@@ -587,14 +561,13 @@ async fn mesh_event_loop(
             MeshEvent::PeerHeight { node_id, height, tip_hash, oldest_block } => {
                 peer_heights.insert(node_id, height);
                 peer_oldest.insert(node_id, oldest_block);
-                let (our_height, our_tip) = {
-                    let c = chain.lock().await;
-                    (c.height(), c.tip_hash())
-                };
-                if height > our_height {
-                    let from = if tip_hash != our_tip && our_height > 0 { 0 } else { our_height };
-                    // When requesting old blocks, skip peers that have already pruned them.
-                    // If this peer can't serve `from`, skip — another peer (archive node) will.
+                let snap = chain.sync_snap().await;
+                if height > snap.height {
+                    let from = if tip_hash != snap.tip_hash && snap.height > 0 {
+                        0
+                    } else {
+                        snap.height
+                    };
                     let peer_can_serve = oldest_block <= from;
                     if !peer_can_serve && from > 0 {
                         debug!(
@@ -608,7 +581,7 @@ async fn mesh_event_loop(
                             "peer {} is at height {}, we're at {} — requesting sync from {}",
                             hex::encode(&node_id[..4]),
                             height,
-                            our_height,
+                            snap.height,
                             from,
                         );
                         let _ = mesh_handle.send_sync_request(our_node_id, from).await;
@@ -616,15 +589,7 @@ async fn mesh_event_loop(
                 }
             }
             MeshEvent::SyncRequest { from_node, from_height } => {
-                let blocks: Vec<Block> = {
-                    let c = chain.lock().await;
-                    c.blocks
-                        .iter()
-                        .filter(|b| b.index > from_height)
-                        .take(MAX_BLOCKS_PER_SYNC)
-                        .cloned()
-                        .collect()
-                };
+                let blocks = chain.blocks_after(from_height, MAX_BLOCKS_PER_SYNC).await;
                 if !blocks.is_empty() {
                     info!(
                         "serving {} blocks from height {} to {}",
@@ -639,60 +604,62 @@ async fn mesh_event_loop(
                 if for_node != our_node_id {
                     continue;
                 }
-                let mut c = chain.lock().await;
-                let height_before = c.height();
+                let height_before = chain.height().await;
                 let max_candidate = blocks.iter().map(|b| b.index).max().unwrap_or(0);
                 info!("sync response: {} blocks, candidate tip {}", blocks.len(), max_candidate);
 
-                // Fast path: blocks extend the current tip in order.
                 let mut applied = 0u64;
                 for block in blocks.clone() {
-                    if c.append(block) {
+                    if chain.append(block).await {
                         applied += 1;
                     }
                 }
 
-                // Slow path: reorg — handles a competing fork that is now longer.
-                if applied == 0 && c.try_reorg(blocks) {
+                if applied == 0 && chain.try_reorg(blocks).await {
+                    let new_height = chain.height().await;
                     info!(
                         "reorg: switched to longer chain at height {} (was {})",
-                        c.height(),
-                        height_before
+                        new_height, height_before
                     );
-                    applied = c.height() - height_before;
+                    applied = new_height.saturating_sub(height_before);
                 }
 
                 if applied > 0 {
-                    info!("sync applied {applied} blocks, now at height {}", c.height());
-                    // Auto-prune on light nodes after every sync batch.
+                    let new_height = chain.height().await;
+                    info!("sync applied {applied} blocks, now at height {new_height}");
+
                     if let Some(keep) = prune_keep {
-                        let h = c.height();
-                        if h > keep + 100 {
-                            // Archive segments that we're responsible for before discarding them.
+                        if new_height > keep + 100 {
                             if archive_density > 0.0 {
-                                if let Some(top_seg) = c.highest_complete_segment() {
-                                    let oldest_live_seg = ce_chain::segment_id_for_block(
-                                        c.blocks.first().map(|b| b.index).unwrap_or(0),
-                                    );
+                                if let Some(top_seg) =
+                                    chain.highest_complete_segment().await
+                                {
+                                    let snap = chain.sync_snap().await;
+                                    let oldest_live_seg =
+                                        ce_chain::segment_id_for_block(snap.oldest);
                                     for seg_id in oldest_live_seg..=top_seg {
                                         if ce_chain::should_hold_segment(
                                             &our_node_id,
                                             seg_id,
                                             archive_density,
                                         ) {
-                                            let seg_path = archive_dir.join(
-                                                format!("segment_{seg_id}.bin"),
-                                            );
+                                            let seg_path = archive_dir
+                                                .join(format!("segment_{seg_id}.bin"));
                                             if !seg_path.exists() {
-                                                if let Some(blocks) = c.export_segment(seg_id) {
+                                                if let Some(seg_blocks) =
+                                                    chain.export_segment(seg_id).await
+                                                {
                                                     if let Err(e) = ce_chain::save_segment(
                                                         &archive_dir,
                                                         seg_id,
-                                                        &blocks,
+                                                        &seg_blocks,
                                                     ) {
                                                         warn!("archive segment {seg_id}: {e}");
                                                     } else {
-                                                        info!("archived segment {seg_id} ({} blocks)", blocks.len());
+                                                        info!(
+                                                            "archived segment {seg_id} ({} blocks)",
+                                                            seg_blocks.len()
+                                                        );
                                                     }
                                                 }
                                             }
@@ -700,28 +667,24 @@ async fn mesh_event_loop(
                                     }
                                 }
                             }
-                            c.prune(keep);
-                            let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
-                            info!("pruned to height {}..{} (light mode)", oldest, h);
-                            // Announce updated segment manifest after archiving.
+                            chain.prune(keep).await;
+                            let snap = chain.sync_snap().await;
+                            info!("pruned to height {}..{} (light mode)", snap.oldest, snap.height);
                             let held = ce_chain::list_archive_segments(&archive_dir);
                             let _ = mesh_handle.announce_segments(our_node_id, held).await;
                         }
                     }
-                    let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
-                    if let Err(e) = c.save(&chain_path) {
+
+                    if let Err(e) = chain.save(chain_path.clone()).await {
                         warn!("save chain after sync: {e}");
                     }
-                    let tip = c.tip_hash();
-                    let h = c.height();
-                    drop(c);
-                    let _ = mesh_handle.announce_height(our_node_id, h, tip, oldest).await;
+                    let snap = chain.sync_snap().await;
+                    let _ = mesh_handle
+                        .announce_height(our_node_id, snap.height, snap.tip_hash, snap.oldest)
+                        .await;
                 } else {
-                    // Neither fast-path nor reorg applied the candidate set.
-                    // Check if any known peer is still ahead of us; if so keep requesting.
-                    let our_height = c.height();
+                    let our_height = chain.height().await;
                     let best_peer_height = peer_heights.values().copied().max().unwrap_or(0);
-                    drop(c);
                     if best_peer_height > our_height {
                         warn!(
                             "sync blocks didn't apply (our height {our_height}, \
@@ -742,16 +705,10 @@ async fn mesh_event_loop(
             }
             MeshEvent::PeerConnected(peer) => {
                 info!("peer connected: {peer}");
-                // Re-broadcast our current height and segments so any node that connects
-                // after our startup announcement still learns our chain state immediately.
-                // Without this, late-joining nodes never receive a PeerHeight event from us
-                // and their sync loop never triggers.
-                let (h, tip, oldest) = {
-                    let c = chain.lock().await;
-                    let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
-                    (c.height(), c.tip_hash(), oldest)
-                };
-                let _ = mesh_handle.announce_height(our_node_id, h, tip, oldest).await;
+                let snap = chain.sync_snap().await;
+                let _ = mesh_handle
+                    .announce_height(our_node_id, snap.height, snap.tip_hash, snap.oldest)
+                    .await;
                 let held = ce_chain::list_archive_segments(&archive_dir);
                 if !held.is_empty() {
                     let _ = mesh_handle.announce_segments(our_node_id, held).await;
@@ -759,18 +716,13 @@ async fn mesh_event_loop(
             }
             MeshEvent::PeerDisconnected(peer) => info!("peer disconnected: {peer}"),
             MeshEvent::IncomingRpc { from_peer, correlation_id, request } => {
-                // SegmentFetch is public: any peer may request archive blocks — no trust check.
                 if let RpcRequest::SegmentFetch { segment_id, .. } = &request {
                     let seg_id = *segment_id;
                     let chain2 = chain.clone();
                     let adir = archive_dir.clone();
                     let handle = mesh_handle.clone();
                     tokio::spawn(async move {
-                        // Try live chain first, then on-disk archive.
-                        let blocks = {
-                            let c = chain2.lock().await;
-                            c.export_segment(seg_id)
-                        };
+                        let blocks = chain2.export_segment(seg_id).await;
                         let blocks = if let Some(b) = blocks {
                             Some(b)
                         } else {
@@ -778,7 +730,9 @@ async fn mesh_event_loop(
                         };
                         let resp = match blocks {
                             Some(b) => RpcResponse::SegmentData { segment_id: seg_id, blocks: b },
-                            None => RpcResponse::Error(format!("segment {seg_id} not available")),
+                            None => {
+                                RpcResponse::Error(format!("segment {seg_id} not available"))
+                            }
                         };
                         let _ = handle.respond_rpc(correlation_id, resp).await;
                     });
@@ -794,8 +748,6 @@ async fn mesh_event_loop(
                 }
             }
             MeshEvent::CellSignal(signal) => {
-                // Reject replays: nonce must strictly increase per sender.
-                // Only enforced once we've seen at least one signal from them.
                 if let Some(&prev) = last_nonce.get(&signal.from) {
                     if signal.nonce <= prev {
                         warn!(
@@ -808,8 +760,6 @@ async fn mesh_event_loop(
                     }
                 }
 
-                // Trusted devices (registered in machines.toml) may send payloads
-                // without burn proof — they proved identity via noise transport.
                 let sender_is_trusted = {
                     let path = data_dir.join("machines.toml");
                     crate::devices::Devices::load_or_empty(&path).is_trusted(&signal.from)
@@ -822,10 +772,7 @@ async fn mesh_event_loop(
                     continue;
                 }
                 if let Some(burn) = &signal.burn_proof {
-                    let lookup = {
-                        let c = chain.lock().await;
-                        c.tx_by_id(&burn.tx_id)
-                    };
+                    let lookup = chain.tx_by_id(burn.tx_id).await;
                     let Some((tx, _height, _hash)) = lookup else {
                         warn!(
                             "dropping signal: burn_proof tx {} not found on chain",
@@ -843,7 +790,6 @@ async fn mesh_event_loop(
                 }
                 last_nonce.insert(signal.from, signal.nonce);
 
-                // Update atlas if this is a capacity advertisement.
                 if let Some(cap) = parse_capacity_signal(&signal) {
                     atlas.lock().await.insert(signal.from, cap);
                 }
@@ -860,10 +806,6 @@ async fn mesh_event_loop(
 
 // ----- Incoming mesh RPC handler -----
 
-/// Verify and dispatch a /ce/rpc/1 request from a remote peer.
-///
-/// Spawns a tokio task so exec (potentially minutes) doesn't block the mesh event loop.
-/// Always calls `mesh_handle.respond_rpc` exactly once, even on failure.
 fn handle_incoming_rpc(
     from_peer: ce_mesh::CePeerId,
     correlation_id: u64,
@@ -872,9 +814,6 @@ fn handle_incoming_rpc(
     docker: Option<Docker>,
     mesh_handle: MeshHandle,
 ) {
-    // Verify the claimed CE NodeId matches the noise-authenticated libp2p PeerId.
-    // This is the trust check: noise proved the sender holds the Ed25519 private key;
-    // we confirm the same key is registered as a trusted device.
     let from_node = request.from_node();
     let trust_ok = match peer_id_from_node_id(&from_node) {
         Ok(expected) if expected == from_peer => {
@@ -896,10 +835,12 @@ fn handle_incoming_rpc(
     if !trust_ok {
         let handle = mesh_handle.clone();
         tokio::spawn(async move {
-            let _ = handle.respond_rpc(
-                correlation_id,
-                RpcResponse::Error("sender is not a trusted device".into()),
-            ).await;
+            let _ = handle
+                .respond_rpc(
+                    correlation_id,
+                    RpcResponse::Error("sender is not a trusted device".into()),
+                )
+                .await;
         });
         return;
     }
@@ -908,10 +849,12 @@ fn handle_incoming_rpc(
         RpcRequest::Exec { image, cmd, cwd, .. } => {
             let Some(docker) = docker else {
                 tokio::spawn(async move {
-                    let _ = mesh_handle.respond_rpc(
-                        correlation_id,
-                        RpcResponse::Error("Docker not available on this node".into()),
-                    ).await;
+                    let _ = mesh_handle
+                        .respond_rpc(
+                            correlation_id,
+                            RpcResponse::Error("Docker not available on this node".into()),
+                        )
+                        .await;
                 });
                 return;
             };
@@ -929,14 +872,12 @@ fn handle_incoming_rpc(
                 let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
             });
         }
-        // SegmentFetch is handled before this function is called (no trust check needed).
         RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
         RpcRequest::SyncFile { path, data, .. } => {
             let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
             let home_canon = home.canonicalize().unwrap_or(home.clone());
 
             let resp = (|| -> RpcResponse {
-                // Reject path traversal.
                 if path.contains("..") {
                     return RpcResponse::Error("path traversal not allowed".into());
                 }
@@ -948,7 +889,9 @@ fn handle_incoming_rpc(
                             cp.join(target.file_name().unwrap_or_default())
                         }) {
                             Some(c) => c,
-                            None => return RpcResponse::Error("cannot resolve target path".into()),
+                            None => {
+                                return RpcResponse::Error("cannot resolve target path".into())
+                            }
                         }
                     }
                     None => return RpcResponse::Error("invalid path".into()),
@@ -976,7 +919,7 @@ fn handle_incoming_rpc(
 
 #[allow(clippy::too_many_arguments)]
 async fn job_manager_loop(
-    chain: Arc<Mutex<Chain>>,
+    chain: ChainHandle,
     identity: Arc<Identity>,
     mesh_handle: MeshHandle,
     chain_path: PathBuf,
@@ -993,32 +936,13 @@ async fn job_manager_loop(
         }
     };
 
-    // Per-container tasks send (job_id, exit_code) when the container exits.
     let (completion_tx, mut completion_rx) = mpsc::channel::<([u8; 32], i64)>(32);
     let mut settle_ticker = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut heartbeat_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-    // Skip the first (immediate) tick so the heartbeat fires 30s after start.
     heartbeat_ticker.tick().await;
 
-    // Initialize heartbeat epoch counters from chain state (survives restarts).
-    let mut heartbeat_epochs: HashMap<NodeId, u64> = {
-        let c = chain.lock().await;
-        let host_id = identity.node_id();
-        let mut epochs: HashMap<NodeId, u64> = HashMap::new();
-        for block in &c.blocks {
-            for tx in &block.transactions {
-                if let ce_chain::TxKind::Heartbeat { cell, host, epoch, .. } = &tx.kind {
-                    if host == &host_id {
-                        let e = epochs.entry(*cell).or_insert(0);
-                        if *epoch >= *e {
-                            *e = *epoch + 1;
-                        }
-                    }
-                }
-            }
-        }
-        epochs
-    };
+    let mut heartbeat_epochs: HashMap<NodeId, u64> =
+        chain.heartbeat_epochs(identity.node_id()).await;
 
     loop {
         tokio::select! {
@@ -1067,7 +991,6 @@ async fn job_manager_loop(
             }
         }
 
-        // Submit settle txs for any jobs that now have a payer signature.
         submit_pending_settles(
             &chain,
             &identity,
@@ -1080,7 +1003,6 @@ async fn job_manager_loop(
     }
 }
 
-/// Accept a JobBid from the mesh: pull the image, start the container, record the job.
 async fn handle_incoming_bid(
     tx: Tx,
     identity: &Identity,
@@ -1088,18 +1010,27 @@ async fn handle_incoming_bid(
     job_store: &JobStore,
     completion_tx: &mpsc::Sender<([u8; 32], i64)>,
 ) {
-    let TxKind::JobBid { job_id, payer, image, cmd, env, cpu_cores, mem_mb, bid, duration_secs, .. } = &tx.kind
+    let TxKind::JobBid {
+        job_id,
+        payer,
+        image,
+        cmd,
+        env,
+        cpu_cores,
+        mem_mb,
+        bid,
+        duration_secs,
+        ..
+    } = &tx.kind
     else {
         return;
     };
     let (bid, duration_secs) = (*bid, *duration_secs);
 
-    // Never accept our own bids; chain would reject the settle (payer == host).
     if payer == &identity.node_id() {
         return;
     }
 
-    // Skip if already accepted (duplicate gossip).
     {
         let store = job_store.lock().await;
         if store.contains_key(job_id) {
@@ -1140,7 +1071,6 @@ async fn handle_incoming_bid(
                     },
                 );
             }
-            // Spawn a task that waits for the container to exit, then notifies.
             let mgr = manager.clone();
             let cid = container_id;
             let jid = *job_id;
@@ -1170,9 +1100,8 @@ async fn handle_incoming_bid(
     }
 }
 
-/// Build and submit JobSettle txs for jobs in AwaitingSettlement state that have a payer_sig.
 async fn submit_pending_settles(
-    chain: &Arc<Mutex<Chain>>,
+    chain: &ChainHandle,
     identity: &Identity,
     mesh_handle: &MeshHandle,
     chain_path: &PathBuf,
@@ -1208,33 +1137,17 @@ async fn submit_pending_settles(
 
         pool.add(settle_tx.clone()).await;
         let _ = mesh_handle.broadcast_tx(&settle_tx).await;
-
         info!("submitted JobSettle tx for job {}", hex::encode(&job_id));
 
-        // Update status immediately; the chain confirms later.
         let mut store = job_store.lock().await;
         if let Some(r) = store.get_mut(&job_id) {
             r.status = CeJobStatus::Settled;
         }
     }
 
-    // Also mark as Settled any jobs for which we find a confirmed JobSettle on-chain.
-    let settled_on_chain: Vec<[u8; 32]> = {
-        let c = chain.lock().await;
-        c.blocks
-            .iter()
-            .flat_map(|b| &b.transactions)
-            .filter_map(|tx| {
-                if let TxKind::JobSettle { job_id, host, .. } = &tx.kind {
-                    if host == &identity.node_id() { Some(*job_id) } else { None }
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
+    let settled_on_chain = chain.settled_on_chain(identity.node_id()).await;
     if !settled_on_chain.is_empty() {
-        let _ = chain.lock().await.save(chain_path);
+        let _ = chain.save(chain_path.clone()).await;
         let mut store = job_store.lock().await;
         for job_id in settled_on_chain {
             if let Some(r) = store.get_mut(&job_id) {
@@ -1246,20 +1159,18 @@ async fn submit_pending_settles(
     }
 }
 
-/// Emit Heartbeat txs for all Running jobs. Returns (job_id, container_id) pairs
-/// for cells whose balance is too low to afford the next heartbeat.
 async fn emit_heartbeats(
-    chain: &Arc<Mutex<Chain>>,
+    chain: &ChainHandle,
     identity: &Identity,
     mesh_handle: &MeshHandle,
     pool: &TxPool,
     job_store: &JobStore,
     heartbeat_epochs: &mut HashMap<NodeId, u64>,
 ) -> Vec<([u8; 32], Option<String>)> {
-    // Snapshot running jobs: (payer, bid, duration_secs, job_id, container_id)
     let running: Vec<(NodeId, u64, u64, [u8; 32], Option<String>)> = {
         let store = job_store.lock().await;
-        store.values()
+        store
+            .values()
             .filter(|r| matches!(r.status, CeJobStatus::Running))
             .map(|r| (r.payer, r.bid, r.duration_secs, r.job_id, r.container_id.clone()))
             .collect()
@@ -1268,17 +1179,17 @@ async fn emit_heartbeats(
     let mut to_terminate: Vec<([u8; 32], Option<String>)> = Vec::new();
 
     for (cell, bid, duration_secs, job_id, container_id) in running {
-        // Heartbeat rate: spread the bid evenly over 30-second intervals.
         let intervals = (duration_secs / 30).max(1);
         let amount = bid / intervals;
         if amount == 0 {
             continue;
         }
 
-        let cell_balance = chain.lock().await.balance(&cell);
+        let cell_balance = chain.balance(cell).await;
         if cell_balance < amount as i64 {
             info!(
-                "cell {} insufficient balance ({cell_balance}) for heartbeat {amount}, terminating job {}",
+                "cell {} insufficient balance ({cell_balance}) for heartbeat {amount}, \
+                 terminating job {}",
                 hex::encode(&cell[..4]),
                 hex::encode(&job_id),
             );
@@ -1310,8 +1221,6 @@ async fn emit_heartbeats(
     to_terminate
 }
 
-/// Broadcast this node's available capacity as a capability-only CEP-1 signal every 60 seconds.
-/// Capabilities encode cpu_cores / mem_mb / running_jobs so peers can build an atlas.
 async fn capacity_broadcast_loop(
     identity: Arc<Identity>,
     mesh_handle: MeshHandle,
@@ -1319,10 +1228,8 @@ async fn capacity_broadcast_loop(
     send_nonce: Arc<AtomicU64>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-    // Skip immediate first tick.
     ticker.tick().await;
 
-    // Read available system resources once (approximation; accurate values need sysinfo).
     let cpu_cores = num_cpus() as u32;
     let mem_mb = available_mem_mb();
 
@@ -1345,7 +1252,7 @@ async fn capacity_broadcast_loop(
             identity.node_id(),
             ce_protocol::CellAddress::Broadcast,
             capabilities,
-            vec![],   // empty payload — no burn proof required
+            vec![],
             None,
             nonce,
             &identity,
@@ -1359,8 +1266,6 @@ async fn capacity_broadcast_loop(
     }
 }
 
-/// Extract a PeerCapacity from an incoming capacity advertisement signal.
-/// Returns None if the signal is not a capacity advertisement.
 fn parse_capacity_signal(signal: &CellSignal) -> Option<PeerCapacity> {
     let mut cpu = None;
     let mut mem = None;
@@ -1386,7 +1291,6 @@ fn num_cpus() -> usize {
 }
 
 fn available_mem_mb() -> u32 {
-    // Best-effort: read /proc/meminfo on Linux; fall back to 4096.
     #[cfg(target_os = "linux")]
     {
         if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
@@ -1411,7 +1315,6 @@ fn tx_burn_amount(tx: &Tx) -> Option<u64> {
         TxKind::JobBid { bid, .. } => Some(*bid),
         TxKind::JobSettle { cost, .. } => Some(*cost),
         TxKind::Heartbeat { amount, .. } => Some(*amount),
-        // JobExpire and TrustGrant carry no burnable credit amount.
         TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => None,
     }
 }

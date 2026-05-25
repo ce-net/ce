@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use bollard::{container::RemoveContainerOptions, Docker};
-use ce_chain::{payer_settle_bytes, Block, Chain, Tx, TxKind};
+use ce_chain::{payer_settle_bytes, Block, Tx, TxKind};
 use ce_container::{exec_in_container, ExecSpec};
 use ce_identity::{verify, Identity, NodeId};
 use ce_mesh::{MeshHandle, RpcRequest, RpcResponse, peer_id_from_node_id};
@@ -27,9 +27,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc};
 
-use crate::{Atlas, CeJobStatus, JobRecord, JobStore, PeerCapacity, SignalRing, TxPool};
+use crate::{
+    Atlas, CeJobStatus, ChainHandle, JobRecord, JobStore, PeerCapacity, SignalRing, TxPool,
+};
 
 /// Per-sender last-accepted timestamp (ms). Used to enforce strictly increasing
 /// nonces and close replay attacks within the 5-minute freshness window.
@@ -38,7 +40,7 @@ type NonceCache = Arc<StdMutex<HashMap<NodeId, u64>>>;
 #[derive(Clone)]
 struct ApiState {
     docker: Option<Docker>,
-    chain: Arc<Mutex<Chain>>,
+    chain: ChainHandle,
     host_node_id: NodeId,
     identity: Arc<Identity>,
     mesh_handle: MeshHandle,
@@ -110,7 +112,7 @@ async fn bid_job(
     let payer = state.identity.node_id();
 
     // Require a positive on-chain balance before accepting the bid.
-    let balance = state.chain.lock().await.balance(&payer);
+    let balance = state.chain.balance(payer).await;
     if balance <= 0 {
         return err(
             StatusCode::PAYMENT_REQUIRED,
@@ -295,16 +297,14 @@ async fn stop_job(State(state): State<ApiState>, Path(id): Path<String>) -> Resp
 // ----- GET /status -----
 
 async fn node_status(State(state): State<ApiState>) -> Response {
-    let chain = state.chain.lock().await;
-    let node_id = hex::encode(state.host_node_id);
-    let balance = chain.balance(&state.host_node_id);
+    let snap = state.chain.chain_status(state.host_node_id).await;
     (
         StatusCode::OK,
         Json(NodeStatusResponse {
-            node_id,
-            height: chain.height(),
-            difficulty: chain.difficulty,
-            balance,
+            node_id: hex::encode(state.host_node_id),
+            height: snap.height,
+            difficulty: snap.difficulty,
+            balance: snap.balance,
         }),
     )
         .into_response()
@@ -402,8 +402,7 @@ async fn send_signal(
             Some(arr) => arr,
             None => return err(StatusCode::BAD_REQUEST, "burn_tx_id_hex must be 64 hex chars"),
         };
-        let chain = state.chain.lock().await;
-        let Some((tx, height, hash)) = chain.tx_by_id(&tx_id) else {
+        let Some((tx, height, hash)) = state.chain.tx_by_id(tx_id).await else {
             return err(
                 StatusCode::BAD_REQUEST,
                 "burn_tx_id_hex does not match any tx in the local chain",
@@ -755,7 +754,7 @@ async fn transfer(State(state): State<ApiState>, Json(req): Json<TransferRequest
         return err(StatusCode::BAD_REQUEST, "amount must be > 0");
     }
     let from = state.identity.node_id();
-    let balance = state.chain.lock().await.balance(&from);
+    let balance = state.chain.balance(from).await;
     if balance < req.amount as i64 {
         return err(
             StatusCode::PAYMENT_REQUIRED,
@@ -1041,7 +1040,7 @@ async fn get_atlas(State(state): State<ApiState>) -> Response {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
-    chain: Arc<Mutex<Chain>>,
+    chain: ChainHandle,
     identity: Arc<Identity>,
     mesh_handle: MeshHandle,
     signals: SignalRing,
