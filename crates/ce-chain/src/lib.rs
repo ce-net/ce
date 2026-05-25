@@ -12,6 +12,78 @@ pub const TARGET_BLOCK_SECS: u64 = 600;
 /// Minimum blocks to retain after a prune. Covers EXPIRY_BLOCKS + difficulty window.
 pub const PRUNE_KEEP_BLOCKS: u64 = 2880;
 
+/// Number of blocks per archive segment. 1000 blocks ≈ 2.8 hours at 10 s/block.
+pub const SEGMENT_SIZE: u64 = 1000;
+
+/// Default fraction of history segments each node volunteers to hold.
+/// At 15% density with 20 peers → ~3× replication per segment on average.
+/// 0.0 = opt out, 1.0 = full archive.
+pub const ARCHIVE_DENSITY: f64 = 0.15;
+
+/// Returns the segment ID that contains `block_index`.
+pub fn segment_id_for_block(block_index: u64) -> u64 {
+    block_index / SEGMENT_SIZE
+}
+
+/// Deterministic volunteer check: should this node hold `segment_id` from its archive?
+/// Uses rendezvous hashing — any node can compute this for any peer without coordination.
+pub fn should_hold_segment(node_id: &NodeId, segment_id: u64, density: f64) -> bool {
+    if density >= 1.0 {
+        return true;
+    }
+    if density <= 0.0 {
+        return false;
+    }
+    let mut h = Sha256::new();
+    h.update(node_id);
+    h.update(&segment_id.to_le_bytes());
+    let val = u32::from_le_bytes(h.finalize()[..4].try_into().unwrap());
+    (val as f64 / u32::MAX as f64) < density
+}
+
+/// Persist a segment's blocks to the archive directory (bincode + zstd level 3).
+pub fn save_segment(archive_dir: &Path, segment_id: u64, blocks: &[Block]) -> Result<()> {
+    std::fs::create_dir_all(archive_dir)?;
+    let path = archive_dir.join(format!("segment_{segment_id}.bin"));
+    let raw = bincode::serialize(blocks).map_err(|e| anyhow!("bincode: {e}"))?;
+    let compressed = zstd::encode_all(raw.as_slice(), 3).map_err(|e| anyhow!("zstd: {e}"))?;
+    std::fs::write(path, compressed)?;
+    Ok(())
+}
+
+/// Load a segment from the archive directory. Returns None if the file doesn't exist.
+pub fn load_segment(archive_dir: &Path, segment_id: u64) -> Result<Option<Vec<Block>>> {
+    let path = archive_dir.join(format!("segment_{segment_id}.bin"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let compressed = std::fs::read(&path)?;
+    let raw = zstd::decode_all(compressed.as_slice()).map_err(|e| anyhow!("zstd: {e}"))?;
+    let blocks: Vec<Block> = bincode::deserialize(&raw).map_err(|e| anyhow!("bincode: {e}"))?;
+    Ok(Some(blocks))
+}
+
+/// Return all segment IDs present in the archive directory (sorted).
+pub fn list_archive_segments(archive_dir: &Path) -> Vec<u64> {
+    let mut ids = vec![];
+    let Ok(entries) = std::fs::read_dir(archive_dir) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if let Some(rest) = s.strip_prefix("segment_") {
+            if let Some(id_str) = rest.strip_suffix(".bin") {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
 /// Returns true if `hash` begins with at least `bits` zero bits.
 /// With `bits = 0` this is always true (genesis / test chains).
 pub fn has_leading_zeros(hash: &[u8; 32], bits: u8) -> bool {
@@ -688,6 +760,35 @@ impl Chain {
             miner,
             sig: [0u8; 64],
         }
+    }
+
+    /// Export all blocks in `segment_id` from the live chain.
+    /// Returns None if those blocks have been pruned or the segment isn't reached yet.
+    pub fn export_segment(&self, segment_id: u64) -> Option<Vec<Block>> {
+        let start = segment_id * SEGMENT_SIZE;
+        let end = start + SEGMENT_SIZE;
+        let base = self.blocks.first().map(|b| b.index).unwrap_or(u64::MAX);
+        if base > start {
+            return None;
+        }
+        let blocks: Vec<Block> = self
+            .blocks
+            .iter()
+            .filter(|b| b.index >= start && b.index < end)
+            .cloned()
+            .collect();
+        if blocks.is_empty() { None } else { Some(blocks) }
+    }
+
+    /// The highest segment ID that is fully written (all SEGMENT_SIZE blocks present).
+    /// Returns None if the chain hasn't accumulated a full segment yet.
+    pub fn highest_complete_segment(&self) -> Option<u64> {
+        let h = self.height();
+        if h < SEGMENT_SIZE {
+            return None;
+        }
+        let current_seg = h / SEGMENT_SIZE;
+        if current_seg == 0 { None } else { Some(current_seg - 1) }
     }
 
     /// Load chain from disk. Supports bincode+zstd (current) and plain JSON (legacy migration).

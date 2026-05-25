@@ -532,6 +532,10 @@ name = "ce-deploy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ce-chain",
+ "ce-identity",
+ "ce-node",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",

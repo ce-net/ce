@@ -14,3 +14,7 @@ tracing = "0.1"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = "0.3"
+ce-node = { path = "../ce-node" }
+ce-chain = { path = "../ce-chain" }
+ce-identity = { path = "../ce-identity" }
+hex = "0.4"

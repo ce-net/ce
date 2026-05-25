@@ -95,12 +95,20 @@ pub enum RpcRequest {
         path: String,
         data: Vec<u8>,
     },
+    /// Fetch a historical archive segment from a peer's local archive.
+    /// The peer replies with SegmentData if it holds the segment, or Error otherwise.
+    SegmentFetch {
+        from_node: NodeId,
+        segment_id: u64,
+    },
 }
 
 impl RpcRequest {
     pub fn from_node(&self) -> NodeId {
         match self {
-            Self::Exec { from_node, .. } | Self::SyncFile { from_node, .. } => *from_node,
+            Self::Exec { from_node, .. }
+            | Self::SyncFile { from_node, .. }
+            | Self::SegmentFetch { from_node, .. } => *from_node,
         }
     }
 }
@@ -110,6 +118,8 @@ impl RpcRequest {
 pub enum RpcResponse {
     ExecResult { stdout: String, stderr: String, exit_code: i32 },
     SyncAck,
+    /// Blocks for the requested archive segment.
+    SegmentData { segment_id: u64, blocks: Vec<Block> },
     /// The remote node rejected the request (trust failure, Docker error, etc.).
     Error(String),
 }
@@ -180,12 +190,24 @@ impl request_response::Codec for CeRpcCodec {
     }
 }
 
+// ----- Segment manifest wire type -----
+
+/// Broadcast on `ce-segments` topic: advertises which archive segments a node holds.
+/// Sent on startup and whenever the local segment set changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentManifest {
+    node_id: NodeId,
+    /// Sorted list of segment IDs this node holds in its archive.
+    held_segments: Vec<u64>,
+}
+
 // ----- Command channel -----
 
 enum MeshCommand {
     PublishTx(Vec<u8>),
     PublishBlock(Vec<u8>),
     AnnounceHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32], oldest_block: u64 },
+    AnnounceSegments { node_id: NodeId, held_segments: Vec<u64> },
     SendSyncRequest { from_node: NodeId, from_height: u64 },
     SendSyncResponse { for_node: NodeId, blocks: Vec<Block> },
     PublishSignal(Vec<u8>),
@@ -213,6 +235,8 @@ pub enum MeshEvent {
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
     PeerHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32], oldest_block: u64 },
+    /// A peer broadcast their archive segment manifest.
+    PeerSegments { node_id: NodeId, held_segments: Vec<u64> },
     SyncRequest { from_node: NodeId, from_height: u64 },
     SyncBlocks { for_node: NodeId, blocks: Vec<Block> },
     CellSignal(CellSignal),
@@ -238,6 +262,7 @@ const TOPIC_HEIGHTS: &str = "ce-heights";
 const TOPIC_SYNCREQ: &str = "ce-syncreq";
 const TOPIC_SYNCRESP: &str = "ce-syncresp";
 const TOPIC_PROTOCOL: &str = PROTOCOL_TOPIC;
+const TOPIC_SEGMENTS: &str = "ce-segments";
 
 // ----- Network behaviour -----
 
@@ -264,6 +289,7 @@ struct Topics {
     syncreq: gossipsub::TopicHash,
     syncresp: gossipsub::TopicHash,
     protocol: gossipsub::TopicHash,
+    segments: gossipsub::TopicHash,
 }
 
 // ----- Handle returned to callers -----
@@ -307,6 +333,11 @@ impl MeshHandle {
         self.send(MeshCommand::PublishSignal(bytes)).await
     }
 
+    /// Broadcast which archive segments this node holds (via `ce-segments` topic).
+    pub async fn announce_segments(&self, node_id: NodeId, held_segments: Vec<u64>) -> Result<()> {
+        self.send(MeshCommand::AnnounceSegments { node_id, held_segments }).await
+    }
+
     /// Add a dial hint so the swarm can find and connect to a peer.
     /// The `addr` is a libp2p multiaddr, e.g. a relay circuit address.
     /// Silently ignores invalid multiaddrs (logs a warning instead).
@@ -344,6 +375,7 @@ pub struct Mesh {
     syncreq_topic: gossipsub::IdentTopic,
     syncresp_topic: gossipsub::IdentTopic,
     protocol_topic: gossipsub::IdentTopic,
+    segments_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<MeshCommand>,
     event_tx: mpsc::Sender<MeshEvent>,
     /// Relay nodes: peer_id → full multiaddr. On connect, listen on the circuit addr.
@@ -372,6 +404,7 @@ impl Mesh {
         let syncreq_topic = gossipsub::IdentTopic::new(TOPIC_SYNCREQ);
         let syncresp_topic = gossipsub::IdentTopic::new(TOPIC_SYNCRESP);
         let protocol_topic = gossipsub::IdentTopic::new(TOPIC_PROTOCOL);
+        let segments_topic = gossipsub::IdentTopic::new(TOPIC_SEGMENTS);
 
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -452,6 +485,7 @@ impl Mesh {
             syncreq_topic,
             syncresp_topic,
             protocol_topic,
+            segments_topic,
             cmd_rx,
             event_tx,
             relay_peers: HashMap::new(),
@@ -500,6 +534,7 @@ impl Mesh {
             &self.syncreq_topic,
             &self.syncresp_topic,
             &self.protocol_topic,
+            &self.segments_topic,
         ] {
             self.swarm.behaviour_mut().gossipsub.subscribe(topic)?;
         }
@@ -511,6 +546,7 @@ impl Mesh {
             syncreq: self.syncreq_topic.hash(),
             syncresp: self.syncresp_topic.hash(),
             protocol: self.protocol_topic.hash(),
+            segments: self.segments_topic.hash(),
         };
 
         loop {
@@ -635,6 +671,13 @@ impl Mesh {
                 if let Ok(bytes) = bincode::serialize(&msg) {
                     let _ = self.swarm.behaviour_mut().gossipsub
                         .publish(self.heights_topic.clone(), bytes);
+                }
+            }
+            MeshCommand::AnnounceSegments { node_id, held_segments } => {
+                let msg = SegmentManifest { node_id, held_segments };
+                if let Ok(bytes) = bincode::serialize(&msg) {
+                    let _ = self.swarm.behaviour_mut().gossipsub
+                        .publish(self.segments_topic.clone(), bytes);
                 }
             }
             MeshCommand::SendSyncRequest { from_node, from_height } => {
@@ -789,6 +832,14 @@ fn decode_gossip(message: gossipsub::Message, topics: &Topics) -> Option<MeshEve
                 Err(e) => { warn!("ce-protocol-1 signal failed sig check: {e}"); None }
             },
             Err(e) => { warn!("bad ce-protocol-1 gossip: {e}"); None }
+        }
+    } else if t == &topics.segments {
+        match bincode::deserialize::<SegmentManifest>(&message.data) {
+            Ok(m) => Some(MeshEvent::PeerSegments {
+                node_id: m.node_id,
+                held_segments: m.held_segments,
+            }),
+            Err(e) => { warn!("bad segment manifest: {e}"); None }
         }
     } else {
         None

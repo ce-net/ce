@@ -132,6 +132,10 @@ pub struct NodeConfig {
     /// How many recent blocks to keep after pruning. `None` = archive (never prune).
     /// Light nodes set this to `PRUNE_KEEP_BLOCKS`. Relay and desktops use `None`.
     pub prune_keep: Option<u64>,
+    /// Fraction of history segments to volunteer to hold in local archive (0.0–1.0).
+    /// Light nodes use ARCHIVE_DENSITY (~0.15); archive nodes should set 1.0.
+    /// Together across all nodes this achieves distributed redundancy of the full history.
+    pub archive_density: f64,
 }
 
 impl Default for NodeConfig {
@@ -145,6 +149,7 @@ impl Default for NodeConfig {
             mine: true,
             mining_interval_secs: 10,
             prune_keep: None,
+            archive_density: ce_chain::ARCHIVE_DENSITY,
         }
     }
 }
@@ -266,6 +271,8 @@ impl Node {
             let data_dir2 = node.config.data_dir.clone();
             let docker2 = docker.clone();
             let prune_keep = node.config.prune_keep;
+            let archive_density = node.config.archive_density;
+            let archive_dir2 = node.config.data_dir.join("archive");
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain,
@@ -281,6 +288,8 @@ impl Node {
                     data_dir2,
                     docker2,
                     prune_keep,
+                    archive_density,
+                    archive_dir2,
                 )
                 .await;
             });
@@ -479,6 +488,8 @@ async fn mesh_event_loop(
     data_dir: PathBuf,
     docker: Option<Docker>,
     prune_keep: Option<u64>,
+    archive_density: f64,
+    archive_dir: PathBuf,
 ) {
     // Tracks the highest accepted nonce per sender to prevent replays.
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
@@ -486,8 +497,33 @@ async fn mesh_event_loop(
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
     // Oldest block index each peer can serve. Used to route sync requests to archive peers.
     let mut peer_oldest: HashMap<NodeId, u64> = HashMap::new();
+    // Which archive segments each peer holds. Used to route SegmentFetch requests.
+    let mut peer_segments: HashMap<NodeId, Vec<u64>> = HashMap::new();
 
-    while let Some(event) = rx.recv().await {
+    // Announce our current archive segments on startup.
+    {
+        let held = ce_chain::list_archive_segments(&archive_dir);
+        if !held.is_empty() {
+            let _ = mesh_handle.announce_segments(our_node_id, held).await;
+        }
+    }
+
+    // Periodic ticker: re-announce segment manifest every 5 minutes so new peers learn what we hold.
+    let mut segment_announce_ticker =
+        tokio::time::interval(std::time::Duration::from_secs(300));
+
+    loop {
+        let event = tokio::select! {
+            _ = segment_announce_ticker.tick() => {
+                let held = ce_chain::list_archive_segments(&archive_dir);
+                let _ = mesh_handle.announce_segments(our_node_id, held).await;
+                continue;
+            }
+            maybe = rx.recv() => match maybe {
+                Some(e) => e,
+                None => break,
+            }
+        };
         match event {
             MeshEvent::NewBlock(block) => {
                 let mut c = chain.lock().await;
@@ -600,9 +636,44 @@ async fn mesh_event_loop(
                     if let Some(keep) = prune_keep {
                         let h = c.height();
                         if h > keep + 100 {
+                            // Archive segments that we're responsible for before discarding them.
+                            if archive_density > 0.0 {
+                                if let Some(top_seg) = c.highest_complete_segment() {
+                                    let oldest_live_seg = ce_chain::segment_id_for_block(
+                                        c.blocks.first().map(|b| b.index).unwrap_or(0),
+                                    );
+                                    for seg_id in oldest_live_seg..=top_seg {
+                                        if ce_chain::should_hold_segment(
+                                            &our_node_id,
+                                            seg_id,
+                                            archive_density,
+                                        ) {
+                                            let seg_path = archive_dir.join(
+                                                format!("segment_{seg_id}.bin"),
+                                            );
+                                            if !seg_path.exists() {
+                                                if let Some(blocks) = c.export_segment(seg_id) {
+                                                    if let Err(e) = ce_chain::save_segment(
+                                                        &archive_dir,
+                                                        seg_id,
+                                                        &blocks,
+                                                    ) {
+                                                        warn!("archive segment {seg_id}: {e}");
+                                                    } else {
+                                                        info!("archived segment {seg_id} ({} blocks)", blocks.len());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             c.prune(keep);
                             let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
                             info!("pruned to height {}..{} (light mode)", oldest, h);
+                            // Announce updated segment manifest after archiving.
+                            let held = ce_chain::list_archive_segments(&archive_dir);
+                            let _ = mesh_handle.announce_segments(our_node_id, held).await;
                         }
                     }
                     let oldest = c.blocks.first().map(|b| b.index).unwrap_or(0);
@@ -629,17 +700,57 @@ async fn mesh_event_loop(
                     }
                 }
             }
-            MeshEvent::PeerConnected(peer) => info!("peer connected: {peer}"),
+            MeshEvent::PeerSegments { node_id, held_segments } => {
+                debug!(
+                    "peer {} holds {} archive segments",
+                    hex::encode(&node_id[..4]),
+                    held_segments.len(),
+                );
+                peer_segments.insert(node_id, held_segments);
+            }
+            MeshEvent::PeerConnected(peer) => {
+                info!("peer connected: {peer}");
+                // Announce our segments to every new peer immediately.
+                let held = ce_chain::list_archive_segments(&archive_dir);
+                if !held.is_empty() {
+                    let _ = mesh_handle.announce_segments(our_node_id, held).await;
+                }
+            }
             MeshEvent::PeerDisconnected(peer) => info!("peer disconnected: {peer}"),
             MeshEvent::IncomingRpc { from_peer, correlation_id, request } => {
-                handle_incoming_rpc(
-                    from_peer,
-                    correlation_id,
-                    request,
-                    &data_dir,
-                    docker.clone(),
-                    mesh_handle.clone(),
-                );
+                // SegmentFetch is public: any peer may request archive blocks — no trust check.
+                if let RpcRequest::SegmentFetch { segment_id, .. } = &request {
+                    let seg_id = *segment_id;
+                    let chain2 = chain.clone();
+                    let adir = archive_dir.clone();
+                    let handle = mesh_handle.clone();
+                    tokio::spawn(async move {
+                        // Try live chain first, then on-disk archive.
+                        let blocks = {
+                            let c = chain2.lock().await;
+                            c.export_segment(seg_id)
+                        };
+                        let blocks = if let Some(b) = blocks {
+                            Some(b)
+                        } else {
+                            ce_chain::load_segment(&adir, seg_id).ok().flatten()
+                        };
+                        let resp = match blocks {
+                            Some(b) => RpcResponse::SegmentData { segment_id: seg_id, blocks: b },
+                            None => RpcResponse::Error(format!("segment {seg_id} not available")),
+                        };
+                        let _ = handle.respond_rpc(correlation_id, resp).await;
+                    });
+                } else {
+                    handle_incoming_rpc(
+                        from_peer,
+                        correlation_id,
+                        request,
+                        &data_dir,
+                        docker.clone(),
+                        mesh_handle.clone(),
+                    );
+                }
             }
             MeshEvent::CellSignal(signal) => {
                 // Reject replays: nonce must strictly increase per sender.
@@ -777,6 +888,8 @@ fn handle_incoming_rpc(
                 let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
             });
         }
+        // SegmentFetch is handled before this function is called (no trust check needed).
+        RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
         RpcRequest::SyncFile { path, data, .. } => {
             let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
             let home_canon = home.canonicalize().unwrap_or(home.clone());
