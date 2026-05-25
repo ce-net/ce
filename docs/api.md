@@ -259,6 +259,73 @@ Returns the last 100 validated CEP-1 signals seen by this node (newest at the en
 
 ---
 
+## GET /signals/stream
+
+Server-Sent Events stream. Pushes every validated CEP-1 signal to the client the instant it arrives — no polling required. Each event is a JSON object with the same shape as the items returned by `GET /signals`.
+
+Connect and keep the connection open:
+```bash
+curl -N http://localhost:8080/signals/stream
+```
+
+The server sends a keep-alive comment every 15 seconds on idle connections. Disconnect when done.
+
+**Response** `text/event-stream`
+```
+data: {"from":"a3f2...","to":"broadcast","capabilities":[...],"payload_hex":"deadbeef","nonce":1,"id":"..."}
+
+data: {"from":"b9c1...","to":"broadcast","capabilities":[...],"payload_hex":"","nonce":2,"id":"..."}
+```
+
+---
+
+## GET /blocks/stream
+
+Server-Sent Events stream. Pushes every block accepted by this node (whether locally mined or received from a peer) the instant it is appended to the chain.
+
+```bash
+curl -N http://localhost:8080/blocks/stream
+```
+
+**Response** `text/event-stream`
+```
+data: {"index":42,"hash":"a1b2...","prev_hash":"9f0e...","timestamp":1716634800,"miner":"a3f2...","tx_count":3,"nonce":12345}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `index` | integer | Block height |
+| `hash` | string | 64-hex block hash |
+| `prev_hash` | string | 64-hex hash of the previous block |
+| `timestamp` | integer | Unix seconds when the block was sealed |
+| `miner` | string | 64-hex NodeId of the block producer |
+| `tx_count` | integer | Number of transactions in the block |
+| `nonce` | integer | PoW nonce |
+
+---
+
+## GET /transactions/stream
+
+Server-Sent Events stream. Pushes every transaction accepted from the mesh the instant it passes signature verification.
+
+```bash
+curl -N http://localhost:8080/transactions/stream
+```
+
+**Response** `text/event-stream`
+```
+data: {"id":"c3d4...","origin":"a3f2...","kind":"Transfer","amount":500}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | 64-hex transaction ID (SHA256 of the serialised tx) |
+| `origin` | string | 64-hex NodeId of the signer |
+| `kind` | string | `Transfer` \| `UptimeReward` \| `JobBid` \| `JobSettle` \| `JobExpire` \| `TrustGrant` \| `Heartbeat` |
+| `amount` | integer | Credit amount (0 for kinds without one) |
+
+---
+
 ## POST /signals/send
 
 Build a CEP-1 signal locally, sign it, and broadcast it on the `ce-protocol-1` gossip topic.

@@ -341,9 +341,9 @@ The goal: no polling. Every subscriber gets pushed signals, blocks, and transact
 
 Currently `GET /signals` is a poll endpoint returning a static ring buffer snapshot. Internally a `tokio::sync::broadcast::Sender<CellSignal>` already fires on every validated signal — it just isn't exposed over HTTP.
 
-### 6a. SSE streams (planned)
+### 6a. SSE streams ✅ Done
 
-Add three Server-Sent Events endpoints. Each streams newline-delimited JSON events as they arrive. Clients connect once and stay connected; the server pushes immediately.
+Three Server-Sent Events endpoints. Each streams newline-delimited JSON events as they arrive. Clients connect once and stay connected; the server pushes immediately.
 
 ```
 GET /signals/stream        — SSE: one JSON CellSignal per event
@@ -565,7 +565,7 @@ Cost: 1000 credits. Duration: 210,000 blocks. Name collision: first-wins per cha
 7. ~~**Chain storage optimisation**~~ ✅ Done — bincode+zstd persistence, O(1) tip validation, transparent JSON migration
 8. ~~**Distributed segment archive**~~ ✅ Done — light node mode, rendezvous-hash segment assignment, `ce-segments` gossip topic, `SegmentFetch` RPC, oldest_block routing
 9. **DNS + nginx for relay** — wire relay.ce-net.com → 178.105.145.170, proxy /bootstrap (30 min ops task)
-10. **Subscription system** (Phase 6) — SSE endpoints `/signals/stream`, `/blocks/stream`, `/transactions/stream`; wire `signal_tx` into `ApiState`
+10. ~~**Subscription system** (Phase 6a)~~ ✅ Done — SSE endpoints `/signals/stream`, `/blocks/stream`, `/transactions/stream`; `signal_tx`/`block_tx`/`tx_tx` broadcast channels wired through `ApiState`
 11. **Live mesh benchmark suite** (Phase 7) — `ce-bench` crate, gossip latency, RPC RTT, chain sync speed
 12. **Chain checkpoints** (Phase 1c) — needed before public launch
 13. **Longest-chain fork selection** — reorg function in `mesh_event_loop`

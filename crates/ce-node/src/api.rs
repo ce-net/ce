@@ -3,26 +3,31 @@ use axum::{
     body::Body,
     extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{delete, get, post, put},
     Json, Router,
 };
 use bollard::{container::RemoveContainerOptions, Docker};
-use ce_chain::{payer_settle_bytes, Chain};
+use ce_chain::{payer_settle_bytes, Block, Chain, Tx, TxKind};
 use ce_container::{exec_in_container, ExecSpec};
 use ce_identity::{verify, Identity, NodeId};
 use ce_mesh::{MeshHandle, RpcRequest, RpcResponse, peer_id_from_node_id};
 use ce_protocol::{BurnProof, Capability, CellAddress, CellSignal};
+use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    convert::Infallible,
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::{Atlas, CeJobStatus, JobRecord, JobStore, PeerCapacity, SignalRing, TxPool};
 
@@ -38,6 +43,12 @@ struct ApiState {
     identity: Arc<Identity>,
     mesh_handle: MeshHandle,
     signals: SignalRing,
+    /// Push channel — subscribers receive every validated CEP-1 signal instantly.
+    signal_tx: broadcast::Sender<CellSignal>,
+    /// Push channel — subscribers receive every accepted block instantly.
+    block_tx: broadcast::Sender<Block>,
+    /// Push channel — subscribers receive every accepted transaction instantly.
+    tx_tx: broadcast::Sender<Tx>,
     send_nonce: Arc<AtomicU64>,
     job_store: JobStore,
     pool: TxPool,
@@ -894,6 +905,120 @@ async fn get_bootstrap(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, Json(BootstrapResponse { peers })).into_response()
 }
 
+// ----- SSE push streams -----
+//
+// Three endpoints that push events the instant they arrive — no polling required.
+// Clients connect once and stay connected; the server delivers each event as a
+// newline-delimited JSON Server-Sent Event.
+//
+// Usage:
+//   curl -N http://localhost:8080/signals/stream
+//   curl -N http://localhost:8080/blocks/stream
+//   curl -N http://localhost:8080/transactions/stream
+
+#[derive(Debug, Serialize)]
+struct BlockView {
+    index: u64,
+    hash: String,
+    prev_hash: String,
+    timestamp: u64,
+    miner: String,
+    tx_count: usize,
+    nonce: u64,
+}
+
+fn block_view(b: &Block) -> BlockView {
+    BlockView {
+        index: b.index,
+        hash: hex::encode(b.hash()),
+        prev_hash: hex::encode(b.prev_hash),
+        timestamp: b.timestamp,
+        miner: hex::encode(b.miner),
+        tx_count: b.transactions.len(),
+        nonce: b.nonce,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TxStreamView {
+    id: String,
+    origin: String,
+    kind: &'static str,
+    /// Credit amount associated with this tx (0 for kinds without one).
+    amount: u64,
+}
+
+fn tx_stream_view(tx: &Tx) -> TxStreamView {
+    let (kind, amount) = match &tx.kind {
+        TxKind::Transfer { amount, .. } => ("Transfer", *amount),
+        TxKind::UptimeReward { amount, .. } => ("UptimeReward", *amount),
+        TxKind::JobBid { bid, .. } => ("JobBid", *bid),
+        TxKind::JobSettle { cost, .. } => ("JobSettle", *cost),
+        TxKind::JobExpire { .. } => ("JobExpire", 0),
+        TxKind::TrustGrant { .. } => ("TrustGrant", 0),
+        TxKind::Heartbeat { amount, .. } => ("Heartbeat", *amount),
+    };
+    TxStreamView { id: hex::encode(tx.id()), origin: hex::encode(tx.origin), kind, amount }
+}
+
+/// Build a lazily-polled SSE stream from a broadcast receiver.
+///
+/// Each item produced by the receiver is converted to JSON via `view_fn` and
+/// sent as an SSE data event. Lagged receivers (slow clients) log a warning and
+/// skip the dropped messages rather than closing the connection.
+///
+/// `view_fn` is threaded through the `unfold` state so the borrow checker is
+/// satisfied without unsafe code. Requires `F: Clone` which all fn-pointers and
+/// simple closures automatically satisfy.
+fn sse_broadcast<T, V, F>(
+    rx: broadcast::Receiver<T>,
+    view_fn: F,
+) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    T: Clone + Send + 'static,
+    V: Serialize,
+    F: Fn(&T) -> V + Clone + Send + 'static,
+{
+    // Package (rx, view_fn) as the unfold state so both are threaded through each call.
+    stream::unfold((rx, view_fn), |(mut rx, view_fn)| async move {
+        loop {
+            match rx.recv().await {
+                Ok(item) => {
+                    let json = serde_json::to_string(&view_fn(&item)).unwrap_or_default();
+                    return Some((Ok(Event::default().data(json)), (rx, view_fn)));
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("SSE stream lagged {n} messages — slow consumer");
+                    // Loop again; don't close the connection.
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+}
+
+async fn stream_signals(
+    State(state): State<ApiState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.signal_tx.subscribe();
+    Sse::new(sse_broadcast(rx, |sig: &CellSignal| signal_view(sig)))
+        .keep_alive(KeepAlive::default())
+}
+
+async fn stream_blocks(
+    State(state): State<ApiState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.block_tx.subscribe();
+    Sse::new(sse_broadcast(rx, |b: &Block| block_view(b))).keep_alive(KeepAlive::default())
+}
+
+async fn stream_transactions(
+    State(state): State<ApiState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.tx_tx.subscribe();
+    Sse::new(sse_broadcast(rx, |tx: &Tx| tx_stream_view(tx))).keep_alive(KeepAlive::default())
+}
+
 // ----- GET /atlas -----
 
 #[derive(Debug, Serialize)]
@@ -920,6 +1045,9 @@ pub async fn start(
     identity: Arc<Identity>,
     mesh_handle: MeshHandle,
     signals: SignalRing,
+    signal_tx: broadcast::Sender<CellSignal>,
+    block_tx: broadcast::Sender<Block>,
+    tx_tx: broadcast::Sender<Tx>,
     send_nonce: Arc<AtomicU64>,
     port: u16,
     listen_port: u16,
@@ -942,6 +1070,9 @@ pub async fn start(
         identity,
         mesh_handle,
         signals,
+        signal_tx,
+        block_tx,
+        tx_tx,
         send_nonce,
         job_store,
         pool,
@@ -962,6 +1093,10 @@ pub async fn start(
         .route("/status", get(node_status))
         .route("/signals", get(list_signals))
         .route("/signals/send", post(send_signal))
+        // SSE push streams — no polling required.
+        .route("/signals/stream", get(stream_signals))
+        .route("/blocks/stream", get(stream_blocks))
+        .route("/transactions/stream", get(stream_transactions))
         .route("/health", get(|| async { "ok" }))
         .route("/bootstrap", get(get_bootstrap))
         .route("/atlas", get(get_atlas))

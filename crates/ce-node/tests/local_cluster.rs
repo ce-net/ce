@@ -362,6 +362,7 @@ async fn job_lifecycle() {
         api_port: api_payer,
         mine: true,
         mining_interval_secs: 2,
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -387,6 +388,7 @@ async fn job_lifecycle() {
         api_port: api_host,
         mine: true,
         mining_interval_secs: 2,
+        ..Default::default()
     })
     .await
     .unwrap();

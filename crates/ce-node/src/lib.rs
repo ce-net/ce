@@ -214,6 +214,9 @@ impl Node {
         let signals: SignalRing =
             Arc::new(Mutex::new(VecDeque::with_capacity(SIGNAL_RING_CAPACITY)));
         let (signal_tx, _signal_rx0) = broadcast::channel::<CellSignal>(64);
+        // Push channels for SSE streams — subscribers never need to poll.
+        let (block_tx, _block_rx0) = broadcast::channel::<Block>(32);
+        let (tx_tx, _tx_rx0) = broadcast::channel::<Tx>(256);
         let send_nonce = Arc::new(AtomicU64::new(0));
         let job_store: JobStore = Arc::new(Mutex::new(HashMap::new()));
         let atlas: Atlas = Arc::new(Mutex::new(HashMap::new()));
@@ -254,8 +257,9 @@ impl Node {
             let chain_path2 = node.config.data_dir.join("chain").join("chain.json");
             let pool = pool.clone();
             let interval = node.config.mining_interval_secs;
+            let block_tx2 = block_tx.clone();
             tokio::spawn(async move {
-                mining_loop(chain, identity, handle, chain_path2, pool, interval).await;
+                mining_loop(chain, identity, handle, chain_path2, pool, interval, block_tx2).await;
             });
         }
 
@@ -267,6 +271,8 @@ impl Node {
             let pool = pool.clone();
             let signals = signals.clone();
             let signal_tx = signal_tx.clone();
+            let block_tx3 = block_tx.clone();
+            let tx_tx3 = tx_tx.clone();
             let atlas2 = atlas.clone();
             let data_dir2 = node.config.data_dir.clone();
             let docker2 = docker.clone();
@@ -283,6 +289,8 @@ impl Node {
                     pool,
                     signals,
                     signal_tx,
+                    block_tx3,
+                    tx_tx3,
                     bid_notify_tx,
                     atlas2,
                     data_dir2,
@@ -347,6 +355,9 @@ impl Node {
                     identity,
                     mesh_handle,
                     signals,
+                    signal_tx,
+                    block_tx,
+                    tx_tx,
                     send_nonce,
                     api_port,
                     p2p_port,
@@ -422,6 +433,7 @@ async fn mining_loop(
     chain_path: PathBuf,
     pool: TxPool,
     interval_secs: u64,
+    block_tx: broadcast::Sender<Block>,
 ) {
     let mut ticker =
         tokio::time::interval(std::time::Duration::from_secs(interval_secs));
@@ -458,6 +470,7 @@ async fn mining_loop(
                 if let Err(e) = c.save(&chain_path) {
                     warn!("save chain: {e}");
                 }
+                let _ = block_tx.send(block.clone());
             }
             (c.height(), c.tip_hash())
         };
@@ -483,6 +496,8 @@ async fn mesh_event_loop(
     pool: TxPool,
     signals: SignalRing,
     signal_tx: broadcast::Sender<CellSignal>,
+    block_tx: broadcast::Sender<Block>,
+    tx_tx: broadcast::Sender<Tx>,
     bid_notify_tx: mpsc::Sender<Tx>,
     atlas: Atlas,
     data_dir: PathBuf,
@@ -548,6 +563,7 @@ async fn mesh_event_loop(
                     if let Err(e) = c.save(&chain_path) {
                         warn!("save chain: {e}");
                     }
+                    let _ = block_tx.send(block.clone());
                 } else {
                     warn!(
                         "rejected block {} from mesh (index/hash/diff mismatch)",
@@ -562,6 +578,7 @@ async fn mesh_event_loop(
                         if matches!(tx.kind, TxKind::JobBid { .. }) {
                             let _ = bid_notify_tx.send(tx.clone()).await;
                         }
+                        let _ = tx_tx.send(tx.clone());
                         pool.add(tx).await;
                     }
                     Err(e) => warn!("invalid tx from mesh: {e}"),

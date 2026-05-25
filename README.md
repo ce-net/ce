@@ -205,7 +205,10 @@ See [docs/api.md](docs/api.md) for the complete reference.
 | POST | `/jobs/:id/settle` | Payer co-signs the settlement |
 | DELETE | `/jobs/:id` | Force-stop a container |
 | POST | `/transfer` | Transfer credits to another node |
-| GET | `/signals` | Last 100 validated CEP-1 signals |
+| GET | `/signals` | Last 100 validated CEP-1 signals (snapshot) |
+| GET | `/signals/stream` | SSE push stream — instant signal delivery, no polling |
+| GET | `/blocks/stream` | SSE push stream — every accepted block |
+| GET | `/transactions/stream` | SSE push stream — every accepted transaction |
 | POST | `/signals/send` | Sign and broadcast a CEP-1 signal |
 | GET | `/atlas` | Peer capacity atlas from capacity advertisements |
 | PUT | `/sync/*path` | Upload a file (CE identity auth, must be trusted device) |
