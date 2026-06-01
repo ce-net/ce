@@ -216,7 +216,7 @@ Transfer credits from this node to another node. Builds a `Transfer` tx, adds it
 
 Return the capacity atlas: the latest capacity snapshot received from each peer via CEP-1 capacity signals.
 
-Nodes broadcast capacity every 60 seconds with capabilities `{name: "cpu", version: N}`, `{name: "mem_mb", version: N}`, `{name: "jobs", version: N}`.
+Nodes broadcast capacity every 60 seconds with capabilities `{name: "cpu", version: N}`, `{name: "mem_mb", version: N}`, `{name: "jobs", version: N}`, plus one `{name: "tag:<t>", version: 1}` entry per capability-derived self-tag. Self-tags are objective, node-reported labels describing what work the node can realistically perform — currently `linux`/`macos`/`windows`, `x86_64`/`aarch64`, and conditionally `docker`, `gpu`, `manycore` (≥16 cores), `highmem` (≥32 GB). They are distinct from owner tags in `machines.toml`. Receivers strip the `tag:` prefix and expose the set as `tags`.
 
 **Response** `200 OK`
 ```json
@@ -226,10 +226,13 @@ Nodes broadcast capacity every 60 seconds with capabilities `{name: "cpu", versi
     "cpu_cores": 8,
     "mem_mb": 16384,
     "running_jobs": 3,
-    "last_seen_secs": 1716470400
+    "last_seen_secs": 1716470400,
+    "tags": ["linux", "x86_64", "docker", "gpu"]
   }
 ]
 ```
+
+Self-tags are advertised only while a node is mining (the capacity-broadcast loop runs under the mining gate). The `ce fleet ls` command joins these with owner tags from the local `machines.toml`.
 
 ---
 

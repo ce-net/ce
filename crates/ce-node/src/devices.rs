@@ -11,6 +11,14 @@ pub struct DeviceEntry {
     pub node_id: String,
     /// API address in "host:port" form, e.g. "192.168.1.10:8080".
     pub addr: String,
+    /// Owner-assigned organizational tags (e.g. "build", "home", "primary").
+    ///
+    /// These are subjective labels you attach locally to organize and select
+    /// your own devices. They are distinct from the capability-derived self-tags
+    /// a node advertises on the mesh (`gpu`, `docker`, `linux`, ...), which describe
+    /// what work a node can realistically perform and are read from the atlas.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// The full device registry, serialised as TOML.
@@ -41,10 +49,31 @@ impl Devices {
     }
 
     pub fn add(&mut self, name: &str, node_id: NodeId, addr: &str) {
+        // Preserve any tags already set for this name (re-adding should not wipe them).
+        let tags = self.devices.get(name).map(|e| e.tags.clone()).unwrap_or_default();
         self.devices.insert(
             name.to_string(),
-            DeviceEntry { node_id: hex::encode(node_id), addr: addr.to_string() },
+            DeviceEntry { node_id: hex::encode(node_id), addr: addr.to_string(), tags },
         );
+    }
+
+    /// Add one or more owner tags to an existing device. Duplicates are ignored.
+    pub fn add_tags(&mut self, name: &str, tags: &[String]) -> Result<()> {
+        let entry = self.devices.get_mut(name).ok_or_else(|| anyhow!("unknown device '{name}'"))?;
+        for t in tags {
+            if !entry.tags.iter().any(|e| e == t) {
+                entry.tags.push(t.clone());
+            }
+        }
+        entry.tags.sort();
+        Ok(())
+    }
+
+    /// Remove one or more owner tags from an existing device.
+    pub fn remove_tags(&mut self, name: &str, tags: &[String]) -> Result<()> {
+        let entry = self.devices.get_mut(name).ok_or_else(|| anyhow!("unknown device '{name}'"))?;
+        entry.tags.retain(|e| !tags.iter().any(|t| t == e));
+        Ok(())
     }
 
     /// Remove a device by name. Returns true if it existed.
@@ -74,6 +103,22 @@ impl Devices {
                 let bytes = hex::decode(&entry.node_id).ok()?;
                 let arr: [u8; 32] = bytes.try_into().ok()?;
                 Some((name.clone(), arr, entry.addr.clone()))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Like `list`, but also returns each device's owner tags. Sorted by name.
+    /// Used by the `ce fleet` view, which joins these with mesh self-tags.
+    pub fn entries(&self) -> Vec<(String, NodeId, String, Vec<String>)> {
+        let mut out: Vec<(String, NodeId, String, Vec<String>)> = self
+            .devices
+            .iter()
+            .filter_map(|(name, entry)| {
+                let bytes = hex::decode(&entry.node_id).ok()?;
+                let arr: [u8; 32] = bytes.try_into().ok()?;
+                Some((name.clone(), arr, entry.addr.clone(), entry.tags.clone()))
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -187,6 +232,33 @@ mod tests {
         let (nid, addr) = loaded.get("desktop").unwrap();
         assert_eq!(nid, id1.node_id());
         assert_eq!(addr, "192.168.1.10:8080");
+    }
+
+    #[test]
+    fn tags_add_dedup_remove_and_persist() {
+        let dir = tmpdir("tags");
+        let path = dir.join("machines.toml");
+        let id = make_identity("tags-id");
+
+        let mut d = Devices::default();
+        d.add("desktop", id.node_id(), "10.0.0.1:8844");
+        d.add_tags("desktop", &["gpu".into(), "build".into(), "gpu".into()]).unwrap();
+        // Duplicate "gpu" collapses; tags are sorted.
+        assert_eq!(d.entries()[0].3, vec!["build".to_string(), "gpu".to_string()]);
+
+        // Re-adding the same device preserves tags.
+        d.add("desktop", id.node_id(), "10.0.0.2:8844");
+        assert_eq!(d.entries()[0].3, vec!["build".to_string(), "gpu".to_string()]);
+
+        d.remove_tags("desktop", &["build".into()]).unwrap();
+        assert_eq!(d.entries()[0].3, vec!["gpu".to_string()]);
+
+        // Tagging an unknown device errors.
+        assert!(d.add_tags("ghost", &["x".into()]).is_err());
+
+        d.save(&path).unwrap();
+        let loaded = Devices::load(&path).unwrap();
+        assert_eq!(loaded.entries()[0].3, vec!["gpu".to_string()]);
     }
 
     #[test]

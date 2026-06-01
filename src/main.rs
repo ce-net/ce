@@ -88,6 +88,15 @@ enum Commands {
         #[command(subcommand)]
         command: DevicesCommands,
     },
+    /// View and organize your device fleet by tag.
+    ///
+    /// Combines owner tags (from machines.toml) with capability self-tags a node
+    /// advertises on the mesh (gpu, docker, linux, ...), read from the local node's atlas.
+    /// Example: ce fleet ls --select gpu
+    Fleet {
+        #[command(subcommand)]
+        command: FleetCommands,
+    },
     /// Sync files to a remote device.
     ///
     /// Destination format: <device-name>:<remote-path>
@@ -209,6 +218,9 @@ enum DevicesCommands {
         /// API address (host:port). If omitted, you will be prompted interactively.
         #[arg(long)]
         addr: Option<String>,
+        /// Owner tag to attach (repeatable): --tag build --tag home
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
     /// List all registered devices.
     Ls,
@@ -216,6 +228,37 @@ enum DevicesCommands {
     Revoke {
         /// Device name to remove.
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FleetCommands {
+    /// List devices with their owner tags and live capability self-tags.
+    Ls {
+        /// Only show devices carrying this tag (matches owner tags or mesh self-tags).
+        #[arg(long)]
+        select: Option<String>,
+        /// Local node API port to read the atlas from.
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// Attach one or more owner tags to a device.
+    ///
+    /// Example: ce fleet tag desktop build gpu
+    Tag {
+        /// Device name.
+        name: String,
+        /// Tags to add.
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Remove one or more owner tags from a device.
+    Untag {
+        /// Device name.
+        name: String,
+        /// Tags to remove.
+        #[arg(required = true)]
+        tags: Vec<String>,
     },
 }
 
@@ -567,7 +610,7 @@ async fn main() -> Result<()> {
         Commands::Devices { command } => {
             let path = devices_path(&data_dir);
             match command {
-                DevicesCommands::Add { name, node_id, addr } => {
+                DevicesCommands::Add { name, node_id, addr, tags } => {
                     use std::io::{BufRead, Write};
 
                     let node_id_hex = match node_id {
@@ -600,17 +643,22 @@ async fn main() -> Result<()> {
 
                     let mut devices = Devices::load_or_empty(&path);
                     devices.add(&name, node_id, &addr_str);
+                    if !tags.is_empty() {
+                        devices.add_tags(&name, &tags)?;
+                    }
                     devices.save(&path)?;
                     println!("Added device '{name}'.");
                 }
                 DevicesCommands::Ls => {
                     let devices = Devices::load_or_empty(&path);
-                    let list = devices.list();
+                    let list = devices.entries();
                     if list.is_empty() {
                         println!("No devices registered. Use `ce devices add <name>`.");
                     } else {
-                        for (name, node_id, addr) in &list {
-                            println!("{name:<16}  {}  {addr}", hex::encode(node_id));
+                        for (name, node_id, addr, tags) in &list {
+                            let tag_str =
+                                if tags.is_empty() { String::new() } else { format!("  [{}]", tags.join(", ")) };
+                            println!("{name:<16}  {}  {addr}{tag_str}", hex::encode(node_id));
                         }
                     }
                 }
@@ -621,6 +669,81 @@ async fn main() -> Result<()> {
                         println!("Revoked device '{name}'.");
                     } else {
                         println!("Device '{name}' not found.");
+                    }
+                }
+            }
+        }
+
+        Commands::Fleet { command } => {
+            let path = devices_path(&data_dir);
+            match command {
+                FleetCommands::Tag { name, tags } => {
+                    let mut devices = Devices::load_or_empty(&path);
+                    devices.add_tags(&name, &tags)?;
+                    devices.save(&path)?;
+                    println!("Tagged '{name}' with [{}].", tags.join(", "));
+                }
+                FleetCommands::Untag { name, tags } => {
+                    let mut devices = Devices::load_or_empty(&path);
+                    devices.remove_tags(&name, &tags)?;
+                    devices.save(&path)?;
+                    println!("Removed [{}] from '{name}'.", tags.join(", "));
+                }
+                FleetCommands::Ls { select, api_port } => {
+                    let devices = Devices::load_or_empty(&path);
+                    let entries = devices.entries();
+                    if entries.is_empty() {
+                        println!("No devices registered. Use `ce devices add <name>`.");
+                        return Ok(());
+                    }
+
+                    // Best-effort: read live capability self-tags from the local node's atlas.
+                    // node_id (hex) -> self-tags. Empty if the node is not running.
+                    let mut self_tags: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+                    let url = format!("http://127.0.0.1:{api_port}/atlas");
+                    match reqwest::Client::new().get(&url).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(atlas) = resp.json::<serde_json::Value>().await {
+                                for e in atlas.as_array().map(|v| v.as_slice()).unwrap_or(&[]) {
+                                    if let Some(id) = e["node_id"].as_str() {
+                                        let tags = e["tags"]
+                                            .as_array()
+                                            .map(|a| {
+                                                a.iter()
+                                                    .filter_map(|t| t.as_str().map(String::from))
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        self_tags.insert(id.to_string(), tags);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            eprintln!(
+                                "note: local node not reachable on :{api_port} — showing owner tags only \
+                                 (capability self-tags need a running `ce start`)."
+                            );
+                        }
+                    }
+
+                    println!("{:<16}  {:<16}  {:<24}  capabilities", "NAME", "NODE", "OWNER TAGS");
+                    for (name, node_id, _addr, owner_tags) in &entries {
+                        let id_hex = hex::encode(node_id);
+                        let caps = self_tags.get(&id_hex).cloned().unwrap_or_default();
+
+                        // --select matches either an owner tag or a capability self-tag.
+                        if let Some(sel) = &select {
+                            let hit = owner_tags.iter().any(|t| t == sel) || caps.iter().any(|t| t == sel);
+                            if !hit {
+                                continue;
+                            }
+                        }
+
+                        let owners = if owner_tags.is_empty() { "-".into() } else { owner_tags.join(", ") };
+                        let cap_str = if caps.is_empty() { "-".into() } else { caps.join(", ") };
+                        println!("{name:<16}  {:<16}  {owners:<24}  {cap_str}", &id_hex[..16]);
                     }
                 }
             }

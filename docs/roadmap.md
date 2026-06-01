@@ -29,8 +29,9 @@ These are the same system from two angles. The identity primitive that lets untr
 | `ce-container` | ✅ Complete | gVisor detection, CPU/memory/network limits, image pull, wait-for-exit, stop_job |
 | `ce-node` | ✅ Complete | Mining loop, mesh event loop, job manager, heartbeat loop (30s), capacity broadcast (60s), atlas, signal ring buffer, tx pool, nonce replay prevention |
 | HTTP API | ✅ Complete | /jobs/bid, /jobs (list), /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /transfer, /status, /signals, /signals/send, /health, /atlas, /sync/*, /exec, /bootstrap, /mesh-exec, /mesh-sync |
-| CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, devices (add/ls/revoke — inline node-id support), sync, exec, deploy, ps, kill, fund, run |
-| Device registry | ✅ Complete | machines.toml, trusted device management, CE identity auth for sync/exec |
+| CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, devices (add/ls/revoke — inline node-id support, `--tag`), fleet (ls/tag/untag), sync, exec, deploy, ps, kill, fund, run |
+| Device registry | ✅ Complete | machines.toml, trusted device management, CE identity auth for sync/exec, owner tags |
+| Fleet categorization | ✅ Complete | Owner tags in machines.toml + capability-derived self-tags advertised on the mesh (`gpu`, `docker`, `linux`, `manycore`, `highmem`, ...). `ce fleet ls [--select TAG]` joins both. Tags are the selector surface scoped grants target. |
 | `ce-deploy` | ✅ Complete | Hetzner provisioning, SSH deploy, E2E tests |
 | Integration tests | ✅ Complete | single node mines, two nodes sync, tx pool propagates, API health/status, signal propagation, job lifecycle (requires Docker, skipped by default) |
 | Chain persistence | ✅ Complete | bincode+zstd (level 3) storage (~8x smaller than JSON), O(1) tip validation, checkpoint pruning, JSON migration on first load |

@@ -42,6 +42,11 @@ pub struct PeerCapacity {
     pub mem_mb: u32,
     pub running_jobs: u32,
     pub last_seen_secs: u64,
+    /// Capability-derived self-tags the node advertises (e.g. "gpu", "docker",
+    /// "linux", "x86_64", "manycore", "highmem"). These describe what work the
+    /// node can realistically perform and let any peer select hosts by capability.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Atlas: maps NodeId → latest capacity snapshot. Updated from incoming CEP-1 capacity signals.
@@ -198,6 +203,7 @@ impl Node {
         let chain = spawn_chain_actor(raw_chain);
 
         let docker = Docker::connect_with_socket_defaults().ok();
+        let docker_available = docker.is_some();
         if docker.is_none() {
             warn!("Docker unavailable — exec RPCs and job routes will be disabled");
         }
@@ -340,7 +346,8 @@ impl Node {
             let job_store2 = job_store.clone();
             let send_nonce2 = send_nonce.clone();
             tokio::spawn(async move {
-                capacity_broadcast_loop(identity2, handle2, job_store2, send_nonce2).await;
+                capacity_broadcast_loop(identity2, handle2, job_store2, send_nonce2, docker_available)
+                    .await;
             });
         }
 
@@ -1267,12 +1274,15 @@ async fn capacity_broadcast_loop(
     mesh_handle: MeshHandle,
     job_store: JobStore,
     send_nonce: Arc<AtomicU64>,
+    docker_available: bool,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
     ticker.tick().await;
 
     let cpu_cores = num_cpus() as u32;
     let mem_mb = available_mem_mb();
+    let self_tags = capability_tags(docker_available, cpu_cores, mem_mb);
+    info!("node self-tags: {}", self_tags.join(", "));
 
     loop {
         ticker.tick().await;
@@ -1282,11 +1292,16 @@ async fn capacity_broadcast_loop(
             store.values().filter(|r| matches!(r.status, CeJobStatus::Running)).count() as u32
         };
 
-        let capabilities = vec![
+        let mut capabilities = vec![
             Capability { name: "cpu".into(), version: cpu_cores },
             Capability { name: "mem_mb".into(), version: mem_mb },
             Capability { name: "jobs".into(), version: running_jobs },
         ];
+        // Advertise self-tags as `tag:<name>` capabilities. This rides the existing
+        // CEP-1 capability list — no wire-format change — and peers strip the prefix.
+        for t in &self_tags {
+            capabilities.push(Capability { name: format!("tag:{t}"), version: 1 });
+        }
 
         let nonce = send_nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let signal = CellSignal::build(
@@ -1311,12 +1326,17 @@ fn parse_capacity_signal(signal: &CellSignal) -> Option<PeerCapacity> {
     let mut cpu = None;
     let mut mem = None;
     let mut jobs = None;
+    let mut tags = Vec::new();
     for cap in &signal.capabilities {
         match cap.name.as_str() {
             "cpu"    => cpu  = Some(cap.version),
             "mem_mb" => mem  = Some(cap.version),
             "jobs"   => jobs = Some(cap.version),
-            _ => {}
+            other => {
+                if let Some(t) = other.strip_prefix("tag:") {
+                    tags.push(t.to_string());
+                }
+            }
         }
     }
     let (cpu_cores, mem_mb) = cpu.zip(mem)?;
@@ -1324,7 +1344,45 @@ fn parse_capacity_signal(signal: &CellSignal) -> Option<PeerCapacity> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    Some(PeerCapacity { cpu_cores, mem_mb, running_jobs: jobs.unwrap_or(0), last_seen_secs })
+    Some(PeerCapacity { cpu_cores, mem_mb, running_jobs: jobs.unwrap_or(0), last_seen_secs, tags })
+}
+
+/// Capability-derived tags this node advertises so any peer can select hosts by
+/// what they can realistically do. Objective and self-reported — distinct from the
+/// owner-assigned tags in machines.toml. Additive: new tags can be introduced without
+/// breaking older nodes, which simply ignore tags they do not recognize.
+fn capability_tags(docker_available: bool, cpu_cores: u32, mem_mb: u32) -> Vec<String> {
+    let mut tags = vec![
+        std::env::consts::OS.to_string(),   // "linux" | "macos" | "windows"
+        std::env::consts::ARCH.to_string(), // "x86_64" | "aarch64" | ...
+    ];
+    if docker_available {
+        tags.push("docker".into());
+    }
+    if has_gpu() {
+        tags.push("gpu".into());
+    }
+    if cpu_cores >= 16 {
+        tags.push("manycore".into());
+    }
+    if mem_mb >= 32_768 {
+        tags.push("highmem".into());
+    }
+    tags
+}
+
+/// Best-effort NVIDIA GPU detection. Linux-only for now (checks the driver node);
+/// other platforms report no GPU until detection is added.
+fn has_gpu() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/proc/driver/nvidia/version").exists()
+            || std::path::Path::new("/dev/nvidia0").exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 fn num_cpus() -> usize {
@@ -1357,5 +1415,59 @@ fn tx_burn_amount(tx: &Tx) -> Option<u64> {
         TxKind::JobSettle { cost, .. } => Some(*cost),
         TxKind::Heartbeat { amount, .. } => Some(*amount),
         TxKind::JobExpire { .. } | TxKind::TrustGrant { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod capability_tag_tests {
+    use super::*;
+    use ce_protocol::CellAddress;
+
+    #[test]
+    fn capability_tags_reflect_resources() {
+        // Always reports OS and ARCH.
+        let base = capability_tags(false, 1, 1024);
+        assert!(base.contains(&std::env::consts::OS.to_string()));
+        assert!(base.contains(&std::env::consts::ARCH.to_string()));
+        assert!(!base.contains(&"docker".to_string()));
+        assert!(!base.contains(&"manycore".to_string()));
+        assert!(!base.contains(&"highmem".to_string()));
+
+        let big = capability_tags(true, 32, 65_536);
+        assert!(big.contains(&"docker".to_string()));
+        assert!(big.contains(&"manycore".to_string()));
+        assert!(big.contains(&"highmem".to_string()));
+    }
+
+    #[test]
+    fn self_tags_round_trip_through_capacity_signal() {
+        let dir = std::env::temp_dir().join(format!("ce-captag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = Identity::load_or_generate(&dir).unwrap();
+
+        let mut caps = vec![
+            Capability { name: "cpu".into(), version: 8 },
+            Capability { name: "mem_mb".into(), version: 16_384 },
+            Capability { name: "jobs".into(), version: 2 },
+        ];
+        for t in ["gpu", "linux", "docker"] {
+            caps.push(Capability { name: format!("tag:{t}"), version: 1 });
+        }
+
+        let signal = CellSignal::build(
+            identity.node_id(),
+            CellAddress::Broadcast,
+            caps,
+            vec![],
+            None,
+            0,
+            &identity,
+        );
+
+        let parsed = parse_capacity_signal(&signal).expect("capacity parses");
+        assert_eq!(parsed.cpu_cores, 8);
+        assert_eq!(parsed.mem_mb, 16_384);
+        assert_eq!(parsed.running_jobs, 2);
+        assert_eq!(parsed.tags, vec!["gpu".to_string(), "linux".to_string(), "docker".to_string()]);
     }
 }
