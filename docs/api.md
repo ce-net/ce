@@ -1,6 +1,6 @@
 # CE HTTP API
 
-Base URL: `http://localhost:8080` (configurable via `--api-port`)
+Base URL: `http://localhost:8844` (configurable via `--api-port`)
 
 All request and response bodies are JSON. All responses include a `Content-Type: application/json` header.
 
@@ -143,7 +143,7 @@ a `JobSettle` tx.
 | Field | Type | Description |
 |---|---|---|
 | `cost` | integer | Agreed settlement amount in credits (must be ≤ original `bid`) |
-| `payer_sig` | string | Ed25519 signature (128 hex chars) of `payer_settle_bytes(job_id, cost)` using the payer's identity key |
+| `payer_sig` | string | Ed25519 signature (128 hex chars) of `payer_settle_bytes(job_id, host_node_id, cost)` (v2) using the payer's identity key — the host node ID is bound into the signature to prevent settlement hijacking |
 
 The server verifies the payer signature before storing it.
 
@@ -265,7 +265,7 @@ Server-Sent Events stream. Pushes every validated CEP-1 signal to the client the
 
 Connect and keep the connection open:
 ```bash
-curl -N http://localhost:8080/signals/stream
+curl -N http://localhost:8844/signals/stream
 ```
 
 The server sends a keep-alive comment every 15 seconds on idle connections. Disconnect when done.
@@ -284,7 +284,7 @@ data: {"from":"b9c1...","to":"broadcast","capabilities":[...],"payload_hex":"","
 Server-Sent Events stream. Pushes every block accepted by this node (whether locally mined or received from a peer) the instant it is appended to the chain.
 
 ```bash
-curl -N http://localhost:8080/blocks/stream
+curl -N http://localhost:8844/blocks/stream
 ```
 
 **Response** `text/event-stream`
@@ -309,7 +309,7 @@ data: {"index":42,"hash":"a1b2...","prev_hash":"9f0e...","timestamp":1716634800,
 Server-Sent Events stream. Pushes every transaction accepted from the mesh the instant it passes signature verification.
 
 ```bash
-curl -N http://localhost:8080/transactions/stream
+curl -N http://localhost:8844/transactions/stream
 ```
 
 **Response** `text/event-stream`

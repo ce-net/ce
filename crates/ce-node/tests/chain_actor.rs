@@ -821,7 +821,7 @@ async fn actor_settled_on_chain_finds_settle_tx() {
 
     // Block 3: host settles the job — closes the open bid.
     {
-        let settle_bytes = payer_settle_bytes(&job_id, cost);
+        let settle_bytes = payer_settle_bytes(&job_id, &host.node_id(), cost);
         let payer_sig = payer.sign(&settle_bytes);
         let settle_kind = TxKind::JobSettle {
             job_id,

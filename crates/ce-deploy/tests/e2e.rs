@@ -12,7 +12,9 @@
 //!   - Hetzner Cloud API token with read/write access
 //!   - An SSH key already registered in your Hetzner project (CE_SSH_KEY_NAME)
 //!   - The corresponding private key at CE_SSH_KEY_PATH
-//!   - CE binary built for Linux x86_64: `cargo build --release`
+//!   - CE binary built for Linux x86_64 (musl). From macOS:
+//!       cargo build --release --target x86_64-unknown-linux-musl
+//!     Or set CE_BINARY=/path/to/linux-amd64-ce to use a pre-built binary.
 
 use ce_deploy::{Cluster};
 use tokio::time::{sleep, Duration};
@@ -23,18 +25,37 @@ fn env(key: &str) -> String {
 }
 
 fn ce_binary() -> String {
-    // Must be built before running this test.
-    let path = std::env::current_dir()
+    // CE_BINARY env var overrides all path detection.
+    if let Ok(path) = std::env::var("CE_BINARY") {
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "CE_BINARY={path} does not exist"
+        );
+        return path;
+    }
+
+    let workspace = std::env::current_dir()
         .unwrap()
         .ancestors()
-        .find(|p| p.join("target/release/ce").exists())
-        .map(|p| p.join("target/release/ce").to_string_lossy().into_owned())
-        .unwrap_or_else(|| "target/release/ce".into());
+        .find(|p| p.join("Cargo.toml").exists())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+
+    // Prefer the musl static binary (runs on any Linux regardless of glibc version).
+    let musl_path = workspace.join("target/x86_64-unknown-linux-musl/release/ce");
+    if musl_path.exists() {
+        return musl_path.to_string_lossy().into_owned();
+    }
+
+    // Fall back to native target/release/ce (only works if compiled on Linux x86_64).
+    let native_path = workspace.join("target/release/ce");
     assert!(
-        std::path::Path::new(&path).exists(),
-        "CE binary not found at {path} — run `cargo build --release` first"
+        native_path.exists(),
+        "No Linux CE binary found. Build with:\n  \
+         cargo build --release --target x86_64-unknown-linux-musl\n\
+         or set CE_BINARY=/path/to/linux-binary"
     );
-    path
+    native_path.to_string_lossy().into_owned()
 }
 
 // ----- Three-node cluster tests -----

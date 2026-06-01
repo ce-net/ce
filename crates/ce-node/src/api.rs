@@ -218,7 +218,7 @@ async fn job_status(State(state): State<ApiState>, Path(id): Path<String>) -> Re
 pub struct SettleRequest {
     /// Agreed settlement amount in credits.
     pub cost: u64,
-    /// Payer's Ed25519 signature over payer_settle_bytes(job_id, cost), 128 hex chars.
+    /// Payer's Ed25519 signature over payer_settle_bytes(job_id, host, cost) v2, 128 hex chars.
     pub payer_sig: String,
 }
 
@@ -246,8 +246,8 @@ async fn settle_job(
         }
     };
 
-    // Verify the payer co-signature before storing.
-    let bytes = payer_settle_bytes(&job_id, req.cost);
+    // Verify the payer co-signature before storing (host is bound in v2 to prevent sig theft).
+    let bytes = payer_settle_bytes(&job_id, &state.host_node_id, req.cost);
     if verify(&payer, &bytes, &payer_sig).is_err() {
         return err(StatusCode::BAD_REQUEST, "invalid payer signature");
     }

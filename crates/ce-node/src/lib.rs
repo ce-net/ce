@@ -139,6 +139,9 @@ pub struct NodeConfig {
     /// Light nodes use ARCHIVE_DENSITY (~0.15); archive nodes should set 1.0.
     /// Together across all nodes this achieves distributed redundancy of the full history.
     pub archive_density: f64,
+    /// Disable mDNS local peer discovery. Set to true in tests to prevent in-process
+    /// nodes from connecting to any live local ce node via multicast.
+    pub disable_local_discovery: bool,
 }
 
 impl Default for NodeConfig {
@@ -153,6 +156,7 @@ impl Default for NodeConfig {
             mining_interval_secs: 10,
             prune_keep: None,
             archive_density: ce_chain::ARCHIVE_DENSITY,
+            disable_local_discovery: false,
         }
     }
 }
@@ -198,7 +202,11 @@ impl Node {
             warn!("Docker unavailable — exec RPCs and job routes will be disabled");
         }
 
-        let (mesh, mesh_handle, mesh_rx) = Mesh::new(identity.secret_bytes())?;
+        let (mesh, mesh_handle, mesh_rx) = if config.disable_local_discovery {
+            Mesh::new_isolated(identity.secret_bytes())?
+        } else {
+            Mesh::new(identity.secret_bytes())?
+        };
 
         let mut mesh = mesh;
         for peer in &config.bootstrap_peers {
@@ -278,6 +286,7 @@ impl Node {
             let prune_keep = node.config.prune_keep;
             let archive_density = node.config.archive_density;
             let archive_dir2 = node.config.data_dir.join("archive");
+            let disable_local_discovery = node.config.disable_local_discovery;
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain2,
@@ -297,6 +306,7 @@ impl Node {
                     prune_keep,
                     archive_density,
                     archive_dir2,
+                    disable_local_discovery,
                 )
                 .await;
             });
@@ -382,6 +392,10 @@ impl Node {
 
     pub async fn any_burnable_tx(&self) -> Option<([u8; 32], u64)> {
         self.chain.any_burnable_tx().await
+    }
+
+    pub async fn any_burnable_tx_by_self(&self) -> Option<([u8; 32], u64)> {
+        self.chain.any_burnable_tx_by_origin(self.identity.node_id()).await
     }
 
     pub async fn status(&self) -> NodeStatus {
@@ -490,6 +504,7 @@ async fn mesh_event_loop(
     prune_keep: Option<u64>,
     archive_density: f64,
     archive_dir: PathBuf,
+    disable_local_discovery: bool,
 ) {
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
@@ -559,9 +574,24 @@ async fn mesh_event_loop(
                 }
             }
             MeshEvent::PeerHeight { node_id, height, tip_hash, oldest_block } => {
+                let snap = chain.sync_snap().await;
+                // Isolation mode: when running in an isolated test environment
+                // (disable_local_discovery=true), silently discard announcements from peers
+                // claiming a height more than 500 blocks ahead while we are on a fresh chain
+                // (height < 200). This prevents live ce nodes discovered via mDNS from
+                // triggering wasteful sync loops against an unrelated production chain.
+                // We do NOT add such peers to peer_heights so the retry ticker ignores them.
+                if disable_local_discovery && snap.height < 200 && height > snap.height + 500 {
+                    debug!(
+                        "isolation: ignoring height {} from peer {} (we are at {})",
+                        height,
+                        hex::encode(&node_id[..4]),
+                        snap.height,
+                    );
+                    continue;
+                }
                 peer_heights.insert(node_id, height);
                 peer_oldest.insert(node_id, oldest_block);
-                let snap = chain.sync_snap().await;
                 if height > snap.height {
                     let from = if tip_hash != snap.tip_hash && snap.height > 0 {
                         0
@@ -784,6 +814,17 @@ async fn mesh_event_loop(
                         warn!(
                             "dropping signal: burn_proof amount {} does not match on-chain tx",
                             burn.amount,
+                        );
+                        continue;
+                    }
+                    // Prevent burn-proof theft: the tx must have been originated by the
+                    // signal sender. Without this check, any node could copy a tx_id from
+                    // a legitimate signal it observed and send free-riding signals.
+                    if tx.origin != signal.from {
+                        warn!(
+                            "dropping signal: burn_proof tx {} not owned by sender {}",
+                            hex::encode(&burn.tx_id[..4]),
+                            hex::encode(&signal.from[..4]),
                         );
                         continue;
                     }

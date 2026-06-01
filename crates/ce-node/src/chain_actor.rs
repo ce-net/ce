@@ -55,6 +55,9 @@ pub enum ChainCmd {
     SettledOnChain { host: NodeId, reply: oneshot::Sender<Vec<[u8; 32]>> },
     /// Find any tx in chain history with a burnable credit amount (used by tests/signals).
     AnyBurnableTx { reply: oneshot::Sender<Option<([u8; 32], u64)>> },
+    /// Like AnyBurnableTx but restricted to txs where tx.origin == origin.
+    /// Used by tests to avoid picking up txs from foreign chains after a reorg.
+    AnyBurnableTxByOrigin { origin: NodeId, reply: oneshot::Sender<Option<([u8; 32], u64)>> },
     // --- writes ---
     NextBlock { txs: Vec<Tx>, miner: NodeId, reply: oneshot::Sender<Block> },
     Append { block: Block, reply: oneshot::Sender<bool> },
@@ -138,6 +141,12 @@ impl ChainHandle {
     pub async fn any_burnable_tx(&self) -> Option<([u8; 32], u64)> {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::AnyBurnableTx { reply: tx }).await;
+        rx.await.ok().flatten()
+    }
+
+    pub async fn any_burnable_tx_by_origin(&self, origin: NodeId) -> Option<([u8; 32], u64)> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.0.send(ChainCmd::AnyBurnableTxByOrigin { origin, reply: tx }).await;
         rx.await.ok().flatten()
     }
 
@@ -268,6 +277,20 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
                     .iter()
                     .flat_map(|b| &b.transactions)
                     .find_map(|tx| tx_burn_amount(tx).map(|a| (tx.id(), a)));
+                let _ = reply.send(found);
+            }
+            ChainCmd::AnyBurnableTxByOrigin { origin, reply } => {
+                let found = chain
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.transactions)
+                    .find_map(|tx| {
+                        if tx.origin == origin {
+                            tx_burn_amount(tx).map(|a| (tx.id(), a))
+                        } else {
+                            None
+                        }
+                    });
                 let _ = reply.send(found);
             }
             ChainCmd::NextBlock { txs, miner, reply } => {

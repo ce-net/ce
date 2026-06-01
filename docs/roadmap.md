@@ -104,7 +104,22 @@ b"ce-auth-v1 " || METHOD || " " || PATH || " " || timestamp_le_u64 || " " || SHA
 
 `Chain::locked_balance(node)` computes credits locked in open bids (no matching `JobSettle` or `JobExpire`). `Chain::append` validates that the payer's free balance (`balance - locked_balance`) covers each new bid; settle cost must not exceed the original bid. `JobExpire { job_id, payer }` releases locked credits once `EXPIRY_BLOCKS = 1440` have elapsed with no settlement.
 
-### 1c. Chain checkpoints
+### 1c-ext. Chain adversarial hardening (round 2) ✅ Done
+
+Six additional attack vectors found and addressed:
+
+| Attack | Fix |
+|---|---|
+| **Cross-type double-spend (Transfer + JobBid in same block)** | `in_block_transfer` lifted out of inner scope; JobBid free-balance check now subtracts in-block transfers from the same payer |
+| **Cross-type double-spend (Transfer + Heartbeat in same block)** | Heartbeat debit check now subtracts in-block transfers from the same cell |
+| **Block-size bomb** | `MAX_TXS_PER_BLOCK = 1024` added; blocks exceeding this are rejected before signature verification |
+| **Zero-amount transfer chain bloat** | `Transfer { amount: 0 }` now explicitly rejected |
+| **UptimeReward misdirection** | Documented as intentional design (miner chooses recipient, like Bitcoin coinbase); test added |
+| **Rogue host heartbeat drain** | Documented as known limitation (heartbeats not yet bid-gated); tracked for Phase 4 fix requiring bid-acceptance tx |
+
+61 chain unit tests including 14 named adversarial scenarios.
+
+### 1d. Chain checkpoints
 
 Add `Checkpoint` as a block type. Every 1000 blocks, nodes collectively sign the tip hash. Once a checkpoint accumulates signatures from > 50% of known peers, it is broadcast and every node freezes that prefix as immutable.
 
@@ -128,7 +143,7 @@ pub struct Checkpoint {
 ```toml
 [devices.desktop]
 node_id = "8f3a9b..."
-addr    = "192.168.1.10:8080"
+addr    = "192.168.1.10:8844"
 ```
 
 CLI commands implemented:
@@ -195,7 +210,7 @@ Short batch jobs still use JobBid/JobSettle; heartbeats are for long-running cel
 ce deploy <image> [--fund N] [--cpu N] [--mem N] [--duration N] [--cmd CMD...]
 ```
 
-Submits a `JobBid` on the local node's API (default port 8080). Use `--api-port` to override.
+Submits a `JobBid` on the local node's API (default port 8844). Use `--api-port` to override.
 
 ### 3c. Cell management CLI ✅ Done
 
@@ -293,13 +308,13 @@ ce devices add desktop
 ce id                         # copy the "ce node id" line
 
 # On your local machine:
-ce devices add desktop <node-id> --addr 192.168.1.10:8080
+ce devices add desktop <node-id> --addr 192.168.1.10:8844
 ```
 
 ### 5d. Relay as ce-net.com gateway (pending — needs DNS + nginx)
 
 Set up DNS and nginx on the relay to proxy:
-- `ce-net.com/bootstrap` → `localhost:8080/bootstrap`
+- `ce-net.com/bootstrap` → `localhost:8844/bootstrap`
 - `ce-net.com/install` → install script
 
 ```
@@ -560,6 +575,7 @@ Cost: 1000 credits. Duration: 210,000 blocks. Name collision: first-wins per cha
 2. ~~**Node-to-node services** (Phase 2)~~ ✅ Done (device registry, sync push, sandboxed exec; watch + .ceignore + on-chain TrustGrant broadcast planned)
 3. ~~**Credit escrow / JobExpire**~~ ✅ Done
 4. ~~**Heartbeat economy**~~ ✅ Done — 30s heartbeat loop, epoch replay prevention, cell wallet exhaustion terminates container
+4b. ~~**Chain security hardening**~~ ✅ Done — replay attack prevention (tx deduplication), inflation attack fix (one UptimeReward per block), bid-override double-spend fix, heartbeat epoch overflow DoS fix, settlement hijacking fix (payer_sig v2 binds host identity)
 5. ~~**Cell deploy CLI**~~ ✅ Done — `ce deploy`, `ce ps`, `ce kill`, `ce fund`, `ce run`, `GET /jobs`, `POST /transfer`, `GET /atlas`
 6. ~~**Auto-bootstrap from ce-net.com**~~ ✅ Done — `ce start` fetches relay list automatically; `GET /bootstrap` endpoint added; inline `ce devices add <name> <id>` works
 7. ~~**Chain storage optimisation**~~ ✅ Done — bincode+zstd persistence, O(1) tip validation, transparent JSON migration

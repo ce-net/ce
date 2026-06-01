@@ -122,6 +122,11 @@ mod sig_serde {
 /// locked credits. Approximately 24 hours at 10s/block.
 pub const EXPIRY_BLOCKS: u64 = 1440;
 
+/// Maximum transactions per block. Prevents chain-bloat attacks where an adversary packs
+/// a block with thousands of tiny transactions to exhaust storage or gossip bandwidth.
+/// At ~200 bytes/tx this caps a block at ~200 KB, well within the gossip 4 MB limit.
+pub const MAX_TXS_PER_BLOCK: usize = 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TxKind {
     /// Credit transfer between nodes.
@@ -168,11 +173,11 @@ pub enum TxKind {
     Heartbeat { cell: NodeId, host: NodeId, amount: u64, epoch: u64 },
 }
 
-/// Canonical bytes the payer signs to authorize a settlement of `cost` against `job_id`.
-/// Both the host (when building) and the chain (when validating) must produce
-/// identical bytes for the same inputs.
-pub fn payer_settle_bytes(job_id: &[u8; 32], cost: u64) -> Vec<u8> {
-    bincode::serialize(&(b"ce-job-settle-v1", job_id, cost)).unwrap_or_default()
+/// Canonical bytes the payer signs to authorize a settlement of `cost` for `job_id` by `host`.
+/// Binds the authorization to a specific host so a stolen sig cannot be replayed by another node.
+/// Both the host (when building) and the chain (when validating) must produce identical bytes.
+pub fn payer_settle_bytes(job_id: &[u8; 32], host: &NodeId, cost: u64) -> Vec<u8> {
+    bincode::serialize(&(b"ce-job-settle-v2", job_id, host, cost)).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,10 +432,34 @@ impl Chain {
         if !block.verify_seal() {
             return false;
         }
+        // Reject oversized blocks before paying signature-verification cost.
+        if block.transactions.len() > MAX_TXS_PER_BLOCK {
+            return false;
+        }
         for tx in &block.transactions {
             if tx.verify().is_err() {
                 return false;
             }
+        }
+        // Reject duplicate transaction IDs — prevents cross-block replay and within-block copies.
+        {
+            let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+            for tx in &block.transactions {
+                let id = tx.id();
+                if self.tx_index.contains_key(&id) || !seen.insert(id) {
+                    return false;
+                }
+            }
+        }
+        // At most one UptimeReward per block — a miner cannot claim multiple emission events.
+        if block
+            .transactions
+            .iter()
+            .filter(|tx| matches!(tx.kind, TxKind::UptimeReward { .. }))
+            .count()
+            > 1
+        {
+            return false;
         }
         // Each UptimeReward must match the emission schedule.
         for tx in &block.transactions {
@@ -451,6 +480,34 @@ impl Chain {
         if self.total_supply_cache.saturating_add(new_emission) > SUPPLY_CAP {
             return false;
         }
+        // Transfer rules: sender must have enough free balance after accumulating all
+        // in-block debits. Without this check an attacker could pack two Transfer txs
+        // each for the full balance in one block and double-spend.
+        //
+        // Declared outside its validation loop so later sections (JobBid, Heartbeat) can
+        // subtract in-block transfers from the same sender — closing the cross-type
+        // double-spend where a node transfers credits and bids/heartbeats with the same
+        // credits in a single block.
+        let mut in_block_transfer: std::collections::HashMap<NodeId, u64> =
+            std::collections::HashMap::new();
+        for tx in &block.transactions {
+            if let TxKind::Transfer { from, amount, .. } = &tx.kind {
+                // Zero-amount transfers are economically meaningless and bloat the chain.
+                if *amount == 0 {
+                    return false;
+                }
+                // Sender must match tx origin (verified above via tx.verify()).
+                let prior_balance = self.balance(from);
+                let locked = self.locked_balance(from) as i64;
+                let accumulated = *in_block_transfer.get(from).unwrap_or(&0) as i64;
+                let free = prior_balance - locked - accumulated;
+                if free < *amount as i64 {
+                    return false;
+                }
+                *in_block_transfer.entry(*from).or_insert(0) =
+                    in_block_transfer.get(from).unwrap_or(&0).saturating_add(*amount);
+            }
+        }
         // JobBid rules.
         {
             // Envelope: must be signed by the named payer.
@@ -461,15 +518,31 @@ impl Chain {
                     }
                 }
             }
+            // No rebid while open: a second bid for the same job_id would silently overwrite
+            // the open_bids entry, dropping the original credit lock and enabling a double-spend.
+            {
+                let mut in_block_job_ids: std::collections::HashSet<[u8; 32]> =
+                    std::collections::HashSet::new();
+                for tx in &block.transactions {
+                    if let TxKind::JobBid { job_id, .. } = &tx.kind {
+                        if self.open_bids.contains_key(job_id) || !in_block_job_ids.insert(*job_id) {
+                            return false;
+                        }
+                    }
+                }
+            }
             // Free-balance check: payer must have enough un-locked credits to cover the bid.
             // Accumulate within this block to prevent double-bidding in a single block.
+            // Also subtract in-block transfers: a payer cannot transfer away credits and
+            // then bid with those same credits in the same block (cross-type double-spend).
             let mut in_block_bid: std::collections::HashMap<NodeId, u64> =
                 std::collections::HashMap::new();
             for tx in &block.transactions {
                 if let TxKind::JobBid { payer, bid, .. } = &tx.kind {
                     let already_locked = self.locked_balance(payer) as i64;
                     let in_block = *in_block_bid.get(payer).unwrap_or(&0) as i64;
-                    let free = self.balance(payer) - already_locked - in_block;
+                    let transferred = *in_block_transfer.get(payer).unwrap_or(&0) as i64;
+                    let free = self.balance(payer) - already_locked - in_block - transferred;
                     if free < *bid as i64 {
                         return false;
                     }
@@ -492,8 +565,8 @@ impl Chain {
                 if payer == host {
                     return false;
                 }
-                // Payer co-signature over (job_id, cost).
-                let bytes = payer_settle_bytes(job_id, *cost);
+                // Payer co-signature over (job_id, host, cost) — host is bound to prevent sig theft.
+                let bytes = payer_settle_bytes(job_id, host, *cost);
                 if verify(payer, &bytes, payer_sig).is_err() {
                     return false;
                 }
@@ -564,6 +637,10 @@ impl Chain {
                     if cell == host {
                         return false;
                     }
+                    // epoch=u64::MAX would permanently block future heartbeats for this pair.
+                    if *epoch == u64::MAX {
+                        return false;
+                    }
                     // Epoch must be strictly greater than the last confirmed for this pair.
                     let chain_last = self.last_heartbeat_epoch(cell, host);
                     let in_block_last = in_block_epochs.get(&(*cell, *host)).copied();
@@ -574,10 +651,12 @@ impl Chain {
                         }
                     }
                     in_block_epochs.insert((*cell, *host), *epoch);
-                    // Cell balance must cover the heartbeat.
+                    // Cell balance must cover heartbeat + any credits the cell transferred
+                    // away earlier in this same block (cross-type double-spend defence).
                     let prior_balance = self.balance(cell);
-                    let accumulated = *heartbeat_debits.get(cell).unwrap_or(&0) as i64;
-                    if prior_balance - accumulated < *amount as i64 {
+                    let hb_accumulated = *heartbeat_debits.get(cell).unwrap_or(&0) as i64;
+                    let transferred = *in_block_transfer.get(cell).unwrap_or(&0) as i64;
+                    if prior_balance - hb_accumulated - transferred < *amount as i64 {
                         return false;
                     }
                     *heartbeat_debits.entry(*cell).or_insert(0) += amount;
@@ -1187,7 +1266,7 @@ mod tests {
         job_id: [u8; 32],
         cost: u64,
     ) -> Tx {
-        let payer_sig = payer.sign(&payer_settle_bytes(&job_id, cost));
+        let payer_sig = payer.sign(&payer_settle_bytes(&job_id, &host.node_id(), cost));
         let kind = TxKind::JobSettle {
             job_id,
             host: host.node_id(),
@@ -1328,7 +1407,7 @@ mod tests {
         block.seal(&id);
         assert!(chain.append(block));
 
-        let payer_sig = id.sign(&payer_settle_bytes(&job_id, 50));
+        let payer_sig = id.sign(&payer_settle_bytes(&job_id, &id.node_id(), 50));
         let kind = TxKind::JobSettle {
             job_id,
             host: id.node_id(),
@@ -1709,5 +1788,419 @@ mod tests {
         };
         ghost.seal(&b);
         assert!(!chain.try_reorg(vec![ghost]));
+    }
+
+    // ----- Adversarial / attack scenario tests -----
+
+    // Attack 1: Inflation via duplicate UptimeReward in one block.
+    // A malicious miner packs two UptimeReward txs (for two different node IDs) into one
+    // block. Each reward individually matches emission_rate, so the per-tx check passes,
+    // but the block would emit 2× the scheduled amount. Must be rejected.
+    #[test]
+    fn inflation_attack_two_rewards_same_block() {
+        let miner = make_identity("inf-miner");
+        let second = make_identity("inf-second");
+        let mut chain = Chain::genesis();
+
+        let r1 = signed_uptime_reward(&miner, 1);
+        let r2 = signed_uptime_reward(&second, 1);
+        let mut block = chain.next_block(vec![r1, r2], miner.node_id());
+        block.seal(&miner);
+        assert!(!chain.append(block), "block with two UptimeRewards must be rejected");
+        assert_eq!(chain.height(), 0);
+    }
+
+    // Attack 2: Cross-block transaction replay.
+    // Same signed Transfer (identical bytes → same tx_id) submitted in block 1 and again
+    // in block 2. The payer re-accumulates credits via a reward between them.
+    // The second submission must be rejected even though the sender now has sufficient balance.
+    #[test]
+    fn replay_attack_same_tx_different_blocks() {
+        let miner = make_identity("replay-miner");
+        let victim = make_identity("replay-victim");
+        let mut chain = Chain::genesis();
+
+        // Fund miner with two reward blocks so they have 2 × emission_rate credits.
+        seal_and_append(&mut chain, &miner);
+        seal_and_append(&mut chain, &miner);
+        let balance_after_two_rewards = chain.balance(&miner.node_id());
+        assert!(balance_after_two_rewards > 0);
+
+        // First spend: transfer half to victim. Chain height 3.
+        let spend_amount = 1u64;
+        let transfer = signed_transfer(&miner, victim.node_id(), spend_amount);
+        let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, transfer.clone()], miner.node_id());
+        block.seal(&miner);
+        assert!(chain.append(block), "first transfer must succeed");
+
+        // Mine another block to top up miner's balance again.
+        seal_and_append(&mut chain, &miner);
+
+        // Replay: include the exact same Transfer tx in block 5.
+        let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, transfer], miner.node_id());
+        block.seal(&miner);
+        assert!(!chain.append(block), "replayed tx must be rejected even with sufficient balance");
+    }
+
+    // Attack 3: Within-block transaction duplication.
+    // Two copies of the identical signed tx in one block. The second copy must be rejected.
+    #[test]
+    fn replay_attack_duplicate_tx_within_block() {
+        let miner = make_identity("dup-miner");
+        let victim = make_identity("dup-victim");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &miner, 1_000);
+
+        let transfer = signed_transfer(&miner, victim.node_id(), 100);
+        let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
+        let mut block = chain.next_block(
+            vec![reward, transfer.clone(), transfer],
+            miner.node_id(),
+        );
+        block.seal(&miner);
+        assert!(!chain.append(block), "block with duplicate tx must be rejected");
+    }
+
+    // Attack 4: Heartbeat epoch=u64::MAX — permanent denial-of-service.
+    // A compromised host submits epoch=u64::MAX, making it impossible for any future
+    // heartbeat to satisfy the strictly-greater-than constraint. Must be rejected.
+    #[test]
+    fn heartbeat_epoch_overflow_blocks_future() {
+        let host = make_identity("hb-overflow-host");
+        let cell = make_identity("hb-overflow-cell");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &cell, 10_000);
+
+        let kind = TxKind::Heartbeat {
+            cell: cell.node_id(),
+            host: host.node_id(),
+            amount: 100,
+            epoch: u64::MAX,
+        };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = host.sign(&data);
+        let bad_hb = Tx::new(kind, host.node_id(), sig);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, bad_hb], host.node_id());
+        block.seal(&host);
+        assert!(!chain.append(block), "epoch=u64::MAX heartbeat must be rejected");
+    }
+
+    // Attack 5: Bid-override double-spend.
+    // Payer opens a bid for job A (500 credits locked). In a later block the payer submits
+    // another bid for the SAME job_id. Without protection the second bid overwrites the
+    // open_bids entry, the locked amount drops from 500 to the new bid, and the payer can
+    // spend the difference. Must be rejected.
+    #[test]
+    fn bid_rebid_same_job_id_credit_unlock_rejected() {
+        let host = make_identity("rebid-host");
+        let payer = make_identity("rebid-payer");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 2_000);
+
+        let job_id = [88u8; 32];
+        let bid1 = signed_job_bid(&payer, job_id, 500);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, bid1], host.node_id());
+        block.seal(&host);
+        assert!(chain.append(block));
+        assert_eq!(chain.locked_balance(&payer.node_id()), 500);
+
+        // Attempt rebid for the same job_id.
+        let bid2 = signed_job_bid(&payer, job_id, 100);
+        let reward2 = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block2 = chain.next_block(vec![reward2, bid2], host.node_id());
+        block2.seal(&host);
+        assert!(!chain.append(block2), "rebid for open job_id must be rejected");
+        // Locked balance must be unchanged.
+        assert_eq!(chain.locked_balance(&payer.node_id()), 500);
+    }
+
+    // Attack 6: Settlement hijacking via stolen payer signature.
+    // The payer's co-signature now binds the host identity (payer_settle_bytes v2).
+    // Mallory intercepts Alice's signed authorization and presents herself as the host.
+    // The chain must reject because the payer_sig is over (job_id, real_host, cost),
+    // not (job_id, mallory, cost).
+    #[test]
+    fn settlement_hijack_stolen_payer_sig_rejected() {
+        let real_host = make_identity("hijack-real-host");
+        let mallory = make_identity("hijack-mallory");
+        let payer = make_identity("hijack-payer");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 1_000);
+
+        let job_id = [77u8; 32];
+        let bid = signed_job_bid(&payer, job_id, 500);
+        let reward = signed_uptime_reward(&real_host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, bid], real_host.node_id());
+        block.seal(&real_host);
+        assert!(chain.append(block));
+
+        // Payer signs authorization for the REAL host.
+        let payer_sig = payer.sign(&payer_settle_bytes(&job_id, &real_host.node_id(), 300));
+
+        // Mallory creates a settle naming herself as host, using Alice's stolen sig.
+        let kind = TxKind::JobSettle {
+            job_id,
+            host: mallory.node_id(),
+            payer: payer.node_id(),
+            cpu_ms: 1000,
+            mem_mb: 32,
+            cost: 300,
+            payer_sig,
+        };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = mallory.sign(&data);
+        let bad_settle = Tx::new(kind, mallory.node_id(), sig);
+
+        let reward2 = signed_uptime_reward(&mallory, chain.tip().index + 1);
+        let mut block2 = chain.next_block(vec![reward2, bad_settle], mallory.node_id());
+        block2.seal(&mallory);
+        assert!(!chain.append(block2), "settle hijack with stolen payer sig must be rejected");
+        // Payer's credits must remain locked.
+        assert_eq!(chain.locked_balance(&payer.node_id()), 500);
+    }
+
+    // Attack 7: Shadow chain reorg with inflated rewards.
+    // An attacker builds a longer fork where each block contains two UptimeReward txs.
+    // The fork is 2 blocks longer than the honest chain, so it would win on length,
+    // but every shadow block must be individually valid — the inflation blocks fail
+    // append() and the entire reorg is rejected.
+    #[test]
+    fn shadow_chain_inflation_reorg_rejected() {
+        let honest = make_identity("shadow-honest");
+        let attacker = make_identity("shadow-attacker");
+        let colluder = make_identity("shadow-colluder");
+        let mut chain = Chain::genesis();
+        seal_and_append(&mut chain, &honest);
+        seal_and_append(&mut chain, &honest);
+
+        let fork_base = chain.clone();
+
+        // Build shadow fork: two more blocks, each with two UptimeRewards.
+        let mut shadow_blocks: Vec<Block> = Vec::new();
+        let mut shadow = fork_base.clone();
+        for _ in 0..4 {
+            let next_idx = shadow.tip().index + 1;
+            let r1 = signed_uptime_reward(&attacker, next_idx);
+            let r2 = signed_uptime_reward(&colluder, next_idx);
+            let mut block = shadow.next_block(vec![r1, r2], attacker.node_id());
+            block.seal(&attacker);
+            // Don't push through shadow.append — just collect the blocks.
+            shadow_blocks.push(block);
+            // Manually advance shadow tip for next_block to produce correct prev_hash.
+            shadow.blocks.push(shadow_blocks.last().unwrap().clone());
+        }
+
+        // Shadow fork is 4 blocks from base (longer than 0 from honest), but each block
+        // carries two UptimeRewards — chain.try_reorg must reject the whole fork.
+        assert!(!chain.try_reorg(shadow_blocks), "reorg with inflated blocks must be rejected");
+        assert_eq!(chain.tip().miner, honest.node_id(), "honest chain must be unchanged");
+    }
+
+    // Attack 9: Cross-type in-block double-spend — Transfer + JobBid.
+    // Alice transfers most of her credits to Eve and bids the same amount in the same block.
+    // Before the fix, in_block_transfer was scoped away before the JobBid check, letting the
+    // bid pass. Now the bid check subtracts in-block transfers from the same payer.
+    #[test]
+    fn transfer_and_bid_same_credits_rejected() {
+        let host = make_identity("xtd-host");
+        let alice = make_identity("xtd-alice");
+        let eve = make_identity("xtd-eve");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &alice, 1_000);
+
+        let transfer = signed_transfer(&alice, eve.node_id(), 800);
+        let bid = signed_job_bid(&alice, [42u8; 32], 800);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, transfer, bid], host.node_id());
+        block.seal(&host);
+        assert!(!chain.append(block), "transfer + bid exceeding free balance must be rejected");
+        assert_eq!(chain.balance(&alice.node_id()), 1_000, "alice's balance must be unchanged");
+    }
+
+    // Attack 10: Cross-type in-block double-spend — Transfer + Heartbeat.
+    // Bob (cell) transfers credits away while the host submits a heartbeat charging Bob for
+    // the same credits in one block. Before the fix the heartbeat balance check did not see
+    // the in-block transfer; now it does.
+    //
+    // fund(&mut chain, &bob, 500) yields exactly 1000 credits (emission_rate=1000, one block).
+    // 800 (transfer) + 800 (heartbeat) = 1600 > 1000, so the block must be rejected.
+    #[test]
+    fn transfer_and_heartbeat_same_credits_rejected() {
+        let host = make_identity("xth-host");
+        let bob = make_identity("xth-bob");
+        let eve = make_identity("xth-eve");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &bob, 500); // bob accumulates exactly 1000 credits
+
+        let transfer = signed_transfer(&bob, eve.node_id(), 800);
+        let hb = signed_heartbeat(&host, bob.node_id(), 800, 1);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, transfer, hb], host.node_id());
+        block.seal(&host);
+        assert!(!chain.append(block), "transfer + heartbeat exceeding cell balance must be rejected");
+        assert_eq!(chain.balance(&bob.node_id()), 1_000, "bob's balance must be unchanged");
+    }
+
+    // Attack 11: Block-size bomb — adversary packs more than MAX_TXS_PER_BLOCK transactions.
+    // Each individual tx is valid; the block as a whole is rejected solely on size.
+    // This prevents an attacker from exhausting storage or gossip bandwidth.
+    #[test]
+    fn block_size_bomb_rejected() {
+        let miner = make_identity("bomb-miner");
+        let mut chain = Chain::genesis();
+        // Fund just enough for MAX_TXS_PER_BLOCK × 1-credit transfers.
+        // emission_rate=1000, so 2 blocks suffices for 1024 credits.
+        fund(&mut chain, &miner, MAX_TXS_PER_BLOCK as u64);
+
+        let height_before = chain.height();
+        let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
+        let mut txs = vec![reward];
+        // Fill up to MAX_TXS_PER_BLOCK (reward already counts as one slot).
+        for i in 0..MAX_TXS_PER_BLOCK {
+            let mut to = [0u8; 32];
+            to[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            txs.push(signed_transfer(&miner, to, 1));
+        }
+        // txs.len() == MAX_TXS_PER_BLOCK + 1 (one over the limit).
+        let mut block = chain.next_block(txs, miner.node_id());
+        block.seal(&miner);
+        assert!(!chain.append(block), "block with more than MAX_TXS_PER_BLOCK txs must be rejected");
+        assert_eq!(chain.height(), height_before, "chain height must be unchanged after bomb rejection");
+    }
+
+    // Attack 12: UptimeReward misdirection — miner directs emission to a third-party NodeId.
+    // This is ALLOWED by design (analogous to Bitcoin coinbase payout address being arbitrary).
+    // The test documents this intentional behaviour: the reward recipient is the miner's choice.
+    #[test]
+    fn uptime_reward_misdirection_to_third_party() {
+        let miner = make_identity("redir-miner");
+        let beneficiary = make_identity("redir-beneficiary");
+        let mut chain = Chain::genesis();
+
+        let block_index = chain.tip().index + 1;
+        let amount = Chain::emission_rate(block_index);
+        let kind = TxKind::UptimeReward { node: beneficiary.node_id(), amount, epoch: block_index };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = miner.sign(&data);
+        let reward = Tx::new(kind, miner.node_id(), sig);
+
+        let mut block = chain.next_block(vec![reward], miner.node_id());
+        block.seal(&miner);
+        assert!(chain.append(block), "reward directed to a third party must be accepted");
+        assert_eq!(chain.balance(&miner.node_id()), 0, "miner gets nothing");
+        assert_eq!(
+            chain.balance(&beneficiary.node_id()),
+            amount as i64,
+            "beneficiary receives the full emission"
+        );
+    }
+
+    // Attack 13: Rogue host drains a cell with a Heartbeat when no open bid exists.
+    // The chain currently accepts this — heartbeats are not yet bid-gated because the
+    // open_bids cache does not track which host accepted a given bid (only the payer).
+    // This test documents the known design limitation. A future upgrade should introduce
+    // a bid-acceptance tx that links a specific host to a job_id so heartbeats can be
+    // validated against it.
+    #[test]
+    fn rogue_host_heartbeat_drains_cell_without_bid() {
+        let mallory = make_identity("rogue-mallory");
+        let bob = make_identity("rogue-bob");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &bob, 1_000);
+
+        let hb = signed_heartbeat(&mallory, bob.node_id(), 500, 1);
+        let reward = signed_uptime_reward(&mallory, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, hb], mallory.node_id());
+        block.seal(&mallory);
+        // KNOWN LIMITATION: succeeds without a prior bid; bob is drained without consent.
+        assert!(chain.append(block), "rogue heartbeat accepted — known design limitation");
+        assert_eq!(chain.balance(&bob.node_id()), 500, "bob drained 500 credits by rogue host");
+    }
+
+    // Attack 14: Zero-amount transfer chain bloat.
+    // An attacker floods the chain with zero-credit transfers — valid in isolation but
+    // pointless, and accumulate into unbounded chain growth at no cost to the attacker.
+    // The chain now rejects them explicitly.
+    #[test]
+    fn zero_amount_transfer_rejected() {
+        let miner = make_identity("zero-miner");
+        let victim = make_identity("zero-victim");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &miner, 1_000);
+
+        let kind = TxKind::Transfer { from: miner.node_id(), to: victim.node_id(), amount: 0 };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = miner.sign(&data);
+        let zero_tx = Tx::new(kind, miner.node_id(), sig);
+
+        let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, zero_tx], miner.node_id());
+        block.seal(&miner);
+        assert!(!chain.append(block), "zero-amount transfer must be rejected");
+    }
+
+    // Attack 8: Sybil reorg with double-spend — longest-chain double-spend attempt.
+    // Attacker (Alice) pays Bob on the honest chain, then reveals a longer private fork
+    // that redirects the same credits to Mallory. The reorg succeeds because the fork is
+    // longer and fully valid — this is the expected behavior for any longest-chain rule.
+    // It is NOT a chain bug; it documents that finality requires honest majority mining.
+    // The test verifies: (a) a valid longer fork wins, (b) Bob's payment is erased.
+    #[test]
+    fn sybil_reorg_double_spend_succeeds_with_longer_valid_fork() {
+        let alice = make_identity("ds-alice");
+        let bob = make_identity("ds-bob");
+        let mallory = make_identity("ds-mallory");
+        let mut chain = Chain::genesis();
+
+        // Fund Alice on the shared honest chain.
+        fund(&mut chain, &alice, 1_000);
+
+        // Save the chain at this point — both the honest chain and the shadow fork
+        // will build from here so that try_reorg can find the common ancestor.
+        let fork_base = chain.clone();
+
+        // Honest chain: Alice → Bob 500 (one block above fork_base).
+        let pay_bob = signed_transfer(&alice, bob.node_id(), 500);
+        let reward = signed_uptime_reward(&alice, chain.tip().index + 1);
+        let mut b = chain.next_block(vec![reward, pay_bob], alice.node_id());
+        b.seal(&alice);
+        assert!(chain.append(b));
+        assert_eq!(chain.balance(&bob.node_id()), 500);
+
+        // Shadow fork: three blocks from the same fork_base, so it beats the honest
+        // chain's one block and triggers a reorg.
+        let mut shadow_blocks: Vec<Block> = Vec::new();
+        let mut shadow = fork_base;
+
+        // Shadow block 1: Alice → Mallory 500 instead of Bob.
+        let pay_mallory = signed_transfer(&alice, mallory.node_id(), 500);
+        let reward = signed_uptime_reward(&alice, shadow.tip().index + 1);
+        let mut b1 = shadow.next_block(vec![reward, pay_mallory], alice.node_id());
+        b1.seal(&alice);
+        assert!(shadow.append(b1.clone()));
+        shadow_blocks.push(b1);
+
+        // Shadow blocks 2–3: extend the fork past the honest chain.
+        for _ in 0..2usize {
+            let next_idx = shadow.tip().index + 1;
+            let r = signed_uptime_reward(&mallory, next_idx);
+            let mut blk = shadow.next_block(vec![r], mallory.node_id());
+            blk.seal(&mallory);
+            assert!(shadow.append(blk.clone()));
+            shadow_blocks.push(blk);
+        }
+
+        // Three shadow blocks beat the honest chain's one block — reorg must proceed.
+        assert!(chain.try_reorg(shadow_blocks), "valid longer shadow fork must win");
+        assert_eq!(chain.balance(&bob.node_id()), 0, "Bob's payment erased by reorg");
+        // Mallory gets: 500 (transfer from alice) + 2 × emission_rate (shadow blocks 2–3).
+        let mallory_expected = 500i64
+            + Chain::emission_rate(3) as i64
+            + Chain::emission_rate(4) as i64;
+        assert_eq!(chain.balance(&mallory.node_id()), mallory_expected, "Mallory receives transfer + mining rewards after reorg");
     }
 }

@@ -18,3 +18,6 @@ ce-release-key.secret
 # Personal machine config — stays local, not for the public repo
 LAPTOP_SETUP.txt
 machines.toml
+
+# macOS
+.DS_Store

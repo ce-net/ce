@@ -388,11 +388,33 @@ pub struct Mesh {
     /// Monotonic counter for sync request nonces — prevents gossipsub from deduplicating
     /// identical requests (same from_node + from_height) sent on repeated sync intervals.
     sync_nonce: u64,
+    /// When true, mDNS-discovered local peers are ignored and any peer that connects
+    /// which is NOT in `allowed_peers` is immediately disconnected. Set in tests to
+    /// prevent in-process test nodes from connecting to any live local ce node.
+    disable_local_discovery: bool,
+    /// Peers explicitly permitted when `disable_local_discovery` is true.
+    /// Populated from bootstrap and relay addresses. Empty = allow all (production mode).
+    allowed_peers: std::collections::HashSet<PeerId>,
 }
 
 impl Mesh {
     pub fn new(
         secret_key_bytes: [u8; 32],
+    ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>)> {
+        Self::new_inner(secret_key_bytes, false)
+    }
+
+    /// Like `new`, but disables mDNS peer discovery. Use in tests to prevent
+    /// test nodes from connecting to live local nodes via multicast.
+    pub fn new_isolated(
+        secret_key_bytes: [u8; 32],
+    ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>)> {
+        Self::new_inner(secret_key_bytes, true)
+    }
+
+    fn new_inner(
+        secret_key_bytes: [u8; 32],
+        disable_local_discovery: bool,
     ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>)> {
         let ed_secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(secret_key_bytes)?;
         let ed_kp = libp2p::identity::ed25519::Keypair::from(ed_secret);
@@ -493,6 +515,8 @@ impl Mesh {
             pending_inbound: HashMap::new(),
             next_inbound_id: 0,
             sync_nonce: 0,
+            disable_local_discovery,
+            allowed_peers: std::collections::HashSet::new(),
         };
 
         let handle = MeshHandle { cmd_tx };
@@ -502,6 +526,7 @@ impl Mesh {
     pub fn add_bootstrap(&mut self, addr: &str) -> Result<()> {
         let ma: Multiaddr = addr.parse()?;
         let peer_id = peer_id_from_multiaddr(&ma)?;
+        self.allowed_peers.insert(peer_id);
         self.swarm.behaviour_mut().kademlia.add_address(&peer_id, ma.clone());
         self.swarm.dial(ma)?;
         Ok(())
@@ -512,6 +537,7 @@ impl Mesh {
     pub fn add_relay(&mut self, addr: &str) -> Result<()> {
         let ma: Multiaddr = addr.parse()?;
         let peer_id = peer_id_from_multiaddr(&ma)?;
+        self.allowed_peers.insert(peer_id);
         self.relay_peers.insert(peer_id, ma.clone());
         self.swarm.behaviour_mut().kademlia.add_address(&peer_id, ma.clone());
         self.swarm.dial(ma)?;
@@ -581,10 +607,12 @@ impl Mesh {
             SwarmEvent::Behaviour(CeBehaviourEvent::Mdns(
                 mdns::Event::Discovered(peers)
             )) => {
-                for (peer_id, addr) in peers {
-                    info!("mDNS discovered {peer_id} at {addr}");
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                    let _ = self.swarm.dial(peer_id);
+                if !self.disable_local_discovery {
+                    for (peer_id, addr) in peers {
+                        info!("mDNS discovered {peer_id} at {addr}");
+                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                        let _ = self.swarm.dial(peer_id);
+                    }
                 }
             }
 

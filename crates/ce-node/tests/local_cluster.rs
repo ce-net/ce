@@ -34,6 +34,7 @@ async fn start_node(label: &str, bootstrap: Option<String>) -> (Node, PathBuf) {
         data_dir: dir.clone(),
         api_port: api,
         mine: true,
+        disable_local_discovery: true,
         ..Default::default()
     };
     let node = Node::start(config).await.expect("node start");
@@ -67,6 +68,7 @@ async fn two_nodes_sync() {
         data_dir: dir1.clone(),
         api_port: api1,
         mine: true,
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
@@ -98,6 +100,7 @@ async fn tx_pool_propagates() {
         data_dir: dir1.clone(),
         api_port: api1,
         mine: true,
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
@@ -114,6 +117,7 @@ async fn tx_pool_propagates() {
         data_dir: dir2.clone(),
         api_port: api2,
         mine: true,
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
@@ -142,6 +146,7 @@ async fn api_health_check() {
         data_dir: tmpdir("health"),
         api_port: api,
         mine: true,
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
@@ -164,6 +169,7 @@ async fn api_status_endpoint() {
         data_dir: tmpdir("status"),
         api_port: api,
         mine: true,
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
@@ -200,6 +206,7 @@ async fn api_job_bid_rejects_zero_balance() {
         data_dir: tmpdir("job-reject"),
         api_port: api,
         mine: false, // no mining → balance stays at zero
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
@@ -244,21 +251,22 @@ async fn signal_propagates_between_nodes() {
         data_dir: dir_a.clone(),
         api_port: api_a,
         mine: true,
+        mining_interval_secs: 2,
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
     .unwrap();
 
-    let mut burn: Option<([u8; 32], u64)> = None;
+    // Wait for node A to mine at least one block of its own. With 2s intervals this
+    // takes ~2-4s. We use any_burnable_tx_by_self so reorgs from cross-test node
+    // contamination don't cause us to pick up foreign-chain txs.
     for _ in 0..20 {
         sleep(Duration::from_secs(1)).await;
-        if let Some(b) = node_a.any_burnable_tx().await {
-            burn = Some(b);
+        if node_a.any_burnable_tx_by_self().await.is_some() {
             break;
         }
     }
-    let (burn_tx_id, _burn_amount) =
-        burn.expect("node A failed to mine a burnable tx within the budget");
 
     let bs = bootstrap_addr(&dir_a, p2p_a);
     let (p2p_b, api_b) = alloc_ports();
@@ -268,13 +276,14 @@ async fn signal_propagates_between_nodes() {
         data_dir: tmpdir("signal-b"),
         api_port: api_b,
         mine: false,
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
     .unwrap();
 
     let mut synced = false;
-    for _ in 0..15 {
+    for _ in 0..20 {
         sleep(Duration::from_secs(1)).await;
         let resp: serde_json::Value =
             reqwest::get(format!("http://127.0.0.1:{api_b}/status"))
@@ -291,6 +300,20 @@ async fn signal_propagates_between_nodes() {
         }
     }
     assert!(synced, "node B did not sync node A's chain in time");
+
+    // Wait for a self-owned burnable tx on node A's current chain. We loop because
+    // a reorg from a lingering cross-test node can temporarily invalidate our own
+    // blocks; node A will re-mine a fresh block on the winner chain within 2s.
+    let mut burn_tx_id: Option<[u8; 32]> = None;
+    for _ in 0..15 {
+        if let Some((id, _)) = node_a.any_burnable_tx_by_self().await {
+            burn_tx_id = Some(id);
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    let burn_tx_id = burn_tx_id
+        .expect("node A failed to produce a self-owned burnable tx before signal send");
 
     let client = reqwest::Client::new();
     let body = serde_json::json!({
@@ -309,7 +332,7 @@ async fn signal_propagates_between_nodes() {
     let sent: serde_json::Value = resp.json().await.unwrap();
     let sent_id = sent["id"].as_str().unwrap().to_string();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut saw_it = false;
     while std::time::Instant::now() < deadline {
         let signals: serde_json::Value =
@@ -327,7 +350,7 @@ async fn signal_propagates_between_nodes() {
         }
         sleep(Duration::from_millis(200)).await;
     }
-    assert!(saw_it, "node B did not receive signal id={sent_id} within 5s");
+    assert!(saw_it, "node B did not receive signal id={sent_id} within 10s");
 }
 
 /// Full job lifecycle: bid → container starts → container exits → payer settles →
@@ -362,6 +385,7 @@ async fn job_lifecycle() {
         api_port: api_payer,
         mine: true,
         mining_interval_secs: 2,
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
@@ -388,6 +412,7 @@ async fn job_lifecycle() {
         api_port: api_host,
         mine: true,
         mining_interval_secs: 2,
+        disable_local_discovery: true,
         ..Default::default()
     })
     .await
@@ -469,7 +494,11 @@ async fn job_lifecycle() {
         hex::decode(&job_id_hex).unwrap().try_into().expect("job_id is 32 bytes");
     let cost: u64 = 50; // agreed settlement amount (≤ bid)
     let payer_identity = Identity::load_or_generate(&dir_payer.join("identity")).unwrap();
-    let payer_sig = payer_identity.sign(&payer_settle_bytes(&job_id, cost));
+    let host_node_id: [u8; 32] = hex::decode(&node_host.status().await.node_id)
+        .unwrap()
+        .try_into()
+        .expect("node_id is 32 bytes");
+    let payer_sig = payer_identity.sign(&payer_settle_bytes(&job_id, &host_node_id, cost));
 
     // Submit the settlement to the host node.
     let settle_body = serde_json::json!({
