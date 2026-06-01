@@ -64,6 +64,8 @@ struct ApiState {
     atlas: Atlas,
     /// libp2p listen port — used by GET /bootstrap to build multiaddrs.
     listen_port: u16,
+    /// This node's capability self-tags — what grant selectors are matched against.
+    self_tags: Arc<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -475,6 +477,8 @@ fn verify_device_auth(
     data_dir: &std::path::Path,
     body: &[u8],
     nonce_cache: &NonceCache,
+    required: crate::grants::Permission,
+    self_tags: &[String],
 ) -> Result<NodeId, Response> {
     let from_hex = headers
         .get("x-ce-from")
@@ -535,10 +539,21 @@ fn verify_device_auth(
         return Err(err(StatusCode::UNAUTHORIZED, "invalid CE signature"));
     }
 
-    // Trust check: sender must be in the local device registry.
+    // Authorization: a trusted admin has full scope; otherwise the request must carry a
+    // scoped grant (X-CE-Grant header) covering this action on this workspace.
     let devices = crate::devices::Devices::load_or_empty(&data_dir.join("machines.toml"));
-    if !devices.is_trusted(&from) {
-        return Err(err(StatusCode::FORBIDDEN, "sender is not a trusted device"));
+    let grant = match headers.get("x-ce-grant").and_then(|v| v.to_str().ok()) {
+        Some(token) => match crate::grants::SignedGrant::decode(token) {
+            Ok(g) => Some(g),
+            Err(_) => return Err(err(StatusCode::BAD_REQUEST, "malformed X-CE-Grant")),
+        },
+        None => None,
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    if let Err(reason) =
+        crate::grants::authorize(&devices, self_tags, now, &from, required, grant.as_ref())
+    {
+        return Err(err(StatusCode::FORBIDDEN, reason));
     }
 
     Ok(from)
@@ -560,7 +575,7 @@ async fn sync_put(
     };
 
     if let Err(resp) =
-        verify_device_auth(&headers, "PUT", &path, &state.data_dir, &body_bytes, &state.nonce_cache)
+        verify_device_auth(&headers, "PUT", &path, &state.data_dir, &body_bytes, &state.nonce_cache, crate::grants::Permission::Sync, &state.self_tags)
     {
         return resp;
     }
@@ -610,7 +625,7 @@ async fn sync_get(
     let path = req.uri().path().to_string();
     // GET has no body; sign against empty bytes.
     if let Err(resp) =
-        verify_device_auth(&headers, "GET", &path, &state.data_dir, b"", &state.nonce_cache)
+        verify_device_auth(&headers, "GET", &path, &state.data_dir, b"", &state.nonce_cache, crate::grants::Permission::Sync, &state.self_tags)
     {
         return resp;
     }
@@ -661,7 +676,7 @@ async fn exec_command(State(state): State<ApiState>, headers: HeaderMap, req: Re
     };
 
     if let Err(resp) =
-        verify_device_auth(&headers, "POST", "/exec", &state.data_dir, &body_bytes, &state.nonce_cache)
+        verify_device_auth(&headers, "POST", "/exec", &state.data_dir, &body_bytes, &state.nonce_cache, crate::grants::Permission::Exec, &state.self_tags)
     {
         return resp;
     }
@@ -816,6 +831,9 @@ async fn mesh_exec(State(state): State<ApiState>, Json(req): Json<MeshExecReques
         image: req.image,
         cmd: req.cmd,
         cwd: req.cwd,
+        // The proxy node is itself a trusted admin of the target in the personal-fleet case.
+        // Forwarding a caller-supplied grant through the proxy is a future enhancement.
+        grant: None,
     };
 
     match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
@@ -861,6 +879,7 @@ async fn mesh_sync_put(
         from_node: state.host_node_id,
         path: file_path,
         data: body.to_vec(),
+        grant: None,
     };
 
     match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
@@ -1056,6 +1075,7 @@ pub async fn start(
     data_dir: PathBuf,
     atlas: Atlas,
     docker: Option<Docker>,
+    self_tags: Vec<String>,
 ) -> Result<()> {
     if docker.is_none() {
         tracing::warn!("Docker unavailable — job routes and exec will return 503");
@@ -1080,6 +1100,7 @@ pub async fn start(
         nonce_cache,
         atlas,
         listen_port,
+        self_tags: Arc::new(self_tags),
     };
 
     let app = Router::new()

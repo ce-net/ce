@@ -363,18 +363,26 @@ These endpoints let trusted CE nodes sync files and execute commands. Any CE nod
 
 ### Authentication
 
-Every request to `/sync/*` and `/exec` must include three headers:
+Every request to `/sync/*` and `/exec` must include three headers, plus an optional fourth:
 
 | Header | Value |
 |---|---|
 | `X-CE-From` | Sender's NodeId as 64 hex chars |
 | `X-CE-Timestamp` | Current Unix time in milliseconds (u64) |
 | `X-CE-Sig` | Ed25519 signature (128 hex) over `b"ce-auth-v1 " + method + " " + path + " " + timestamp_le_u64` |
+| `X-CE-Grant` | *(optional)* A scoped capability grant token (hex of bincode `SignedGrant`), from `ce grant`. Required when the sender is not a full-scope admin. |
 
 The receiver validates that:
 1. The timestamp is within ±5 minutes of server time (prevents replay attacks).
 2. The signature is valid for the declared sender key.
-3. The sender's NodeId appears in the local `machines.toml` device registry.
+3. The sender is **authorized** for the action (`Sync` for `/sync/*`, `Exec` for `/exec`):
+   - either the sender's NodeId is a trusted admin in the local `machines.toml` (full scope), or
+   - the request carries an `X-CE-Grant` whose `subject` is the sender, whose `issuer` is a
+     trusted admin on this node, whose signature verifies, which has not expired, whose
+     `permissions` include the action, and whose `selector` matches this node's capability
+     self-tags. Denied requests get `403`; a malformed grant token gets `400`.
+
+See the **Scoped capability grants** section in `docs/roadmap.md` for the full model.
 
 ### PUT /sync/*path
 

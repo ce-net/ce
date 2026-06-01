@@ -6,6 +6,7 @@
 //! (or deliberately broken) CE auth headers.
 
 use ce_identity::Identity;
+use ce_node::grants::{Constraints, Permission, Selector, SignedGrant};
 use ce_node::{auth::make_auth_headers, devices::Devices, Node, NodeConfig};
 use reqwest::StatusCode;
 use std::path::{Path, PathBuf};
@@ -494,6 +495,114 @@ async fn exec_empty_cmd_returns_400() {
     );
     let resp = req.send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scoped capability grants (HTTP enforcement path)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Register `admin` as a trusted admin, then issue a grant from it to `subject`.
+/// `subject` itself is NOT registered — its only authority is the grant.
+fn issue_grant(
+    admin: &Identity,
+    subject: &Identity,
+    perms: Vec<Permission>,
+    selector: Selector,
+) -> SignedGrant {
+    SignedGrant::issue(
+        admin,
+        subject.node_id(),
+        perms,
+        selector,
+        Constraints::default(), // no expiry
+        1,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_with_valid_grant_passes_auth() {
+    let (_node, server_dir, api) = start_node("grant-ok").await;
+    let admin = make_identity("grant-ok-admin");
+    register_device(&server_dir, &admin);
+    let subject = make_identity("grant-ok-subject"); // NOT registered
+
+    // Admin grants the subject exec on any workspace.
+    let token = issue_grant(&admin, &subject, vec![Permission::Exec], Selector::Any).encode();
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "image": "alpine:latest",
+        "cmd": ["echo", "hi"],
+    }))
+    .unwrap();
+    let req = add_auth(
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{api}/exec"))
+            .body(body.clone())
+            .header("content-type", "application/json")
+            .header("X-CE-Grant", &token),
+        &subject,
+        "POST",
+        "/exec",
+        &body,
+    );
+    let resp = req.send().await.unwrap();
+    // The grant must clear authorization. What happens next depends on Docker
+    // availability (200 with output, or 503 without), but it must NOT be denied.
+    assert_ne!(resp.status(), StatusCode::FORBIDDEN, "valid grant must not be denied");
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "valid grant must clear auth");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_with_grant_lacking_permission_returns_403() {
+    let (_node, server_dir, api) = start_node("grant-noperm").await;
+    let admin = make_identity("grant-noperm-admin");
+    register_device(&server_dir, &admin);
+    let subject = make_identity("grant-noperm-subject");
+
+    // Grant covers Sync, but the request is Exec.
+    let token = issue_grant(&admin, &subject, vec![Permission::Sync], Selector::Any).encode();
+
+    let body = serde_json::to_vec(&serde_json::json!({ "image": "alpine:latest", "cmd": ["echo", "hi"] })).unwrap();
+    let req = add_auth(
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{api}/exec"))
+            .body(body.clone())
+            .header("content-type", "application/json")
+            .header("X-CE-Grant", &token),
+        &subject,
+        "POST",
+        "/exec",
+        &body,
+    );
+    let resp = req.send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "grant without exec permission must be denied");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_grant_from_untrusted_issuer_returns_403() {
+    let (_node, server_dir, api) = start_node("grant-badissuer").await;
+    let admin = make_identity("grant-badissuer-admin");
+    register_device(&server_dir, &admin);
+    let subject = make_identity("grant-badissuer-subject");
+    let rogue = make_identity("grant-badissuer-rogue"); // NOT a trusted admin
+
+    // A rogue (untrusted) key signs a grant — must be rejected even though it is well-formed.
+    let token = issue_grant(&rogue, &subject, vec![Permission::Exec], Selector::Any).encode();
+
+    let body = serde_json::to_vec(&serde_json::json!({ "image": "alpine:latest", "cmd": ["echo", "hi"] })).unwrap();
+    let req = add_auth(
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{api}/exec"))
+            .body(body.clone())
+            .header("content-type", "application/json")
+            .header("X-CE-Grant", &token),
+        &subject,
+        "POST",
+        "/exec",
+        &body,
+    );
+    let resp = req.send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "grant from untrusted issuer must be denied");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

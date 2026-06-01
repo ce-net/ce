@@ -29,9 +29,10 @@ These are the same system from two angles. The identity primitive that lets untr
 | `ce-container` | ✅ Complete | gVisor detection, CPU/memory/network limits, image pull, wait-for-exit, stop_job |
 | `ce-node` | ✅ Complete | Mining loop, mesh event loop, job manager, heartbeat loop (30s), capacity broadcast (60s), atlas, signal ring buffer, tx pool, nonce replay prevention |
 | HTTP API | ✅ Complete | /jobs/bid, /jobs (list), /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /transfer, /status, /signals, /signals/send, /health, /atlas, /sync/*, /exec, /bootstrap, /mesh-exec, /mesh-sync |
-| CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, devices (add/ls/revoke — inline node-id support, `--tag`), fleet (ls/tag/untag), sync, exec, deploy, ps, kill, fund, run |
-| Device registry | ✅ Complete | machines.toml, trusted device management, CE identity auth for sync/exec, owner tags |
+| CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, devices (add/ls/revoke — inline node-id support, `--tag`), fleet (ls/tag/untag), grant, sync, exec, deploy, ps, kill, fund, run |
+| Device registry | ✅ Complete | machines.toml, trusted-admin management, CE identity auth for sync/exec, owner tags |
 | Fleet categorization | ✅ Complete | Owner tags in machines.toml + capability-derived self-tags advertised on the mesh (`gpu`, `docker`, `linux`, `manycore`, `highmem`, ...). `ce fleet ls [--select TAG]` joins both. Tags are the selector surface scoped grants target. |
+| Scoped capability grants | ✅ Complete | Generic signed delegation (`Permission` × `Selector` × `Constraints`) replacing binary trust. Enforced at both gates (HTTP `X-CE-Grant`, mesh RPC). `ce grant` issues tokens. On-chain revocation anchor planned. See the security model section. |
 | `ce-deploy` | ✅ Complete | Hetzner provisioning, SSH deploy, E2E tests |
 | Integration tests | ✅ Complete | single node mines, two nodes sync, tx pool propagates, API health/status, signal propagation, job lifecycle (requires Docker, skipped by default) |
 | Chain persistence | ✅ Complete | bincode+zstd (level 3) storage (~8x smaller than JSON), O(1) tip validation, checkpoint pruning, JSON migration on first load |
@@ -50,7 +51,7 @@ The foundation — identity, chain, mesh, protocol, containers, job economy, dis
 
 **`.ceignore` format not yet implemented** — Sync skips a hardcoded set of default patterns (`target/`, `node_modules/`, `.git/objects/`, `*.pyc`, `__pycache__/`, `.DS_Store`). Full `.ceignore` file support (using the `ignore` crate) is planned.
 
-**TrustGrant not broadcast on mesh** — `ce devices add` stores the trust relationship locally in `machines.toml`. Broadcasting a `TrustGrant` tx to the mesh (so other nodes can discover trust) is planned but not yet wired to the CLI.
+**TrustGrant not broadcast on mesh** — `ce devices add` stores the admin trust relationship locally in `machines.toml`. Broadcasting a `TrustGrant` tx to the mesh (so other nodes can discover trust) is planned but not yet wired to the CLI. Note: scoped delegation between principals is already handled by capability grants (see the security model section) — they are signed and bearer-presented, needing no broadcast; only the global *revocation anchor* still wants an on-chain home.
 
 **Transport encryption (TLS) not yet implemented** — CE auth provides authenticity and body integrity but NOT confidentiality. Plain HTTP means file contents are visible on the wire. TLS is required for production use; see security model below.
 
@@ -72,7 +73,32 @@ b"ce-auth-v1 " || METHOD || " " || PATH || " " || timestamp_le_u64 || " " || SHA
 | **Body integrity** | Signature commits to SHA256(body); swapping file contents invalidates it |
 | **Freshness** | Timestamp must be within ±5 minutes of server time |
 | **Replay prevention** | Server tracks last-accepted timestamp per sender; strictly increasing requirement |
-| **Explicit trust** | Sender must appear in `machines.toml` before any request is accepted |
+| **Scoped authorization** | Sender is either a full-scope admin in `machines.toml`, or presents a scoped capability grant (see below). Per-action: `/sync` requires `Sync`, `/exec` requires `Exec` |
+
+### Scoped capability grants
+
+CE's generic delegation primitive — mechanism, not policy. A **grant** is a signed statement by
+which a trusted admin (any node in the enforcing device's `machines.toml`) delegates a *subset* of
+its authority to another principal:
+
+> "I, issuer `O`, authorize subject `P` to perform `{permissions}` on any workspace whose
+> capability self-tags satisfy `selector`, subject to `constraints` (expiry, resource ceilings)."
+
+This is what replaced all-or-nothing trust. The node is the enforcement point — it must decide
+whether to run an incoming exec/sync *before* acting — so verification lives in CE (`ce-node/src/grants.rs`,
+enforced in both `api.rs` for HTTP and `lib.rs::handle_incoming_rpc` for mesh RPC). Products that
+model organizations ("a company workspace": teams, people, sponsored billing UX) are built *on top*
+by minting grants; they do not live in `ce-node`. The analogy is Bitcoin Script (protocol verifies
+the spend condition) vs. wallets/exchanges (apps build the org UX), or OAuth's resource server
+(infrastructure) vs. authorization server (product).
+
+- **Permissions** (generic): `exec`, `sync` (enforced today); `deploy`, `kill`, `status` (reserved for the mesh-routed job path).
+- **Selector**: matched against a device's capability self-tags — `*` / `tag=gpu` / `tag=gpu,linux`. Targeting by tag (not node id) means a grant automatically covers workspaces that later advertise the tag.
+- **Constraints**: `not_after` expiry (enforced); `max_cpu` / `max_mem_mb` / `max_credits` (carried by the mechanism, enforced by the deploy path once it is mesh-routed).
+- **Trust root**: a grant is accepted only if its `issuer` is already a trusted admin on the enforcing device. Your own devices are mutual full-scope admins (no grant needed) and can delegate scoped grants to others.
+- **Transport**: HTTP via the `X-CE-Grant` header; mesh RPC carries it as opaque bincode bytes (keeping `ce-mesh` a pure transport).
+- **CLI**: `ce grant <subject> --perm exec --select tag=gpu --expires 7d` issues a token; the subject uses it with `ce exec --grant <token>` / `ce sync --grant <token>`.
+- **Revocation** (current): short `not_after` expiries, or un-trusting the issuer (invalidates every grant it signed). An on-chain `RevokeGrant` anchor keyed by `(issuer, nonce)` is the planned global mechanism.
 
 ### What SSH provides that CE currently lacks
 

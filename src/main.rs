@@ -1,7 +1,12 @@
 use anyhow::{anyhow, Result};
 use ce_chain::Chain;
 use ce_identity::Identity;
-use ce_node::{auth::make_auth_headers, devices::Devices, Node, NodeConfig};
+use ce_node::{
+    auth::make_auth_headers,
+    devices::Devices,
+    grants::{Constraints, Permission, Selector, SignedGrant},
+    Node, NodeConfig,
+};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use std::net::IpAddr;
@@ -97,6 +102,36 @@ enum Commands {
         #[command(subcommand)]
         command: FleetCommands,
     },
+    /// Issue a scoped capability grant token for another principal.
+    ///
+    /// You (a trusted admin on the target workspaces) delegate a subset of your authority:
+    /// the token lets <subject> perform the given permissions on workspaces matching
+    /// --select, until --expires. Hand the printed token to the subject; they pass it via
+    /// `ce exec --grant <token>` or `ce sync --grant <token>`.
+    ///
+    /// Example: ce grant <node-id> --perm exec --select tag=gpu --expires 7d
+    Grant {
+        /// Subject node ID (64 hex chars) — the principal being authorized. Get it via `ce id`.
+        subject: String,
+        /// Permission to grant (repeatable): exec | sync | deploy | kill | status
+        #[arg(long = "perm", required = true)]
+        perms: Vec<String>,
+        /// Workspace selector matched against capability self-tags: `*`, `tag=gpu`, `tag=gpu,linux`.
+        #[arg(long, default_value = "*")]
+        select: String,
+        /// Expiry as a duration from now (e.g. 7d, 24h, 30m, 3600s). Omit for no expiry.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Max CPU cores a deploy under this grant may request.
+        #[arg(long)]
+        max_cpu: Option<u32>,
+        /// Max memory (MB) a deploy under this grant may request.
+        #[arg(long)]
+        max_mem_mb: Option<u32>,
+        /// Max credits the subject may spend under this grant.
+        #[arg(long)]
+        max_credits: Option<u64>,
+    },
     /// Sync files to a remote device.
     ///
     /// Destination format: <device-name>:<remote-path>
@@ -104,6 +139,10 @@ enum Commands {
     Sync {
         src: String,
         dst: String,
+        /// Scoped capability grant token (from `ce grant`), if you are not a full admin
+        /// on the target. Sent as the X-CE-Grant header.
+        #[arg(long)]
+        grant: Option<String>,
     },
     /// Execute a command on a remote CE node inside a sandboxed container.
     ///
@@ -117,6 +156,10 @@ enum Commands {
         /// Working directory (relative to ~/). Defaults to ~/workspace.
         #[arg(long)]
         cwd: Option<String>,
+        /// Scoped capability grant token (from `ce grant`), if you are not a full admin
+        /// on the target. Sent as the X-CE-Grant header.
+        #[arg(long)]
+        grant: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -260,6 +303,23 @@ enum FleetCommands {
         #[arg(required = true)]
         tags: Vec<String>,
     },
+}
+
+/// Parse a human duration into seconds: `7d`, `24h`, `30m`, `3600s`, or a bare number (seconds).
+fn parse_duration_secs(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('d') => (&s[..s.len() - 1], 86_400),
+        Some('h') => (&s[..s.len() - 1], 3_600),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('s') => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    let v: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("bad duration '{s}' (use e.g. 7d, 24h, 30m, 3600s)"))?;
+    Ok(v * mult)
 }
 
 fn data_dir(override_path: Option<PathBuf>) -> PathBuf {
@@ -749,7 +809,46 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Sync { src, dst } => {
+        Commands::Grant { subject, perms, select, expires, max_cpu, max_mem_mb, max_credits } => {
+            let bytes = hex::decode(&subject).map_err(|_| anyhow!("subject must be 64 hex chars"))?;
+            let subject_id: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow!("subject must be exactly 32 bytes (64 hex chars)"))?;
+
+            let permissions: Vec<Permission> =
+                perms.iter().map(|p| Permission::parse(p)).collect::<Result<_>>()?;
+            let selector = Selector::parse(&select);
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let not_after = match &expires {
+                Some(d) => now + parse_duration_secs(d)?,
+                None => {
+                    eprintln!("warning: grant has no --expires; it is valid until you un-trust the issuer");
+                    0
+                }
+            };
+
+            let constraints = Constraints { not_after, max_cpu, max_mem_mb, max_credits };
+            let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
+            // Nonce names this grant (for future revocation); current time is unique enough per issuer.
+            let nonce = now;
+            let sg = SignedGrant::issue(&identity, subject_id, permissions, selector, constraints, nonce);
+
+            eprintln!("Grant issued by {}", identity.node_id_hex());
+            eprintln!("  subject:     {subject}");
+            eprintln!("  permissions: {}", perms.join(", "));
+            eprintln!("  selector:    {select}");
+            eprintln!(
+                "  expires:     {}",
+                if not_after == 0 { "never".to_string() } else { format!("{not_after} (unix seconds)") }
+            );
+            eprintln!("\nToken (give to subject; use with `ce exec --grant` / `ce sync --grant`):");
+            println!("{}", sg.encode());
+        }
+
+        Commands::Sync { src, dst, grant } => {
             // Parse destination: "device:path"
             let (device_name, remote_path) = dst
                 .split_once(':')
@@ -795,6 +894,9 @@ async fn main() -> Result<()> {
                 for (k, v) in &auth {
                     req = req.header(k, v);
                 }
+                if let Some(token) = &grant {
+                    req = req.header("X-CE-Grant", token);
+                }
 
                 let resp = req.send().await?;
                 if !resp.status().is_success() {
@@ -809,7 +911,7 @@ async fn main() -> Result<()> {
             println!("Synced {synced} files to {device_name}:{remote_path} ({skipped} ignored).");
         }
 
-        Commands::Exec { machine, image, cwd, command } => {
+        Commands::Exec { machine, image, cwd, grant, command } => {
             if command.is_empty() {
                 return Err(anyhow!("specify a command to run, e.g. ce exec desktop --image rust:latest cargo build"));
             }
@@ -832,6 +934,9 @@ async fn main() -> Result<()> {
             let mut req = client.post(&url).body(body_bytes).header("content-type", "application/json");
             for (k, v) in &auth {
                 req = req.header(k, v);
+            }
+            if let Some(token) = &grant {
+                req = req.header("X-CE-Grant", token);
             }
 
             let resp = req.send().await?;

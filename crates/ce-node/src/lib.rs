@@ -2,6 +2,7 @@ mod api;
 pub mod auth;
 pub mod chain_actor;
 pub mod devices;
+pub mod grants;
 
 pub use chain_actor::{ChainHandle, ChainStatusSnap, SyncSnap, spawn_chain_actor};
 
@@ -208,6 +209,11 @@ impl Node {
             warn!("Docker unavailable — exec RPCs and job routes will be disabled");
         }
 
+        // Capability self-tags, computed once and shared by the capacity broadcast (what we
+        // advertise) and both auth enforcement points (what grant selectors match against),
+        // so the advertised set and the enforced set can never diverge.
+        let self_tags = capability_tags(docker_available, num_cpus() as u32, available_mem_mb());
+
         let (mesh, mesh_handle, mesh_rx) = if config.disable_local_discovery {
             Mesh::new_isolated(identity.secret_bytes())?
         } else {
@@ -293,6 +299,7 @@ impl Node {
             let archive_density = node.config.archive_density;
             let archive_dir2 = node.config.data_dir.join("archive");
             let disable_local_discovery = node.config.disable_local_discovery;
+            let self_tags2 = self_tags.clone();
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain2,
@@ -313,6 +320,7 @@ impl Node {
                     archive_density,
                     archive_dir2,
                     disable_local_discovery,
+                    self_tags2,
                 )
                 .await;
             });
@@ -345,8 +353,9 @@ impl Node {
             let handle2 = mesh_handle.clone();
             let job_store2 = job_store.clone();
             let send_nonce2 = send_nonce.clone();
+            let self_tags2 = self_tags.clone();
             tokio::spawn(async move {
-                capacity_broadcast_loop(identity2, handle2, job_store2, send_nonce2, docker_available)
+                capacity_broadcast_loop(identity2, handle2, job_store2, send_nonce2, self_tags2)
                     .await;
             });
         }
@@ -364,6 +373,7 @@ impl Node {
             let data_dir2 = node.config.data_dir.clone();
             let atlas3 = atlas.clone();
             let docker3 = docker.clone();
+            let self_tags3 = self_tags.clone();
             tokio::spawn(async move {
                 if let Err(e) = api::start(
                     chain2,
@@ -382,6 +392,7 @@ impl Node {
                     data_dir2,
                     atlas3,
                     docker3,
+                    self_tags3,
                 )
                 .await
                 {
@@ -512,6 +523,7 @@ async fn mesh_event_loop(
     archive_density: f64,
     archive_dir: PathBuf,
     disable_local_discovery: bool,
+    self_tags: Vec<String>,
 ) {
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
@@ -781,6 +793,7 @@ async fn mesh_event_loop(
                         &data_dir,
                         docker.clone(),
                         mesh_handle.clone(),
+                        &self_tags,
                     );
                 }
             }
@@ -861,35 +874,54 @@ fn handle_incoming_rpc(
     data_dir: &Path,
     docker: Option<Docker>,
     mesh_handle: MeshHandle,
+    self_tags: &[String],
 ) {
+    use crate::grants::{authorize, Permission, SignedGrant};
+
+    // Reject helper: send an Error response and stop.
+    let reject = |msg: String| {
+        let handle = mesh_handle.clone();
+        tokio::spawn(async move {
+            let _ = handle.respond_rpc(correlation_id, RpcResponse::Error(msg)).await;
+        });
+    };
+
     let from_node = request.from_node();
-    let trust_ok = match peer_id_from_node_id(&from_node) {
-        Ok(expected) if expected == from_peer => {
-            let devices = crate::devices::Devices::load_or_empty(
-                &data_dir.join("machines.toml")
-            );
-            devices.is_trusted(&from_node)
-        }
+
+    // 1. libp2p-noise authentication: the claimed NodeId must own the connecting PeerId.
+    match peer_id_from_node_id(&from_node) {
+        Ok(expected) if expected == from_peer => {}
         Ok(_) => {
             warn!("rpc: from_node/from_peer mismatch — dropping");
-            false
+            reject("sender identity mismatch".into());
+            return;
         }
         Err(e) => {
             warn!("rpc: invalid from_node: {e}");
-            false
+            reject("invalid sender identity".into());
+            return;
         }
-    };
+    }
 
-    if !trust_ok {
-        let handle = mesh_handle.clone();
-        tokio::spawn(async move {
-            let _ = handle
-                .respond_rpc(
-                    correlation_id,
-                    RpcResponse::Error("sender is not a trusted device".into()),
-                )
-                .await;
-        });
+    // 2. Scoped authorization: the action this RPC performs, and any grant it carries.
+    let (action, grant_bytes): (Permission, Option<Vec<u8>>) = match &request {
+        RpcRequest::Exec { grant, .. } => (Permission::Exec, grant.clone()),
+        RpcRequest::SyncFile { grant, .. } => (Permission::Sync, grant.clone()),
+        RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
+    };
+    let grant = match grant_bytes.as_deref().map(bincode::deserialize::<SignedGrant>) {
+        Some(Ok(g)) => Some(g),
+        Some(Err(_)) => {
+            reject("malformed grant".into());
+            return;
+        }
+        None => None,
+    };
+    let devices = crate::devices::Devices::load_or_empty(&data_dir.join("machines.toml"));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    if let Err(reason) = authorize(&devices, self_tags, now, &from_node, action, grant.as_ref()) {
+        warn!("rpc: denied {} from {}: {reason}", action.as_str(), hex::encode(&from_node[..4]));
+        reject(reason);
         return;
     }
 
@@ -1274,14 +1306,13 @@ async fn capacity_broadcast_loop(
     mesh_handle: MeshHandle,
     job_store: JobStore,
     send_nonce: Arc<AtomicU64>,
-    docker_available: bool,
+    self_tags: Vec<String>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
     ticker.tick().await;
 
     let cpu_cores = num_cpus() as u32;
     let mem_mb = available_mem_mb();
-    let self_tags = capability_tags(docker_available, cpu_cores, mem_mb);
     info!("node self-tags: {}", self_tags.join(", "));
 
     loop {

@@ -87,6 +87,10 @@ pub enum RpcRequest {
         image: String,
         cmd: Vec<String>,
         cwd: Option<String>,
+        /// Optional scoped capability grant (bincode of `SignedGrant`), used when the
+        /// caller is not a full-scope admin. Opaque to the transport; the receiving node
+        /// decodes and enforces it. `None` means the caller relies on admin trust.
+        grant: Option<Vec<u8>>,
     },
     /// Write a single file on the remote node's home directory.
     /// `path` is relative to `~/` — the receiver rejects any `..` components.
@@ -94,6 +98,8 @@ pub enum RpcRequest {
         from_node: NodeId,
         path: String,
         data: Vec<u8>,
+        /// Optional scoped capability grant (bincode of `SignedGrant`). See `Exec`.
+        grant: Option<Vec<u8>>,
     },
     /// Fetch a historical archive segment from a peer's local archive.
     /// The peer replies with SegmentData if it holds the segment, or Error otherwise.
