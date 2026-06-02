@@ -369,6 +369,22 @@ mod tests {
     }
 
     #[test]
+    fn authorizes_deploy_and_kill_and_isolates_permissions() {
+        let (devices, admin, subject, _stranger) = fixture();
+        // A grant covering Deploy+Kill authorizes both.
+        let g = grant_for(&admin, &subject, vec![Permission::Deploy, Permission::Kill], Selector::Any, 0);
+        assert!(authorize(&devices, &[], 1000, &subject.node_id(), Permission::Deploy, Some(&g)).is_ok());
+        assert!(authorize(&devices, &[], 1000, &subject.node_id(), Permission::Kill, Some(&g)).is_ok());
+        // A Deploy-only grant must not authorize Kill or Exec.
+        let gd = grant_for(&admin, &subject, vec![Permission::Deploy], Selector::Any, 0);
+        assert!(authorize(&devices, &[], 1000, &subject.node_id(), Permission::Kill, Some(&gd)).is_err());
+        assert!(authorize(&devices, &[], 1000, &subject.node_id(), Permission::Exec, Some(&gd)).is_err());
+        // Permission strings round-trip.
+        assert_eq!(Permission::parse("deploy").unwrap(), Permission::Deploy);
+        assert_eq!(Permission::parse("kill").unwrap(), Permission::Kill);
+    }
+
+    #[test]
     fn grant_denies_after_expiry() {
         let (devices, admin, subject, _stranger) = fixture();
         let g = grant_for(&admin, &subject, vec![Permission::Exec], Selector::Any, 500);

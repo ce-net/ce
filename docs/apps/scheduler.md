@@ -123,9 +123,9 @@ The substrate is mostly there; a few primitives would make this app cleaner. The
 - **Stake / bond tx** — a lockable, conditionally-releasable collateral. Candidate CE primitive
   (extends the escrow model), but auto-slash adjudication is hard in a trustless setting — start
   with stake-as-visible-commitment.
-- **Mesh-routed deploy** — today `JobBid` is local; remote job placement over the mesh (so a
-  coordinator can place on any reachable host) is the `Deploy`/`Kill` grant permissions, reserved
-  but not yet wired. Likely needed for full fan-out.
+- ~~**Mesh-routed deploy**~~ ✅ Done — `POST /mesh-deploy` / `/mesh-kill` place and stop a cell on
+  a specific host over `/ce/rpc/1`, `Deploy`/`Kill` grant-enforced, host tracks the job for
+  heartbeat billing. This is the directed-placement primitive the control loop's "place" step uses.
 
 ---
 

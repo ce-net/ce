@@ -638,8 +638,9 @@ with the critical path called out.
 
 ### Substrate gaps the scheduler surfaced (planned)
 
-- **Mesh-routed deploy** — `JobBid` is local-only today; remote placement over `/ce/rpc/1`
-  (the reserved `Deploy`/`Kill` grant permissions) is needed for cross-mesh fan-out.
+- ~~**Mesh-routed deploy**~~ ✅ Done — directed placement on a specific host over `/ce/rpc/1`
+  (`RpcRequest::Deploy`/`Kill`, `Deploy`/`Kill` grant-enforced, `POST /mesh-deploy`/`/mesh-kill`,
+  `ce deploy --on <device>`). The host tracks the job so it is heartbeat-billed and killable.
 - **Reputation read over history** — a read-only `history(node_id)` index over settlements/
   heartbeats/expiries so apps can derive per-relationship trust without a full chain scan.
 - **Stake / bond tx** — lockable, conditionally-released collateral (extends the escrow model)

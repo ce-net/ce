@@ -886,6 +886,123 @@ async fn mesh_exec(State(state): State<ApiState>, Json(req): Json<MeshExecReques
     }
 }
 
+// ----- POST /mesh-deploy -----
+//
+// Directed placement: deploy a long-running cell on a SPECIFIC remote host through the mesh,
+// vs. broadcasting a JobBid to whoever accepts. Returns the host-assigned job_id.
+
+#[derive(Debug, Deserialize)]
+struct MeshDeployRequest {
+    /// CE NodeId of the target host (64 hex chars).
+    node_id: String,
+    /// Optional relay circuit multiaddr dial hint.
+    #[serde(default)]
+    hint_multiaddr: String,
+    image: String,
+    #[serde(default)]
+    cmd: Vec<String>,
+    cpu_cores: u32,
+    mem_mb: u64,
+    duration_secs: u64,
+    /// Funding committed for the cell, in base units (string).
+    #[serde(with = "amount_str")]
+    bid: u128,
+    /// Optional scoped grant token (from `ce grant`), forwarded to the host.
+    #[serde(default)]
+    grant: Option<String>,
+}
+
+/// Decode an optional grant token to RPC-ready bincode bytes; validates the token.
+fn grant_to_bytes(token: &Option<String>) -> Result<Option<Vec<u8>>, Response> {
+    match token {
+        Some(t) => match crate::grants::SignedGrant::decode(t) {
+            Ok(g) => Ok(Some(bincode::serialize(&g).unwrap_or_default())),
+            Err(_) => Err(err(StatusCode::BAD_REQUEST, "malformed grant token")),
+        },
+        None => Ok(None),
+    }
+}
+
+async fn mesh_deploy(State(state): State<ApiState>, Json(req): Json<MeshDeployRequest>) -> Response {
+    let node_id: NodeId = match hex::decode(&req.node_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "`node_id` must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&node_id) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
+    };
+    if req.image.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "image must not be empty");
+    }
+    let grant = match grant_to_bytes(&req.grant) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    if !req.hint_multiaddr.is_empty() {
+        let _ = state.mesh_handle.dial(req.hint_multiaddr).await;
+    }
+
+    let rpc_req = RpcRequest::Deploy {
+        from_node: state.host_node_id,
+        image: req.image,
+        cmd: req.cmd,
+        cpu_cores: req.cpu_cores,
+        mem_mb: req.mem_mb,
+        duration_secs: req.duration_secs,
+        bid: req.bid,
+        grant,
+    };
+
+    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
+        Ok(RpcResponse::Deployed { job_id }) => {
+            (StatusCode::OK, Json(serde_json::json!({ "job_id": job_id }))).into_response()
+        }
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
+        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
+    }
+}
+
+// ----- POST /mesh-kill -----
+
+#[derive(Debug, Deserialize)]
+struct MeshKillRequest {
+    node_id: String,
+    #[serde(default)]
+    hint_multiaddr: String,
+    /// The 64-hex job id returned by /mesh-deploy.
+    job_id: String,
+    #[serde(default)]
+    grant: Option<String>,
+}
+
+async fn mesh_kill(State(state): State<ApiState>, Json(req): Json<MeshKillRequest>) -> Response {
+    let node_id: NodeId = match hex::decode(&req.node_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "`node_id` must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&node_id) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
+    };
+    let grant = match grant_to_bytes(&req.grant) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    if !req.hint_multiaddr.is_empty() {
+        let _ = state.mesh_handle.dial(req.hint_multiaddr).await;
+    }
+
+    let rpc_req = RpcRequest::Kill { from_node: state.host_node_id, job_id: req.job_id, grant };
+    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
+        Ok(RpcResponse::Killed) => StatusCode::NO_CONTENT.into_response(),
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
+        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
+    }
+}
+
 // ----- PUT /mesh-sync/:node_id/*path -----
 //
 // Writes a single file on a remote trusted device through the CE mesh.
@@ -1164,6 +1281,8 @@ pub async fn start(
         .route("/exec", post(exec_command))
         // Personal mesh OS: relay-routed mesh RPCs (correct path for NAT traversal).
         .route("/mesh-exec", post(mesh_exec))
+        .route("/mesh-deploy", post(mesh_deploy))
+        .route("/mesh-kill", post(mesh_kill))
         .route("/mesh-sync/:node_id/*path", put(mesh_sync_put))
         .with_state(state);
 

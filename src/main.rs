@@ -169,6 +169,10 @@ enum Commands {
     Deploy {
         /// Docker image to run.
         image: String,
+        /// Place on a SPECIFIC remote device (by name) via the mesh, instead of broadcasting
+        /// a local bid. Directed placement — what a scheduler uses.
+        #[arg(long)]
+        on: Option<String>,
         /// Credits to fund the job with (decimal allowed, e.g. 1000 or 1.5).
         #[arg(long, default_value = "1000")]
         fund: String,
@@ -181,6 +185,9 @@ enum Commands {
         /// Command override for the container.
         #[arg(short, long)]
         cmd: Vec<String>,
+        /// Scoped grant token (from `ce grant`) when deploying on a host you don't fully own.
+        #[arg(long)]
+        grant: Option<String>,
         #[arg(long, default_value = "8844")]
         api_port: u16,
     },
@@ -196,6 +203,12 @@ enum Commands {
     /// Example: ce kill <job-id>
     Kill {
         job_id: String,
+        /// Kill a job running on a SPECIFIC remote device (by name) via the mesh.
+        #[arg(long)]
+        on: Option<String>,
+        /// Scoped grant token, if killing on a host you don't fully own.
+        #[arg(long)]
+        grant: Option<String>,
         #[arg(long, default_value = "8844")]
         api_port: u16,
     },
@@ -1000,19 +1013,45 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Deploy { image, fund, cpu, mem, duration, cmd, api_port } => {
-            let url = format!("http://127.0.0.1:{api_port}/jobs/bid");
+        Commands::Deploy { image, on, fund, cpu, mem, duration, cmd, grant, api_port } => {
             // Amounts cross JSON as decimal strings of base units (precision-safe).
             let bid_base = parse_credits(&fund)?.to_string();
-            let body = serde_json::json!({
-                "image": image,
-                "cmd": cmd,
-                "cpu_cores": cpu,
-                "mem_mb": mem,
-                "duration_secs": duration,
-                "bid": bid_base,
-            });
             let client = reqwest::Client::new();
+
+            let (url, body) = match &on {
+                // Directed placement: route through the local node's mesh proxy to a specific host.
+                Some(device) => {
+                    let dev_path = devices_path(&data_dir);
+                    let devices = Devices::load_or_empty(&dev_path);
+                    let (node_id, _addr) = devices.get(device)?;
+                    (
+                        format!("http://127.0.0.1:{api_port}/mesh-deploy"),
+                        serde_json::json!({
+                            "node_id": hex::encode(node_id),
+                            "image": image,
+                            "cmd": cmd,
+                            "cpu_cores": cpu,
+                            "mem_mb": mem,
+                            "duration_secs": duration,
+                            "bid": bid_base,
+                            "grant": grant,
+                        }),
+                    )
+                }
+                // Open placement: broadcast a local bid; whoever has capacity accepts.
+                None => (
+                    format!("http://127.0.0.1:{api_port}/jobs/bid"),
+                    serde_json::json!({
+                        "image": image,
+                        "cmd": cmd,
+                        "cpu_cores": cpu,
+                        "mem_mb": mem,
+                        "duration_secs": duration,
+                        "bid": bid_base,
+                    }),
+                ),
+            };
+
             let resp = client.post(&url).json(&body).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1020,7 +1059,11 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("deploy failed ({status}): {text}"));
             }
             let result: serde_json::Value = resp.json().await?;
-            println!("job_id: {}", result["job_id"].as_str().unwrap_or("?"));
+            let job_id = result["job_id"].as_str().unwrap_or("?");
+            match &on {
+                Some(device) => println!("job_id: {job_id}  (deployed on {device})"),
+                None => println!("job_id: {job_id}"),
+            }
         }
 
         Commands::Ps { api_port } => {
@@ -1053,10 +1096,26 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Kill { job_id, api_port } => {
-            let url = format!("http://127.0.0.1:{api_port}/jobs/{job_id}");
+        Commands::Kill { job_id, on, grant, api_port } => {
             let client = reqwest::Client::new();
-            let resp = client.delete(&url).send().await?;
+            let resp = match &on {
+                // Directed: route through the local mesh proxy to a specific host.
+                Some(device) => {
+                    let dev_path = devices_path(&data_dir);
+                    let devices = Devices::load_or_empty(&dev_path);
+                    let (node_id, _addr) = devices.get(device)?;
+                    let body = serde_json::json!({
+                        "node_id": hex::encode(node_id),
+                        "job_id": job_id,
+                        "grant": grant,
+                    });
+                    client.post(format!("http://127.0.0.1:{api_port}/mesh-kill")).json(&body).send().await?
+                }
+                // Local job.
+                None => {
+                    client.delete(format!("http://127.0.0.1:{api_port}/jobs/{job_id}")).send().await?
+                }
+            };
             if resp.status().is_success() {
                 println!("Job {job_id} stopped.");
             } else {

@@ -606,6 +606,54 @@ async fn exec_grant_from_untrusted_issuer_returns_403() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mesh-routed deploy/kill — request validation (single node; no peer/Docker needed,
+// the checks below all happen before any mesh send)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mesh_deploy_bad_node_id_returns_400() {
+    let (_node, _dir, api) = start_node("mdeploy-badid").await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{api}/mesh-deploy"))
+        .json(&serde_json::json!({
+            "node_id": "not-hex",
+            "image": "alpine:latest",
+            "cpu_cores": 1, "mem_mb": 128, "duration_secs": 30,
+            "bid": "100"
+        }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mesh_deploy_malformed_grant_returns_400() {
+    let (_node, _dir, api) = start_node("mdeploy-badgrant").await;
+    // Valid (real) target node id, but a garbage grant token — rejected before any send.
+    let target = make_identity("mdeploy-target");
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{api}/mesh-deploy"))
+        .json(&serde_json::json!({
+            "node_id": hex::encode(target.node_id()),
+            "image": "alpine:latest",
+            "cpu_cores": 1, "mem_mb": 128, "duration_secs": 30,
+            "bid": "100",
+            "grant": "not-a-valid-grant-token"
+        }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mesh_kill_bad_node_id_returns_400() {
+    let (_node, _dir, api) = start_node("mkill-badid").await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{api}/mesh-kill"))
+        .json(&serde_json::json!({ "node_id": "xyz", "job_id": "00" }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Auth module unit-level integration check
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -20,6 +20,7 @@ use ce_mesh::{Mesh, MeshEvent, MeshHandle, RpcRequest, RpcResponse, peer_id_from
 use ce_protocol::{CellSignal, Capability};
 use directories::ProjectDirs;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -300,6 +301,7 @@ impl Node {
             let archive_dir2 = node.config.data_dir.join("archive");
             let disable_local_discovery = node.config.disable_local_discovery;
             let self_tags2 = self_tags.clone();
+            let job_store_m = job_store.clone();
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain2,
@@ -321,6 +323,7 @@ impl Node {
                     archive_dir2,
                     disable_local_discovery,
                     self_tags2,
+                    job_store_m,
                 )
                 .await;
             });
@@ -524,6 +527,7 @@ async fn mesh_event_loop(
     archive_dir: PathBuf,
     disable_local_discovery: bool,
     self_tags: Vec<String>,
+    job_store: JobStore,
 ) {
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
@@ -794,6 +798,8 @@ async fn mesh_event_loop(
                         docker.clone(),
                         mesh_handle.clone(),
                         &self_tags,
+                        our_node_id,
+                        job_store.clone(),
                     );
                 }
             }
@@ -867,6 +873,7 @@ async fn mesh_event_loop(
 
 // ----- Incoming mesh RPC handler -----
 
+#[allow(clippy::too_many_arguments)]
 fn handle_incoming_rpc(
     from_peer: ce_mesh::CePeerId,
     correlation_id: u64,
@@ -875,6 +882,8 @@ fn handle_incoming_rpc(
     docker: Option<Docker>,
     mesh_handle: MeshHandle,
     self_tags: &[String],
+    host_node_id: NodeId,
+    job_store: JobStore,
 ) {
     use crate::grants::{authorize, Permission, SignedGrant};
 
@@ -907,6 +916,8 @@ fn handle_incoming_rpc(
     let (action, grant_bytes): (Permission, Option<Vec<u8>>) = match &request {
         RpcRequest::Exec { grant, .. } => (Permission::Exec, grant.clone()),
         RpcRequest::SyncFile { grant, .. } => (Permission::Sync, grant.clone()),
+        RpcRequest::Deploy { grant, .. } => (Permission::Deploy, grant.clone()),
+        RpcRequest::Kill { grant, .. } => (Permission::Kill, grant.clone()),
         RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
     };
     let grant = match grant_bytes.as_deref().map(bincode::deserialize::<SignedGrant>) {
@@ -989,6 +1000,85 @@ fn handle_incoming_rpc(
             })();
 
             tokio::spawn(async move {
+                let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
+            });
+        }
+        RpcRequest::Deploy { image, cmd, cpu_cores, mem_mb, duration_secs, bid, .. } => {
+            if docker.is_none() {
+                reject("Docker not available on this node".into());
+                return;
+            }
+            let payer = from_node; // the deployer funds and is billed for the cell
+            // Derive a job id from time + payer + image (mirrors the local bid path).
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let job_id: [u8; 32] =
+                Sha256::digest(bincode::serialize(&(ts as u64, payer, image.as_str())).unwrap_or_default())
+                    .into();
+            tokio::spawn(async move {
+                let mgr = match ContainerManager::new(host_node_id).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = mesh_handle
+                            .respond_rpc(correlation_id, RpcResponse::Error(format!("container init: {e}")))
+                            .await;
+                        return;
+                    }
+                };
+                let spec = JobSpec { job_id, image, cmd, env: vec![], cpu_cores, mem_mb, payer };
+                let resp = match mgr.launch_job(&spec).await {
+                    Ok(container_id) => {
+                        // Track it so the heartbeat loop bills it and `ps`/Kill can find it.
+                        // Wallet exhaustion will terminate it (existing mechanism).
+                        job_store.lock().await.insert(
+                            job_id,
+                            JobRecord {
+                                job_id,
+                                payer,
+                                container_id: Some(container_id),
+                                status: CeJobStatus::Running,
+                                payer_sig: None,
+                                cost: None,
+                                bid,
+                                duration_secs,
+                            },
+                        );
+                        info!("mesh deploy: launched job {} for {}", hex::encode(&job_id[..4]), hex::encode(&payer[..4]));
+                        RpcResponse::Deployed { job_id: hex::encode(job_id) }
+                    }
+                    Err(e) => RpcResponse::Error(format!("deploy failed: {e}")),
+                };
+                let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
+            });
+        }
+        RpcRequest::Kill { job_id, .. } => {
+            if docker.is_none() {
+                reject("Docker not available on this node".into());
+                return;
+            }
+            tokio::spawn(async move {
+                // Resolve the 64-hex job id to a tracked container.
+                let container = match hex::decode(&job_id).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+                    Some(id) => job_store.lock().await.get(&id).and_then(|r| r.container_id.clone()),
+                    None => None,
+                };
+                let resp = match container {
+                    Some(cid) => {
+                        let mgr = match ContainerManager::new(host_node_id).await {
+                            Ok(m) => m,
+                            Err(e) => {
+                                let _ = mesh_handle
+                                    .respond_rpc(correlation_id, RpcResponse::Error(format!("container init: {e}")))
+                                    .await;
+                                return;
+                            }
+                        };
+                        match mgr.stop_job(&cid).await {
+                            Ok(()) => RpcResponse::Killed,
+                            Err(e) => RpcResponse::Error(format!("kill failed: {e}")),
+                        }
+                    }
+                    None => RpcResponse::Error("unknown job id on this host".into()),
+                };
                 let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
             });
         }

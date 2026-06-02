@@ -550,3 +550,99 @@ async fn job_lifecycle() {
         "host balance should not decrease: before={host_balance_before} after={host_balance_after}"
     );
 }
+
+// Mesh-routed directed deploy: B asks its local node to place a cell on a SPECIFIC host A
+// over the mesh, then kills it. Requires Docker on host A — run with:
+//   cargo test -p ce-node --test local_cluster mesh_deploy_and_kill_roundtrip -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn mesh_deploy_and_kill_roundtrip() {
+    use ce_node::devices::Devices;
+
+    // Host A — runs the container.
+    let (p2p_a, api_a) = alloc_ports();
+    let dir_a = tmpdir("mdep-host");
+    let _node_a = Node::start(NodeConfig {
+        listen_port: p2p_a,
+        bootstrap_peers: vec![],
+        data_dir: dir_a.clone(),
+        api_port: api_a,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let a_id = Identity::load_or_generate(&dir_a.join("identity")).unwrap().node_id();
+
+    sleep(Duration::from_millis(600)).await;
+
+    // Deployer B — bootstrapped to A.
+    let bs = bootstrap_addr(&dir_a, p2p_a);
+    let (p2p_b, api_b) = alloc_ports();
+    let dir_b = tmpdir("mdep-deployer");
+    let _node_b = Node::start(NodeConfig {
+        listen_port: p2p_b,
+        bootstrap_peers: vec![bs],
+        data_dir: dir_b.clone(),
+        api_port: api_b,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let b_id = Identity::load_or_generate(&dir_b.join("identity")).unwrap().node_id();
+
+    // A trusts B as an admin, so B may deploy without presenting a grant.
+    {
+        let path = dir_a.join("machines.toml");
+        let mut devices = Devices::load_or_empty(&path);
+        devices.add("deployer", b_id, "127.0.0.1:0");
+        devices.save(&path).unwrap();
+    }
+
+    sleep(Duration::from_secs(2)).await; // let the mesh connect
+
+    let client = reqwest::Client::new();
+
+    // B directs its local node to deploy on A through the mesh.
+    let resp = client
+        .post(format!("http://127.0.0.1:{api_b}/mesh-deploy"))
+        .json(&serde_json::json!({
+            "node_id": hex::encode(a_id),
+            "image": "alpine:latest",
+            "cmd": ["sleep", "30"],
+            "cpu_cores": 1,
+            "mem_mb": 128,
+            "duration_secs": 60,
+            "bid": "1000000000000000000"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "mesh-deploy should succeed");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let job_id = v["job_id"].as_str().expect("deploy returns a job_id").to_string();
+
+    // Host A should now report the job.
+    let jobs: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{api_a}/jobs"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        jobs.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "host A should list the mesh-deployed job"
+    );
+
+    // Kill it through the mesh.
+    let resp = client
+        .post(format!("http://127.0.0.1:{api_b}/mesh-kill"))
+        .json(&serde_json::json!({ "node_id": hex::encode(a_id), "job_id": job_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "mesh-kill should succeed");
+}

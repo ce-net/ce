@@ -107,6 +107,28 @@ pub enum RpcRequest {
         from_node: NodeId,
         segment_id: u64,
     },
+    /// Deploy a long-running cell (detached container) on a specific remote host.
+    /// Directed placement — unlike a broadcast JobBid, this targets one host. The host
+    /// tracks the job so it is heartbeat-billed and killable; replies with `Deployed`.
+    /// `bid` is the funding (base units) the deployer commits; billing draws it down.
+    Deploy {
+        from_node: NodeId,
+        image: String,
+        cmd: Vec<String>,
+        cpu_cores: u32,
+        mem_mb: u64,
+        duration_secs: u64,
+        bid: u128,
+        /// Optional scoped grant (bincode of `SignedGrant`); opaque to transport. See `Exec`.
+        grant: Option<Vec<u8>>,
+    },
+    /// Stop a job previously deployed on a remote host. `job_id` is the 64-hex id returned
+    /// by `Deployed`. Replies with `Killed`.
+    Kill {
+        from_node: NodeId,
+        job_id: String,
+        grant: Option<Vec<u8>>,
+    },
 }
 
 impl RpcRequest {
@@ -114,7 +136,9 @@ impl RpcRequest {
         match self {
             Self::Exec { from_node, .. }
             | Self::SyncFile { from_node, .. }
-            | Self::SegmentFetch { from_node, .. } => *from_node,
+            | Self::SegmentFetch { from_node, .. }
+            | Self::Deploy { from_node, .. }
+            | Self::Kill { from_node, .. } => *from_node,
         }
     }
 }
@@ -126,6 +150,10 @@ pub enum RpcResponse {
     SyncAck,
     /// Blocks for the requested archive segment.
     SegmentData { segment_id: u64, blocks: Vec<Block> },
+    /// A cell was deployed; `job_id` is the 64-hex id to track/kill it.
+    Deployed { job_id: String },
+    /// A deployed cell was stopped.
+    Killed,
     /// The remote node rejected the request (trust failure, Docker error, etc.).
     Error(String),
 }

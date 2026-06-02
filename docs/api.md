@@ -445,6 +445,44 @@ The node's home directory is bind-mounted read-write at `/workspace` inside the 
 
 ---
 
+## Mesh-routed placement
+
+These let the **local** node place/stop work on a **specific remote host over the mesh**
+(libp2p `/ce/rpc/1`, relay-assisted NAT traversal) — directed placement, the primitive a
+scheduler uses. The local node proxies; the target enforces authorization (admin trust, or a
+forwarded `grant` token covering `Deploy`/`Kill`). Amounts are decimal strings of base units.
+
+### POST /mesh-deploy
+
+Deploy a long-running cell on a specific host. The host tracks it (so it is heartbeat-billed
+and killable) and returns a `job_id`.
+
+**Request body**
+```json
+{
+  "node_id": "<64 hex>",          // target host
+  "image": "alpine:latest",
+  "cmd": ["sleep", "30"],
+  "cpu_cores": 1,
+  "mem_mb": 128,
+  "duration_secs": 60,
+  "bid": "1000000000000000000",   // funding, base units (string)
+  "hint_multiaddr": "",            // optional relay circuit dial hint
+  "grant": null                    // optional scoped grant token
+}
+```
+**Response** `200 OK` → `{ "job_id": "<64 hex>" }`. Errors: `400` bad node_id / malformed grant,
+`502` host rejected (untrusted / Docker error), `504` mesh timeout.
+
+### POST /mesh-kill
+
+Stop a mesh-deployed job. Body: `{ "node_id": "<64 hex>", "job_id": "<64 hex>", "grant": null }`.
+**Response** `204 No Content`. Errors mirror `/mesh-deploy`.
+
+(See also `POST /mesh-exec` and `PUT /mesh-sync/:node_id/*path` for one-shot exec / file push.)
+
+---
+
 ## Container isolation
 
 All containers (job containers and exec containers) are launched with:
