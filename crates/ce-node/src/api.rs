@@ -922,13 +922,18 @@ struct MeshDeployRequest {
     /// Optional scoped grant token (from `ce grant`), forwarded to the host.
     #[serde(default)]
     grant: Option<String>,
+    /// Content-addressed input CIDs (64 hex each) the cell needs. The host stages each from the
+    /// data layer before launch (Stage 4).
+    #[serde(default)]
+    inputs: Vec<String>,
 }
 
 /// Build the polymorphic `Workload` from a deploy request (Docker via `image`, or Wasm via
 /// `wasm_module`), returning its bincode bytes for the RPC.
 fn workload_bytes(req: &MeshDeployRequest) -> Result<Vec<u8>, Response> {
+    let inputs = parse_cids(&req.inputs)?;
     let workload = if let Some(image) = &req.image {
-        ce_runtime::Workload::Docker { image: image.clone(), cmd: req.cmd.clone(), env: vec![] }
+        ce_runtime::Workload::Docker { image: image.clone(), cmd: req.cmd.clone(), env: vec![], inputs }
     } else if let Some(hash_hex) = &req.wasm_module {
         let module_hash: [u8; 32] = hex::decode(hash_hex)
             .ok()
@@ -938,11 +943,25 @@ fn workload_bytes(req: &MeshDeployRequest) -> Result<Vec<u8>, Response> {
             module_hash,
             entry: req.wasm_entry.clone().unwrap_or_else(|| "entry".to_string()),
             args: vec![],
+            inputs,
         }
     } else {
         return Err(err(StatusCode::BAD_REQUEST, "provide either `image` or `wasm_module`"));
     };
     Ok(bincode::serialize(&workload).unwrap_or_default())
+}
+
+/// Parse a list of 64-hex CIDs into 32-byte arrays.
+fn parse_cids(hexes: &[String]) -> Result<Vec<[u8; 32]>, Response> {
+    hexes
+        .iter()
+        .map(|h| {
+            hex::decode(h)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "each input must be 64 hex chars"))
+        })
+        .collect()
 }
 
 /// Decode an optional grant token to RPC-ready bincode bytes; validates the token.

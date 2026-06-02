@@ -79,6 +79,8 @@ client can reuse its execution logic.
 ## Decisions (locked)
 
 - **Dispatch:** `dyn Runtime` registry (plugin-style), not a fixed enum.
-- **Module delivery:** content-addressed by hash (couples to the data-layer item; a minimal
-  content-addressed blob store on the node bridges it until the full data layer lands).
+- **Module delivery:** content-addressed by hash. The data layer now closes this loop — on
+  `Deploy` the host **stages** the Wasm module (and any declared inputs) from the data layer into
+  its local blob store before launch (`docs/data-layer.md` Stage 4), so a workload runs on a host
+  that didn't previously hold its bytes.
 - **Browser node:** deferred to its own repo/design.

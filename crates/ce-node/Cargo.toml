@@ -39,3 +39,4 @@ ce-mesh = { path = "../ce-mesh" }
 ce-identity = { path = "../ce-identity" }
 ce-protocol = { path = "../ce-protocol" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wat = "1"

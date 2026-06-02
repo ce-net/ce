@@ -23,6 +23,10 @@ pub enum Workload {
         cmd: Vec<String>,
         #[serde(default)]
         env: Vec<(String, String)>,
+        /// Content-addressed input blobs (data-layer CIDs) the cell needs. The host stages these
+        /// into its local store (fetching from the mesh) before launch. See `docs/data-layer.md`.
+        #[serde(default)]
+        inputs: Vec<[u8; 32]>,
     },
     /// A WebAssembly module, **content-addressed** by the sha256 of its bytes. The host resolves
     /// the bytes (blob store / data layer) and MUST verify `sha256(bytes) == module_hash` before
@@ -33,6 +37,9 @@ pub enum Workload {
         entry: String,
         #[serde(default)]
         args: Vec<String>,
+        /// Content-addressed input blobs (data-layer CIDs). Staged like a Docker workload's.
+        #[serde(default)]
+        inputs: Vec<[u8; 32]>,
     },
 }
 
@@ -43,6 +50,21 @@ impl Workload {
         match self {
             Workload::Docker { .. } => "docker",
             Workload::Wasm { .. } => "wasm",
+        }
+    }
+
+    /// Every content-addressed dependency the host must have locally before launch: the declared
+    /// `inputs`, plus a Wasm workload's `module_hash`. The host stages each from the data layer
+    /// (Stage 4). The module is first so a missing module fails fast.
+    pub fn content_deps(&self) -> Vec<[u8; 32]> {
+        match self {
+            Workload::Docker { inputs, .. } => inputs.clone(),
+            Workload::Wasm { module_hash, inputs, .. } => {
+                let mut deps = Vec::with_capacity(inputs.len() + 1);
+                deps.push(*module_hash);
+                deps.extend_from_slice(inputs);
+                deps
+            }
         }
     }
 }
@@ -91,18 +113,41 @@ mod tests {
 
     #[test]
     fn required_tag_maps_workload_to_capability() {
-        let d = Workload::Docker { image: "alpine".into(), cmd: vec![], env: vec![] };
-        let w = Workload::Wasm { module_hash: [0u8; 32], entry: "_start".into(), args: vec![] };
+        let d = Workload::Docker { image: "alpine".into(), cmd: vec![], env: vec![], inputs: vec![] };
+        let w = Workload::Wasm { module_hash: [0u8; 32], entry: "_start".into(), args: vec![], inputs: vec![] };
         assert_eq!(d.required_tag(), "docker");
         assert_eq!(w.required_tag(), "wasm");
     }
 
     #[test]
     fn workload_round_trips_through_serde() {
-        let w = Workload::Wasm { module_hash: [7u8; 32], entry: "main".into(), args: vec!["x".into()] };
+        let w = Workload::Wasm {
+            module_hash: [7u8; 32],
+            entry: "main".into(),
+            args: vec!["x".into()],
+            inputs: vec![[1u8; 32], [2u8; 32]],
+        };
         let bytes = serde_json::to_vec(&w).unwrap();
         let back: Workload = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(w, back);
+    }
+
+    #[test]
+    fn content_deps_lists_module_then_inputs() {
+        let w = Workload::Wasm {
+            module_hash: [9u8; 32],
+            entry: "entry".into(),
+            args: vec![],
+            inputs: vec![[1u8; 32], [2u8; 32]],
+        };
+        assert_eq!(w.content_deps(), vec![[9u8; 32], [1u8; 32], [2u8; 32]]);
+        let d = Workload::Docker {
+            image: "x".into(),
+            cmd: vec![],
+            env: vec![],
+            inputs: vec![[5u8; 32]],
+        };
+        assert_eq!(d.content_deps(), vec![[5u8; 32]]);
     }
 
     // A trivial runtime to confirm the trait is object-safe (usable as `dyn Runtime`).
@@ -123,6 +168,6 @@ mod tests {
     #[test]
     fn trait_is_object_safe() {
         let runtimes: Vec<std::sync::Arc<dyn Runtime>> = vec![std::sync::Arc::new(Noop)];
-        assert!(!runtimes[0].can_run(&Workload::Docker { image: "x".into(), cmd: vec![], env: vec![] }));
+        assert!(!runtimes[0].can_run(&Workload::Docker { image: "x".into(), cmd: vec![], env: vec![], inputs: vec![] }));
     }
 }

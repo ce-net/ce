@@ -921,6 +921,7 @@ async fn mesh_event_loop(
                         &self_tags,
                         &runtimes,
                         job_store.clone(),
+                        our_node_id,
                     );
                 }
             }
@@ -1032,6 +1033,45 @@ fn authorize_chunk_serve(
     Ok(receipt.cumulative)
 }
 
+/// Ensure a content-addressed blob is present in the local store, fetching it from the data layer
+/// (free providers) if absent. Used to stage a workload's module + inputs before launch (Stage 4).
+/// Verifies fetched bytes against `cid`; errors if no provider serves it (e.g. it requires payment).
+async fn stage_blob(
+    data_dir: &Path,
+    mesh_handle: &MeshHandle,
+    host_id: NodeId,
+    cid: [u8; 32],
+) -> Result<()> {
+    let dir = data_dir.join("blobs");
+    let path = dir.join(hex::encode(cid));
+    if path.exists() {
+        return Ok(());
+    }
+    let providers = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        mesh_handle.find_providers(cid),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("provider lookup timed out for {}", hex::encode(&cid[..4])))??;
+    for peer in providers {
+        let req = RpcRequest::FetchChunk { from_node: host_id, cid, receipt: None };
+        if let Ok(RpcResponse::ChunkData { bytes, .. }) = mesh_handle.send_rpc(peer, req).await {
+            let got: [u8; 32] = Sha256::digest(&bytes).into();
+            if got != cid {
+                continue;
+            }
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(&path, &bytes)?;
+            let _ = mesh_handle.provide_chunk(cid).await;
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "no provider served {} (it may require payment)",
+        hex::encode(&cid[..4])
+    )
+}
+
 // ----- Incoming mesh RPC handler -----
 
 #[allow(clippy::too_many_arguments)]
@@ -1045,6 +1085,7 @@ fn handle_incoming_rpc(
     self_tags: &[String],
     runtimes: &[Arc<dyn Runtime>],
     job_store: JobStore,
+    host_node_id: NodeId,
 ) {
     use crate::grants::{authorize, Permission, SignedGrant};
 
@@ -1186,7 +1227,21 @@ fn handle_incoming_rpc(
             let job_id: [u8; 32] =
                 Sha256::digest(bincode::serialize(&(ts as u64, payer, workload.required_tag())).unwrap_or_default())
                     .into();
+            let deps = workload.content_deps();
+            let stage_dir = data_dir.to_path_buf();
+            let host_id = host_node_id;
             tokio::spawn(async move {
+                // Stage 4: stage every content-addressed dependency (the Wasm module + declared
+                // inputs) into the local blob store before launch — fetching from the data layer
+                // if absent — so a workload runs on a host that didn't previously hold its bytes.
+                for cid in deps {
+                    if let Err(e) = stage_blob(&stage_dir, &mesh_handle, host_id, cid).await {
+                        let _ = mesh_handle
+                            .respond_rpc(correlation_id, RpcResponse::Error(format!("staging failed: {e}")))
+                            .await;
+                        return;
+                    }
+                }
                 let resp = match runtime.launch(&workload, &limits, job_id).await {
                     Ok(handle) => {
                         // Track it so the heartbeat loop bills it and `ps`/Kill can find it.

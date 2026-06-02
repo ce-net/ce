@@ -377,7 +377,7 @@ impl ce_runtime::Runtime for DockerRuntime {
         job_id: [u8; 32],
     ) -> Result<ce_runtime::Handle> {
         let (image, cmd, env) = match workload {
-            ce_runtime::Workload::Docker { image, cmd, env } => (image.clone(), cmd.clone(), env.clone()),
+            ce_runtime::Workload::Docker { image, cmd, env, .. } => (image.clone(), cmd.clone(), env.clone()),
             other => {
                 return Err(anyhow!("docker runtime cannot run a '{}' workload", other.required_tag()));
             }

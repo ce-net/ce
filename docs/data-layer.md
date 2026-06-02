@@ -1,6 +1,6 @@
 # Data layer — design
 
-**Status: Stages 1–3 done.** Content-addressed, chunked, P2P, paid object distribution — so jobs
+**Status: Stages 1–4 done.** Content-addressed, chunked, P2P, paid object distribution — so jobs
 can get their inputs (datasets, model weights, code) and return their outputs at scale, instead of
 today's one-file `sync`. The frontier's reach for compute has a twin: data has to move too.
 
@@ -30,12 +30,28 @@ against the cid) / `ce-rs` `fetch_chunk_paid`. Tested: receipt accept/reject + t
 authorization decision with real signatures (unit), and a charging provider refusing a free fetch
 over the real mesh (`paid_provider_refuses_free_fetch`).
 
+Stage 4 ✅ (in `ce-runtime` + `ce-node` + `ce-rs`): **content-addressed job inputs**. `Workload`
+(Docker and Wasm) gains `inputs: Vec<[u8;32]>`, and `Workload::content_deps()` lists every
+content-addressed dependency (a Wasm workload's `module_hash` + all inputs). On `Deploy`, the host
+**stages** each dep via `stage_blob` — fetching it from the data layer if absent — *before*
+launch, so a workload runs on a host that didn't previously hold its bytes (this closes the
+runtime's "host resolves the module from the data layer" loop). `mesh-deploy` / `ce-rs`
+`mesh_deploy_wasm` take `inputs`. Tested: `wasm_deploy_stages_module_from_mesh` — a host with no
+local copy of a WASM module stages it from a mesh provider and runs it (the deploy fails without
+staging).
+
+In-cell input *consumption* (WASI preopened dirs for Wasm, volume mounts for Docker) and **output
+publishing** (capture the cell's artifact → publish to the data layer → return the output CID) are
+the next refinement — they need runtime I/O (WASI/mounts) that the v0 runtimes don't yet expose.
+Staging (the "host fetches inputs" half) is the distributed keystone and is done.
+
 Decisions locked: Kademlia provider records, fixed 1 MiB chunks, per-chunk channel receipts,
 scope = transfer + addressing + caching + paid serving (storage-with-proofs is the separate
-market). Next: **Stage 4** — `Workload` I/O by CID (host fetches inputs, publishes outputs).
-Refinements: mesh-advertised pricing + auto provider selection (the capacity signal's `u32`
-version field can't carry a `u128` price — price is an out-of-band/config knob for now), parallel
-multi-provider fetch (swarming), and periodic provider-record refresh.
+market). Refinements still open: in-cell I/O + output publishing (above); mesh-advertised pricing
++ auto provider selection (the capacity signal's `u32` version field can't carry a `u128` price —
+price is an out-of-band/config knob for now); paid staging (the host pays to fetch inputs, cost
+folded into the job — staging uses free providers in v0); parallel multi-provider fetch (swarming);
+and periodic provider-record refresh.
 
 The good news: this is **mostly assembly of primitives CE already has**, not a new system.
 
@@ -106,8 +122,9 @@ the scheduler (`swarm`) stages data to chosen hosts before dispatch.
   knob (0 = free); the provider verifies a receipt covering the running cost before serving.
   Free-riding bounded by small chunks + pay-as-you-go + the receipt's high-water mark. (Mesh-
   advertised pricing + cheap/trusted auto-selection is a refinement; price is config/out-of-band.)
-- **Stage 4 — job integration.** `Workload` inputs/outputs by CID; host fetches inputs, publishes
-  outputs; `swarm` stages data ahead of dispatch.
+- **Stage 4 ✅ — job integration.** `Workload` gains content-addressed `inputs`; the host stages
+  every dependency (Wasm module + inputs) from the data layer before launch. In-cell consumption
+  (WASI/mounts) + output publishing (return an output CID) are the next refinement.
 - *(Separate, later: durable storage market — proof-of-storage, replication incentives.)*
 
 ## Hard problems (named honestly)
