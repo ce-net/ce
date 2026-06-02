@@ -265,6 +265,24 @@ record.
 
 ---
 
+## GET /beacon
+
+Verifiable public randomness from the PoW chain tip — unpredictable (it took work to find) and
+globally agreed. Seed reproducible, auditable host selection from `hash` so nobody can be shown
+to have cherry-picked who ran the work.
+
+**Response** `200 OK`
+```json
+{ "height": 1180, "hash": "9f0e..." }
+```
+
+The tip can reorg; for high-stakes selection derive from a confirmed-depth block, not the volatile
+tip. (Note: a beacon-seeded selection is *verifiable* but *predictable*; for anti-collusion in
+redundancy checks, unpredictable selection at dispatch time is preferable — pick the property the
+use case needs.)
+
+---
+
 ## GET /signals
 
 Returns the last 100 validated CEP-1 signals seen by this node (newest at the end).

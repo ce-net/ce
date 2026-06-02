@@ -24,7 +24,7 @@ to a believable planet-scale launch is called out at the end.
 | ~~Mesh-routed deploy (`Deploy`/`Kill` over `/ce/rpc/1`)~~ ✅ Done | Directed placement on a specific host: `RpcRequest::Deploy`/`Kill`, host tracks the job (heartbeat-billed, killable), `Deploy`/`Kill` grant-enforced, `POST /mesh-deploy`/`/mesh-kill`, `ce deploy --on <device>` / `ce kill --on <device>`. | [CE] | Eng |
 | ~~Reputation read index (`history(node_id)`)~~ ✅ Done | Incremental per-node `NodeStats` cache (jobs hosted/paid, heartbeats, earned/spent, first/last height); `GET /history/:node_id`; `ce-rs` exposes `history()` and `swarm` trust-tiers placement by it. (Pruned light nodes hold only post-checkpoint history; archive nodes are complete.) | [CE] | Eng |
 | Stake / bond tx | Bootstrap trust with risked credits; extends the escrow model. Start as visible commitment (auto-slash needs a fault oracle). | [CE] | Hard |
-| Verifiable randomness beacon (block-hash based) | Lets schedulers prove non-collusive random host selection for the redundancy verification path. | [CE] | Eng |
+| ~~Verifiable randomness beacon (block-hash based)~~ ✅ Done | `GET /beacon` returns the PoW tip `{height, hash}` — unpredictable, globally agreed, for reproducible/auditable host selection. `ce-rs` exposes `beacon()`. (Beacon-seeded selection is verifiable-but-predictable; swarm's redundancy uses trust-ranked selection today — unpredictable-at-dispatch selection for anti-collusion is the refinement.) | [CE] | Eng |
 
 ## Phase B — Capability (what makes "supercomputer" real)
 

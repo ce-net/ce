@@ -1211,6 +1211,22 @@ async fn get_atlas(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, Json(entries)).into_response()
 }
 
+// ----- GET /beacon -----
+//
+// Verifiable public randomness from the PoW chain: the tip block hash is unpredictable
+// (it took work to find) and globally agreed. Schedulers can seed host selection from it so
+// the choice is reproducible and auditable (nobody cherry-picked who ran the work). For
+// high-stakes use, derive from a confirmed-depth block rather than the volatile tip.
+
+async fn get_beacon(State(state): State<ApiState>) -> Response {
+    let snap = state.chain.sync_snap().await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "height": snap.height, "hash": hex::encode(snap.tip_hash) })),
+    )
+        .into_response()
+}
+
 // ----- GET /history/:node_id -----
 //
 // Per-node interaction history (the reputation substrate). CE reports the immutable facts;
@@ -1318,6 +1334,7 @@ pub async fn start(
         .route("/health", get(|| async { "ok" }))
         .route("/bootstrap", get(get_bootstrap))
         .route("/atlas", get(get_atlas))
+        .route("/beacon", get(get_beacon))
         .route("/history/:node_id", get(get_history))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))

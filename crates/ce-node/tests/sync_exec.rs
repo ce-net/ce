@@ -676,6 +676,17 @@ async fn history_unknown_node_returns_zeros() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn beacon_returns_height_and_hash() {
+    let (_node, _dir, api) = start_node("beacon").await;
+    let v: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{api}/beacon")).await.unwrap().json().await.unwrap();
+    assert!(v["height"].as_u64().is_some(), "beacon has a height");
+    let hash = v["hash"].as_str().unwrap_or("");
+    assert_eq!(hash.len(), 64, "beacon hash is 64 hex chars");
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn history_bad_node_id_returns_400() {
     let (_node, _dir, api) = start_node("history-bad").await;
     let resp = reqwest::Client::new()
