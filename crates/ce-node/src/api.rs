@@ -1477,6 +1477,8 @@ async fn put_blob(State(state): State<ApiState>, body: axum::body::Bytes) -> Res
     if let Err(e) = std::fs::write(dir.join(&hex), &body) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("store blob: {e}"));
     }
+    // Announce to the DHT that we now provide this chunk, so peers can fetch it (Stage 2).
+    let _ = state.mesh_handle.provide_chunk(hash).await;
     (StatusCode::CREATED, Json(serde_json::json!({ "hash": hex }))).into_response()
 }
 
@@ -1484,10 +1486,50 @@ async fn get_blob(State(state): State<ApiState>, Path(hash): Path<String>) -> Re
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return err(StatusCode::BAD_REQUEST, "hash must be 64 hex chars");
     }
-    match std::fs::read(state.data_dir.join("blobs").join(&hash)) {
-        Ok(bytes) => (StatusCode::OK, bytes).into_response(),
-        Err(_) => err(StatusCode::NOT_FOUND, "blob not found"),
+    if let Ok(bytes) = std::fs::read(state.data_dir.join("blobs").join(&hash)) {
+        return (StatusCode::OK, bytes).into_response();
     }
+    // Not held locally — pull it from the mesh: find providers via the DHT, fetch from one, and
+    // verify the bytes against the requested hash before serving (content addressing makes this
+    // trustless). The fetched chunk is cached + re-announced, so popular data self-replicates.
+    let mut cid = [0u8; 32];
+    if hex::decode_to_slice(&hash, &mut cid).is_err() {
+        return err(StatusCode::BAD_REQUEST, "hash must be 64 hex chars");
+    }
+    match fetch_chunk_from_mesh(&state, cid).await {
+        Some(bytes) => (StatusCode::OK, bytes).into_response(),
+        None => err(StatusCode::NOT_FOUND, "blob not found (locally or in mesh)"),
+    }
+}
+
+/// Pull a content-addressed chunk from the mesh: discover providers via the DHT, `FetchChunk` from
+/// each in turn, and accept the first reply whose bytes hash to `cid`. On success the chunk is
+/// stored locally and re-announced. Returns `None` if no provider yields valid bytes in time.
+async fn fetch_chunk_from_mesh(state: &ApiState, cid: [u8; 32]) -> Option<Vec<u8>> {
+    let providers = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        state.mesh_handle.find_providers(cid),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    for peer in providers {
+        let req = RpcRequest::FetchChunk { from_node: state.host_node_id, cid };
+        if let Ok(RpcResponse::ChunkData { bytes, .. }) = state.mesh_handle.send_rpc(peer, req).await
+        {
+            let got: [u8; 32] = Sha256::digest(&bytes).into();
+            if got != cid {
+                continue; // wrong/tampered bytes — try the next provider
+            }
+            let dir = state.data_dir.join("blobs");
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(hex::encode(cid)), &bytes);
+            let _ = state.mesh_handle.provide_chunk(cid).await;
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 // ----- Router -----

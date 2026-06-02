@@ -647,3 +647,76 @@ async fn mesh_deploy_and_kill_roundtrip() {
         .unwrap();
     assert_eq!(resp.status(), 204, "mesh-kill should succeed");
 }
+
+/// Data layer Stage 2: a chunk stored on one node is fetchable from another by hash. Node A
+/// stores a blob (becomes a DHT provider); node B, which doesn't hold it, resolves providers via
+/// the DHT, fetches it over the `FetchChunk` mesh RPC, verifies it against the hash, and serves it.
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_fetched_across_mesh() {
+    // Provider A.
+    let (p2p_a, api_a) = alloc_ports();
+    let dir_a = tmpdir("blob-provider");
+    let _node_a = Node::start(NodeConfig {
+        listen_port: p2p_a,
+        bootstrap_peers: vec![],
+        data_dir: dir_a.clone(),
+        api_port: api_a,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    sleep(Duration::from_millis(600)).await;
+
+    // Fetcher B — bootstrapped to A.
+    let bs = bootstrap_addr(&dir_a, p2p_a);
+    let (p2p_b, api_b) = alloc_ports();
+    let _node_b = Node::start(NodeConfig {
+        listen_port: p2p_b,
+        bootstrap_peers: vec![bs],
+        data_dir: tmpdir("blob-fetcher"),
+        api_port: api_b,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    sleep(Duration::from_secs(2)).await; // let the mesh connect + Kademlia populate
+
+    let client = reqwest::Client::new();
+
+    // A distinctive multi-kilobyte payload, stored on A.
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api_a}/blobs"))
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "store blob on A");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let hash = v["hash"].as_str().expect("blob hash").to_string();
+
+    // B does not hold it locally; GET must pull it from the mesh. Poll to allow the DHT provider
+    // record to propagate and the FetchChunk round-trip to complete.
+    let mut fetched: Option<Vec<u8>> = None;
+    for _ in 0..15 {
+        sleep(Duration::from_secs(2)).await;
+        let r = client
+            .get(format!("http://127.0.0.1:{api_b}/blobs/{hash}"))
+            .send()
+            .await
+            .unwrap();
+        if r.status() == 200 {
+            fetched = Some(r.bytes().await.unwrap().to_vec());
+            break;
+        }
+    }
+
+    let got = fetched.expect("B should fetch the blob from A across the mesh");
+    assert_eq!(got, payload, "fetched bytes must match the stored payload exactly");
+}

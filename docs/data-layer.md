@@ -1,16 +1,27 @@
 # Data layer — design
 
-**Status: Stage 1 done.** Content-addressed, chunked, P2P, paid object distribution — so jobs can
-get their inputs (datasets, model weights, code) and return their outputs at scale, instead of
+**Status: Stages 1–2 done.** Content-addressed, chunked, P2P, paid object distribution — so jobs
+can get their inputs (datasets, model weights, code) and return their outputs at scale, instead of
 today's one-file `sync`. The frontier's reach for compute has a twin: data has to move too.
 
 Stage 1 ✅ (in `ce-rs`): the `data` module — `Manifest` (`ce-object-v1`: chunk CIDs + sizes),
 pure `chunk_object`/`reassemble`/`cid` (sha256, matches the node's `/blobs` keying), and
 `CeClient::put_object`/`get_object` layering the existing blob store into whole-object upload/fetch
-with per-chunk verification. Decisions locked: Kademlia provider records (Stage 2), fixed 1 MiB
-chunks, per-chunk channel receipts (Stage 3), scope = transfer + addressing + caching + paid
-serving (storage-with-proofs is the separate market). Next: **Stage 2** — `FetchChunk` mesh RPC +
-DHT provider records so a node pulls chunks it lacks.
+with per-chunk verification.
+
+Stage 2 ✅ (in `ce-mesh` + `ce-node`): a node now pulls chunks it lacks **from the mesh**.
+`RpcRequest::FetchChunk { cid }` → `RpcResponse::ChunkData` over `/ce/rpc/1` (open/unpaid, like
+`SegmentFetch`); DHT **provider records** via Kademlia (`provide_chunk` on store + a startup
+re-announce of all held chunks; `find_providers` completes on the first provider found, not the
+query's final step); `GET /blobs/:hash` falls back to discover → fetch → **verify against the
+hash** → cache + re-announce (so popular data self-replicates). Integration-tested across two
+in-process nodes (`blob_fetched_across_mesh`).
+
+Decisions locked: Kademlia provider records, fixed 1 MiB chunks, per-chunk channel receipts
+(Stage 3), scope = transfer + addressing + caching + paid serving (storage-with-proofs is the
+separate market). Next: **Stage 3** — paid serving (per-chunk channel receipts) + trust-gated
+provider selection; and **Stage 4** — `Workload` I/O by CID. Parallel multi-provider fetch
+(swarming) and periodic provider-record refresh are refinements on the Stage 2 base.
 
 The good news: this is **mostly assembly of primitives CE already has**, not a new system.
 
@@ -70,13 +81,13 @@ the scheduler (`swarm`) stages data to chosen hosts before dispatch.
 
 ## Staged plan
 
-- **Stage 1 — chunked objects + manifests (local).** Generalize `/blobs` into a chunk store; add
+- **Stage 1 ✅ — chunked objects + manifests (local).** Generalize `/blobs` into a chunk store; add
   chunking + a manifest format; `put_object`/`get_object` in `ce-rs` (chunk, store, manifest /
   resolve, fetch-local, verify, reassemble). No network yet. Fully unit-testable.
-- **Stage 2 — content routing + `FetchChunk` RPC.** Announce provider records to Kademlia for
-  held chunks; `FetchChunk { cid }` mesh RPC (verified); parallel multi-provider fetch (swarming);
-  fetched chunks are cached and re-announced (popular data self-replicates). A node can now pull
-  an object it doesn't have from the mesh.
+- **Stage 2 ✅ — content routing + `FetchChunk` RPC.** Announce provider records to Kademlia for
+  held chunks; `FetchChunk { cid }` mesh RPC (verified); fetched chunks are cached and re-announced
+  (popular data self-replicates). A node now pulls an object it doesn't have from the mesh.
+  (Parallel multi-provider fetch / swarming is a refinement on top.)
 - **Stage 3 — paid serving + trust-gated selection.** Per-chunk channel receipts (provider earns);
   providers advertise a price/MB; requesters pick cheap+trusted providers; free within an admin
   fleet. Free-riding bounded by small chunks + pay-as-you-go + reputation.

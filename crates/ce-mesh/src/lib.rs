@@ -130,6 +130,14 @@ pub enum RpcRequest {
         job_id: String,
         grant: Option<Vec<u8>>,
     },
+    /// Fetch a content-addressed chunk (data-layer blob) from a peer that holds it. `cid` is the
+    /// sha256 of the bytes; the caller verifies `sha256(reply) == cid` on receipt, so a wrong or
+    /// tampered reply is detected and discarded. Open/unpaid in v0 — like `SegmentFetch`, serving
+    /// content-addressed data to anyone; per-chunk payment over channels arrives in a later stage.
+    FetchChunk {
+        from_node: NodeId,
+        cid: [u8; 32],
+    },
 }
 
 impl RpcRequest {
@@ -139,7 +147,8 @@ impl RpcRequest {
             | Self::SyncFile { from_node, .. }
             | Self::SegmentFetch { from_node, .. }
             | Self::Deploy { from_node, .. }
-            | Self::Kill { from_node, .. } => *from_node,
+            | Self::Kill { from_node, .. }
+            | Self::FetchChunk { from_node, .. } => *from_node,
         }
     }
 }
@@ -155,6 +164,8 @@ pub enum RpcResponse {
     Deployed { job_id: String },
     /// A deployed cell was stopped.
     Killed,
+    /// The requested content-addressed chunk's bytes. The caller verifies `sha256(bytes) == cid`.
+    ChunkData { cid: [u8; 32], bytes: Vec<u8> },
     /// The remote node rejected the request (trust failure, Docker error, etc.).
     Error(String),
 }
@@ -258,6 +269,15 @@ enum MeshCommand {
     RespondRpc {
         correlation_id: u64,
         response: RpcResponse,
+    },
+    /// Announce to the DHT that this node holds the chunk keyed by `key` (a sha256), so peers
+    /// querying for it discover us as a provider.
+    ProvideChunk { key: [u8; 32] },
+    /// Query the DHT for peers providing the chunk keyed by `key`. The accumulated provider set
+    /// is delivered via `reply_tx` once the Kademlia query completes.
+    FindProviders {
+        key: [u8; 32],
+        reply_tx: oneshot::Sender<Vec<PeerId>>,
     },
 }
 
@@ -395,6 +415,22 @@ impl MeshHandle {
         self.send(MeshCommand::RespondRpc { correlation_id, response }).await
     }
 
+    /// Announce that this node provides the content-addressed chunk `cid` (a DHT provider record).
+    /// Call it whenever a chunk is stored locally; provider records expire, so re-announce held
+    /// chunks periodically / on startup.
+    pub async fn provide_chunk(&self, cid: [u8; 32]) -> Result<()> {
+        self.send(MeshCommand::ProvideChunk { key: cid }).await
+    }
+
+    /// Find peers advertising the chunk `cid` via the DHT. Returns the providers discovered by the
+    /// time the Kademlia query completes (possibly empty). The caller then `send_rpc`s a
+    /// `FetchChunk` to one of them and verifies the bytes against `cid`.
+    pub async fn find_providers(&self, cid: [u8; 32]) -> Result<Vec<PeerId>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send(MeshCommand::FindProviders { key: cid, reply_tx }).await?;
+        reply_rx.await.map_err(|_| anyhow!("find_providers: actor dropped before response"))
+    }
+
     async fn send(&self, cmd: MeshCommand) -> Result<()> {
         self.cmd_tx.send(cmd).await.map_err(|_| anyhow!("mesh actor gone"))
     }
@@ -420,6 +456,10 @@ pub struct Mesh {
     /// Pending inbound RPC calls: correlation_id → libp2p response channel.
     pending_inbound: HashMap<u64, request_response::ResponseChannel<RpcResponse>>,
     next_inbound_id: u64,
+    /// In-flight DHT provider lookups: kad query id → (reply sender, providers seen so far).
+    /// Completed and drained when the query's final progress step arrives.
+    pending_providers:
+        HashMap<kad::QueryId, (oneshot::Sender<Vec<PeerId>>, std::collections::HashSet<PeerId>)>,
     /// Monotonic counter for sync request nonces — prevents gossipsub from deduplicating
     /// identical requests (same from_node + from_height) sent on repeated sync intervals.
     sync_nonce: u64,
@@ -549,6 +589,7 @@ impl Mesh {
             pending_outbound: HashMap::new(),
             pending_inbound: HashMap::new(),
             next_inbound_id: 0,
+            pending_providers: HashMap::new(),
             sync_nonce: 0,
             disable_local_discovery,
             allowed_peers: std::collections::HashSet::new(),
@@ -666,6 +707,13 @@ impl Mesh {
             // /ce/rpc/1 — device exec/sync protocol.
             SwarmEvent::Behaviour(CeBehaviourEvent::Rpc(rpc_event)) => {
                 self.handle_rpc_event(rpc_event).await;
+            }
+
+            // Kademlia query results — completes `find_providers` lookups (data layer).
+            SwarmEvent::Behaviour(CeBehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed { id, result, step, .. }
+            )) => {
+                self.handle_kad_query(id, result, step.last);
             }
 
             // Everything else: decode and forward to the node.
@@ -797,6 +845,41 @@ impl Mesh {
                     }
                 } else {
                     warn!("rpc: no pending inbound for correlation_id {correlation_id}");
+                }
+            }
+            MeshCommand::ProvideChunk { key } => {
+                let record_key = kad::RecordKey::new(&key);
+                if let Err(e) = self.swarm.behaviour_mut().kademlia.start_providing(record_key) {
+                    debug!("start_providing {:02x?}: {e}", &key[..4]);
+                }
+            }
+            MeshCommand::FindProviders { key, reply_tx } => {
+                let record_key = kad::RecordKey::new(&key);
+                let qid = self.swarm.behaviour_mut().kademlia.get_providers(record_key);
+                self.pending_providers.insert(qid, (reply_tx, std::collections::HashSet::new()));
+            }
+        }
+    }
+
+    /// Accumulate providers from a Kademlia `GetProviders` query and complete the pending
+    /// `find_providers` call when the query's final progress step arrives.
+    fn handle_kad_query(&mut self, id: kad::QueryId, result: kad::QueryResult, last: bool) {
+        if let kad::QueryResult::GetProviders(res) = result {
+            // Complete as soon as any provider is found — one is enough to attempt a fetch, and
+            // waiting for the query's final step can take tens of seconds. Otherwise wait for the
+            // last step (which may carry no providers, i.e. nobody has it).
+            let mut done = last;
+            if let Some((_, acc)) = self.pending_providers.get_mut(&id) {
+                if let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = &res {
+                    acc.extend(providers.iter().copied());
+                    if !acc.is_empty() {
+                        done = true;
+                    }
+                }
+            }
+            if done {
+                if let Some((tx, acc)) = self.pending_providers.remove(&id) {
+                    let _ = tx.send(acc.into_iter().collect());
                 }
             }
         }

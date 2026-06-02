@@ -291,6 +291,27 @@ impl Node {
                 .await;
         }
 
+        // Re-announce every locally-held chunk as a DHT provider record. Provider records expire,
+        // so this runs on each startup; new chunks are announced as they are stored (put_blob).
+        {
+            let handle = mesh_handle.clone();
+            let blobs_dir = node.config.data_dir.join("blobs");
+            tokio::spawn(async move {
+                let entries = match std::fs::read_dir(&blobs_dir) {
+                    Ok(e) => e,
+                    Err(_) => return,
+                };
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    let mut cid = [0u8; 32];
+                    if name.len() == 64 && hex::decode_to_slice(name, &mut cid).is_ok() {
+                        let _ = handle.provide_chunk(cid).await;
+                    }
+                }
+            });
+        }
+
         if node.config.mine {
             let chain2 = chain.clone();
             let identity2 = identity.clone();
@@ -816,6 +837,22 @@ async fn mesh_event_loop(
                         };
                         let _ = handle.respond_rpc(correlation_id, resp).await;
                     });
+                } else if let RpcRequest::FetchChunk { cid, .. } = &request {
+                    // Serve a content-addressed chunk from the local blob store (open, like
+                    // SegmentFetch). The blob file is keyed by hex(cid); the requester re-verifies.
+                    let cid = *cid;
+                    let blobs_dir = data_dir.join("blobs");
+                    let handle = mesh_handle.clone();
+                    tokio::spawn(async move {
+                        let resp = match std::fs::read(blobs_dir.join(hex::encode(cid))) {
+                            Ok(bytes) => RpcResponse::ChunkData { cid, bytes },
+                            Err(_) => RpcResponse::Error(format!(
+                                "chunk {} not held",
+                                hex::encode(&cid[..4])
+                            )),
+                        };
+                        let _ = handle.respond_rpc(correlation_id, resp).await;
+                    });
                 } else {
                     handle_incoming_rpc(
                         from_peer,
@@ -946,6 +983,7 @@ fn handle_incoming_rpc(
         RpcRequest::Deploy { grant, .. } => (Permission::Deploy, grant.clone()),
         RpcRequest::Kill { grant, .. } => (Permission::Kill, grant.clone()),
         RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
+        RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
     };
     let grant = match grant_bytes.as_deref().map(bincode::deserialize::<SignedGrant>) {
         Some(Ok(g)) => Some(g),
@@ -991,6 +1029,7 @@ fn handle_incoming_rpc(
             });
         }
         RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
+        RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
         RpcRequest::SyncFile { path, data, .. } => {
             let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
             let home_canon = home.canonicalize().unwrap_or(home.clone());
