@@ -112,6 +112,7 @@ async fn live_node_syncs_from_relay() {
         prune_keep: Some(ce_chain::PRUNE_KEEP_BLOCKS),
         archive_density: 0.0,
         disable_local_discovery: false,
+        tls: false,
     };
 
     let node = Node::start(config).await.expect("node start failed");
@@ -159,6 +160,7 @@ async fn live_light_node_prunes_and_archives() {
         prune_keep: Some(PRUNE_KEEP),
         archive_density: ARCHIVE_DENSITY,
         disable_local_discovery: false,
+        tls: false,
     };
 
     let node = Node::start(config).await.expect("node start failed");
