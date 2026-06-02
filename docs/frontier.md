@@ -17,7 +17,7 @@ to a believable planet-scale launch is called out at the end.
 
 | Item | Why | Tag | Diff |
 |---|---|---|---|
-| **Payment channels / off-chain micropayments** | `Heartbeat` every ~30s × millions of cells floods any single chain. Open a channel on-chain, stream signed micropayments off-chain, settle the net. Caps the signal-pay economy without it. | [CE] | Hard |
+| **Payment channels / off-chain micropayments** | `Heartbeat` every ~30s × millions of cells floods any single chain. Open a channel on-chain, stream signed micropayments off-chain, settle the net. Caps the signal-pay economy without it. **Design: `docs/payment-channels.md`** (implementation started: off-chain `Receipt` primitive). | [CE] | Hard |
 | **Lightweight runtimes — WASM + browser worker** | "Every computer on Earth" = phones, browsers, Docker-less laptops. Docker-only excludes ~95% of devices; a WASM sandbox + browser tab turns every web visitor into a node. | [CE] | Hard |
 | **Relay scaling + relay incentives** | One relay ≠ a planet. Many relays, discovered dynamically, **earning credits** for relaying; DHT tuned for millions of peers. | [CE] | Eng |
 | **Data layer** — content-addressed, chunked, paid P2P transfer | `sync` is one-file HTTP today. Datasets, weights, inputs, and results need BitTorrent/IPFS-shaped paid distribution. | [CE]+[app] | Hard |

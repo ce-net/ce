@@ -180,6 +180,15 @@ pub fn payer_settle_bytes(job_id: &[u8; 32], host: &NodeId, cost: u128) -> Vec<u
     bincode::serialize(&(b"ce-job-settle-v2", job_id, host, cost)).unwrap_or_default()
 }
 
+/// Canonical bytes the payer signs for an **off-chain payment-channel receipt** — the core of
+/// payment channels (see `docs/payment-channels.md`). `cumulative` is the monotonic total paid
+/// over the channel's life; `host` is bound so a receipt can't be replayed against another host
+/// or channel. The payer streams these off-chain (no tx); the host redeems the highest one
+/// on-chain via `ChannelClose`. The chain validates that closing receipt with identical bytes.
+pub fn channel_receipt_bytes(channel_id: &[u8; 32], host: &NodeId, cumulative: u128) -> Vec<u8> {
+    bincode::serialize(&(b"ce-channel-receipt-v1", channel_id, host, cumulative)).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
     pub kind: TxKind,
@@ -1167,6 +1176,33 @@ mod tests {
     }
 
     // ----- Emission schedule -----
+
+    #[test]
+    fn channel_receipt_is_host_bound_and_tamper_evident() {
+        let payer = make_identity("rcpt-payer");
+        let host = make_identity("rcpt-host");
+        let other = make_identity("rcpt-other");
+        let chan = [7u8; 32];
+
+        // A valid receipt: payer signs (channel, host, cumulative).
+        let bytes = channel_receipt_bytes(&chan, &host.node_id(), 1_000);
+        let sig = payer.sign(&bytes);
+        assert!(verify(&payer.node_id(), &bytes, &sig).is_ok());
+
+        // Tampering the cumulative invalidates the signature.
+        let tampered = channel_receipt_bytes(&chan, &host.node_id(), 2_000);
+        assert!(verify(&payer.node_id(), &tampered, &sig).is_err());
+
+        // Same receipt can't be replayed against a different host.
+        let other_host = channel_receipt_bytes(&chan, &other.node_id(), 1_000);
+        assert!(verify(&payer.node_id(), &other_host, &sig).is_err());
+
+        // Monotonic: a higher cumulative produces distinct bytes (supersedes the prior receipt).
+        assert_ne!(
+            channel_receipt_bytes(&chan, &host.node_id(), 1_000),
+            channel_receipt_bytes(&chan, &host.node_id(), 1_001)
+        );
+    }
 
     #[test]
     fn node_history_tracks_settlements_and_heartbeats() {
