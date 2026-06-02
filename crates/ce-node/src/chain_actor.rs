@@ -24,7 +24,7 @@ use tracing::warn;
 pub struct ChainStatusSnap {
     pub height: u64,
     pub difficulty: u8,
-    pub balance: i64,
+    pub balance: i128,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +38,7 @@ pub struct SyncSnap {
 
 pub enum ChainCmd {
     // --- reads ---
-    Balance { node: NodeId, reply: oneshot::Sender<i64> },
+    Balance { node: NodeId, reply: oneshot::Sender<i128> },
     Height { reply: oneshot::Sender<u64> },
     Difficulty { reply: oneshot::Sender<u8> },
     /// Combined height + difficulty + balance — avoids two round-trips in status handlers.
@@ -54,10 +54,10 @@ pub enum ChainCmd {
     /// All JobSettle job_ids confirmed on-chain for a given host.
     SettledOnChain { host: NodeId, reply: oneshot::Sender<Vec<[u8; 32]>> },
     /// Find any tx in chain history with a burnable credit amount (used by tests/signals).
-    AnyBurnableTx { reply: oneshot::Sender<Option<([u8; 32], u64)>> },
+    AnyBurnableTx { reply: oneshot::Sender<Option<([u8; 32], u128)>> },
     /// Like AnyBurnableTx but restricted to txs where tx.origin == origin.
     /// Used by tests to avoid picking up txs from foreign chains after a reorg.
-    AnyBurnableTxByOrigin { origin: NodeId, reply: oneshot::Sender<Option<([u8; 32], u64)>> },
+    AnyBurnableTxByOrigin { origin: NodeId, reply: oneshot::Sender<Option<([u8; 32], u128)>> },
     // --- writes ---
     NextBlock { txs: Vec<Tx>, miner: NodeId, reply: oneshot::Sender<Block> },
     Append { block: Block, reply: oneshot::Sender<bool> },
@@ -72,7 +72,7 @@ pub enum ChainCmd {
 pub struct ChainHandle(mpsc::Sender<ChainCmd>);
 
 impl ChainHandle {
-    pub async fn balance(&self, node: NodeId) -> i64 {
+    pub async fn balance(&self, node: NodeId) -> i128 {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::Balance { node, reply: tx }).await;
         rx.await.unwrap_or(0)
@@ -138,13 +138,13 @@ impl ChainHandle {
         rx.await.unwrap_or_default()
     }
 
-    pub async fn any_burnable_tx(&self) -> Option<([u8; 32], u64)> {
+    pub async fn any_burnable_tx(&self) -> Option<([u8; 32], u128)> {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::AnyBurnableTx { reply: tx }).await;
         rx.await.ok().flatten()
     }
 
-    pub async fn any_burnable_tx_by_origin(&self, origin: NodeId) -> Option<([u8; 32], u64)> {
+    pub async fn any_burnable_tx_by_origin(&self, origin: NodeId) -> Option<([u8; 32], u128)> {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::AnyBurnableTxByOrigin { origin, reply: tx }).await;
         rx.await.ok().flatten()
@@ -314,7 +314,7 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
     warn!("chain actor stopped — all ChainHandle instances dropped");
 }
 
-fn tx_burn_amount(tx: &Tx) -> Option<u64> {
+fn tx_burn_amount(tx: &Tx) -> Option<u128> {
     match &tx.kind {
         TxKind::Transfer { amount, .. } => Some(*amount),
         TxKind::UptimeReward { amount, .. } => Some(*amount),

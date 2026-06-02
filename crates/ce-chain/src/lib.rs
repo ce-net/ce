@@ -129,10 +129,10 @@ pub const MAX_TXS_PER_BLOCK: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TxKind {
-    /// Credit transfer between nodes.
-    Transfer { from: NodeId, to: NodeId, amount: u64 },
+    /// Credit transfer between nodes. `amount` is in base units (1 credit = `CREDIT` base units).
+    Transfer { from: NodeId, to: NodeId, amount: u128 },
     /// Uptime emission: credits minted and credited to a node for staying online.
-    UptimeReward { node: NodeId, amount: u64, epoch: u64 },
+    UptimeReward { node: NodeId, amount: u128, epoch: u64 },
     /// Open job bid: payer offers up to `bid` credits for a workload.
     /// `cmd` and `env` describe how the container should be launched; they are
     /// included on-chain so any host with capacity can accept the bid deterministically.
@@ -140,7 +140,7 @@ pub enum TxKind {
     JobBid {
         job_id: [u8; 32],
         payer: NodeId,
-        bid: u64,
+        bid: u128,
         image: String,
         cmd: Vec<String>,
         env: Vec<(String, String)>,
@@ -157,7 +157,7 @@ pub enum TxKind {
         payer: NodeId,
         cpu_ms: u64,
         mem_mb: u64,
-        cost: u64,
+        cost: u128,
         #[serde(with = "sig_serde")]
         payer_sig: [u8; 64],
     },
@@ -170,13 +170,13 @@ pub enum TxKind {
     /// Periodic heartbeat payment for a long-running cell.
     /// Signed by the host; debits the cell's wallet and credits the host.
     /// `epoch` must strictly increase per (cell, host) pair to prevent replay.
-    Heartbeat { cell: NodeId, host: NodeId, amount: u64, epoch: u64 },
+    Heartbeat { cell: NodeId, host: NodeId, amount: u128, epoch: u64 },
 }
 
 /// Canonical bytes the payer signs to authorize a settlement of `cost` for `job_id` by `host`.
 /// Binds the authorization to a specific host so a stolen sig cannot be replayed by another node.
 /// Both the host (when building) and the chain (when validating) must produce identical bytes.
-pub fn payer_settle_bytes(job_id: &[u8; 32], host: &NodeId, cost: u64) -> Vec<u8> {
+pub fn payer_settle_bytes(job_id: &[u8; 32], host: &NodeId, cost: u128) -> Vec<u8> {
     bincode::serialize(&(b"ce-job-settle-v2", job_id, host, cost)).unwrap_or_default()
 }
 
@@ -258,21 +258,28 @@ pub struct Checkpoint {
     pub block_height: u64,
     /// Hash of that block (integrity anchor).
     pub block_hash: [u8; 32],
-    /// Total UptimeReward supply emitted up to and including `block_height`.
-    pub total_supply: u64,
-    /// Full balance snapshot at checkpoint height.
-    pub balances: Vec<(NodeId, i64)>,
+    /// Total UptimeReward supply emitted up to and including `block_height`, in base units.
+    pub total_supply: u128,
+    /// Full balance snapshot at checkpoint height (base units).
+    pub balances: Vec<(NodeId, i128)>,
     /// All open (unsettled, unexpired) job bids at checkpoint height.
-    /// Tuple: (job_id, (payer, bid_amount, bid_block_index)).
-    pub open_bids: Vec<([u8; 32], (NodeId, u64, u64))>,
+    /// Tuple: (job_id, (payer, bid_amount_base_units, bid_block_index)).
+    pub open_bids: Vec<([u8; 32], (NodeId, u128, u64))>,
     /// Highest confirmed heartbeat epoch per (cell, host) pair at checkpoint height.
     pub heartbeat_max_epoch: Vec<((NodeId, NodeId), u64)>,
 }
 
 // ----- Chain -----
 
-const EMISSION_BASE: u64 = 1_000;
-pub const SUPPLY_CAP: u64 = 21_000_000_000;
+/// Base units per credit. All on-chain amounts are denominated in base units (integers);
+/// "credits" are a display multiple. 10^18 (wei-style) gives ample room for micropayments
+/// in the per-signal economy. We use integers — never floating point — because float
+/// arithmetic is non-deterministic across machines and would split consensus.
+pub const CREDIT: u128 = 1_000_000_000_000_000_000;
+/// Initial block emission: 1,000 credits per block, expressed in base units.
+const EMISSION_BASE: u128 = 1_000 * CREDIT;
+/// Hard cap on total emitted supply: 21 billion credits, in base units (2.1 × 10^28).
+pub const SUPPLY_CAP: u128 = 21_000_000_000 * CREDIT;
 
 /// zstd magic bytes (little-endian frame magic).
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -290,9 +297,9 @@ pub struct Chain {
     // Incremental caches — NOT persisted (rebuilt on load from checkpoint + blocks).
     // These give O(1) lookups for all validation hot-paths.
 
-    /// Net balance per node.
+    /// Net balance per node (base units).
     #[serde(skip, default)]
-    balances: std::collections::HashMap<NodeId, i64>,
+    balances: std::collections::HashMap<NodeId, i128>,
 
     /// Highest confirmed Heartbeat epoch per (cell, host) pair.
     #[serde(skip, default)]
@@ -306,11 +313,11 @@ pub struct Chain {
     /// bid_block_index enables O(1) EXPIRY_BLOCKS check without scanning history.
     /// Entries are removed when a matching JobSettle or JobExpire is confirmed.
     #[serde(skip, default)]
-    open_bids: std::collections::HashMap<[u8; 32], (NodeId, u64, u64)>,
+    open_bids: std::collections::HashMap<[u8; 32], (NodeId, u128, u64)>,
 
     /// Cumulative UptimeReward supply. Avoids O(n) scan in append().
     #[serde(skip, default)]
-    total_supply_cache: u64,
+    total_supply_cache: u128,
 }
 
 impl Chain {
@@ -364,22 +371,22 @@ impl Chain {
         for (pos, tx) in block.transactions.iter().enumerate() {
             match &tx.kind {
                 TxKind::Transfer { from, to, amount } => {
-                    *self.balances.entry(*from).or_insert(0) -= *amount as i64;
-                    *self.balances.entry(*to).or_insert(0) += *amount as i64;
+                    *self.balances.entry(*from).or_insert(0) -= *amount as i128;
+                    *self.balances.entry(*to).or_insert(0) += *amount as i128;
                 }
                 TxKind::UptimeReward { node, amount, .. } => {
-                    *self.balances.entry(*node).or_insert(0) += *amount as i64;
+                    *self.balances.entry(*node).or_insert(0) += *amount as i128;
                     self.total_supply_cache =
                         self.total_supply_cache.saturating_add(*amount);
                 }
                 TxKind::JobSettle { job_id, host, payer, cost, .. } => {
-                    *self.balances.entry(*payer).or_insert(0) -= *cost as i64;
-                    *self.balances.entry(*host).or_insert(0) += *cost as i64;
+                    *self.balances.entry(*payer).or_insert(0) -= *cost as i128;
+                    *self.balances.entry(*host).or_insert(0) += *cost as i128;
                     self.open_bids.remove(job_id);
                 }
                 TxKind::Heartbeat { cell, host, amount, epoch } => {
-                    *self.balances.entry(*cell).or_insert(0) -= *amount as i64;
-                    *self.balances.entry(*host).or_insert(0) += *amount as i64;
+                    *self.balances.entry(*cell).or_insert(0) -= *amount as i128;
+                    *self.balances.entry(*host).or_insert(0) += *amount as i128;
                     let e = self.heartbeat_max_epoch.entry((*cell, *host)).or_insert(0);
                     if *epoch >= *e {
                         *e = *epoch;
@@ -409,16 +416,18 @@ impl Chain {
         self.tip().index
     }
 
-    /// Total UptimeReward supply emitted. O(1) via incremental cache.
-    pub fn total_supply(&self) -> u64 {
+    /// Total UptimeReward supply emitted, in base units. O(1) via incremental cache.
+    pub fn total_supply(&self) -> u128 {
         self.total_supply_cache
     }
 
-    /// Credits emitted per epoch at a given block index.
-    /// Base rate 1,000; halves every 210,000 blocks; returns 0 after 64 halvings.
-    pub fn emission_rate(block_index: u64) -> u64 {
+    /// Emission per block at a given block index, in base units.
+    /// Base rate 1,000 credits; halves every 210,000 blocks. Because base units are 10^18,
+    /// the reward stays non-zero through ~69 halvings before integer-truncating to 0.
+    /// The `>= 128` guard keeps the shift width valid for u128.
+    pub fn emission_rate(block_index: u64) -> u128 {
         let halvings = block_index / 210_000;
-        if halvings >= 64 { 0 } else { EMISSION_BASE >> halvings }
+        if halvings >= 128 { 0 } else { EMISSION_BASE >> halvings }
     }
 
     /// Validates and appends a block. Returns false if invalid (caller should log and discard).
@@ -470,13 +479,13 @@ impl Chain {
             }
         }
         // Cumulative supply must not exceed the hard cap.
-        let new_emission: u64 = block
+        let new_emission: u128 = block
             .transactions
             .iter()
             .filter_map(|tx| {
                 if let TxKind::UptimeReward { amount, .. } = &tx.kind { Some(*amount) } else { None }
             })
-            .fold(0u64, |a, b| a.saturating_add(b));
+            .fold(0u128, |a, b| a.saturating_add(b));
         if self.total_supply_cache.saturating_add(new_emission) > SUPPLY_CAP {
             return false;
         }
@@ -488,7 +497,7 @@ impl Chain {
         // subtract in-block transfers from the same sender — closing the cross-type
         // double-spend where a node transfers credits and bids/heartbeats with the same
         // credits in a single block.
-        let mut in_block_transfer: std::collections::HashMap<NodeId, u64> =
+        let mut in_block_transfer: std::collections::HashMap<NodeId, u128> =
             std::collections::HashMap::new();
         for tx in &block.transactions {
             if let TxKind::Transfer { from, amount, .. } = &tx.kind {
@@ -498,10 +507,10 @@ impl Chain {
                 }
                 // Sender must match tx origin (verified above via tx.verify()).
                 let prior_balance = self.balance(from);
-                let locked = self.locked_balance(from) as i64;
-                let accumulated = *in_block_transfer.get(from).unwrap_or(&0) as i64;
+                let locked = self.locked_balance(from) as i128;
+                let accumulated = *in_block_transfer.get(from).unwrap_or(&0) as i128;
                 let free = prior_balance - locked - accumulated;
-                if free < *amount as i64 {
+                if free < *amount as i128 {
                     return false;
                 }
                 *in_block_transfer.entry(*from).or_insert(0) =
@@ -535,15 +544,15 @@ impl Chain {
             // Accumulate within this block to prevent double-bidding in a single block.
             // Also subtract in-block transfers: a payer cannot transfer away credits and
             // then bid with those same credits in the same block (cross-type double-spend).
-            let mut in_block_bid: std::collections::HashMap<NodeId, u64> =
+            let mut in_block_bid: std::collections::HashMap<NodeId, u128> =
                 std::collections::HashMap::new();
             for tx in &block.transactions {
                 if let TxKind::JobBid { payer, bid, .. } = &tx.kind {
-                    let already_locked = self.locked_balance(payer) as i64;
-                    let in_block = *in_block_bid.get(payer).unwrap_or(&0) as i64;
-                    let transferred = *in_block_transfer.get(payer).unwrap_or(&0) as i64;
+                    let already_locked = self.locked_balance(payer) as i128;
+                    let in_block = *in_block_bid.get(payer).unwrap_or(&0) as i128;
+                    let transferred = *in_block_transfer.get(payer).unwrap_or(&0) as i128;
                     let free = self.balance(payer) - already_locked - in_block - transferred;
-                    if free < *bid as i64 {
+                    if free < *bid as i128 {
                         return false;
                     }
                     *in_block_bid.entry(*payer).or_insert(0) += bid;
@@ -553,7 +562,7 @@ impl Chain {
         // JobSettle rules.
         // open_bids cache tracks all open (unsettled, unexpired) bids — a single lookup
         // replaces the previous O(n) bid-search + O(n) duplicate-settle scan.
-        let mut payer_debit: std::collections::HashMap<NodeId, u64> =
+        let mut payer_debit: std::collections::HashMap<NodeId, u128> =
             std::collections::HashMap::new();
         for tx in &block.transactions {
             if let TxKind::JobSettle { job_id, host, payer, cost, payer_sig, .. } = &tx.kind {
@@ -584,7 +593,7 @@ impl Chain {
                 // Balance check: chain balance minus accumulated debits in this block must cover cost.
                 let prior_balance = self.balance(payer);
                 let accumulated = *payer_debit.get(payer).unwrap_or(&0);
-                if prior_balance.saturating_sub(accumulated as i64) < *cost as i64 {
+                if prior_balance.saturating_sub(accumulated as i128) < *cost as i128 {
                     return false;
                 }
                 *payer_debit.entry(*payer).or_insert(0) =
@@ -625,7 +634,7 @@ impl Chain {
         {
             let mut in_block_epochs: std::collections::HashMap<(NodeId, NodeId), u64> =
                 std::collections::HashMap::new();
-            let mut heartbeat_debits: std::collections::HashMap<NodeId, u64> =
+            let mut heartbeat_debits: std::collections::HashMap<NodeId, u128> =
                 std::collections::HashMap::new();
             for tx in &block.transactions {
                 if let TxKind::Heartbeat { cell, host, amount, epoch } = &tx.kind {
@@ -654,9 +663,9 @@ impl Chain {
                     // Cell balance must cover heartbeat + any credits the cell transferred
                     // away earlier in this same block (cross-type double-spend defence).
                     let prior_balance = self.balance(cell);
-                    let hb_accumulated = *heartbeat_debits.get(cell).unwrap_or(&0) as i64;
-                    let transferred = *in_block_transfer.get(cell).unwrap_or(&0) as i64;
-                    if prior_balance - hb_accumulated - transferred < *amount as i64 {
+                    let hb_accumulated = *heartbeat_debits.get(cell).unwrap_or(&0) as i128;
+                    let transferred = *in_block_transfer.get(cell).unwrap_or(&0) as i128;
+                    if prior_balance - hb_accumulated - transferred < *amount as i128 {
                         return false;
                     }
                     *heartbeat_debits.entry(*cell).or_insert(0) += amount;
@@ -792,15 +801,15 @@ impl Chain {
         // Live caches are still valid — they reflect the full chain and haven't changed.
     }
 
-    /// O(1) balance lookup via the incremental cache.
-    pub fn balance(&self, node: &NodeId) -> i64 {
+    /// O(1) balance lookup via the incremental cache (base units).
+    pub fn balance(&self, node: &NodeId) -> i128 {
         self.balances.get(node).copied().unwrap_or(0)
     }
 
     /// Credits locked in open bids (no matching JobSettle or JobExpire yet) for a node.
     /// Free balance = `balance(node) - locked_balance(node)`.
     /// O(open_jobs) via the open_bids cache.
-    pub fn locked_balance(&self, node: &NodeId) -> u64 {
+    pub fn locked_balance(&self, node: &NodeId) -> u128 {
         self.open_bids
             .values()
             .filter(|(payer, _, _)| payer == node)
@@ -921,7 +930,7 @@ mod tests {
         Identity::load_or_generate(&tmpdir(tag)).unwrap()
     }
 
-    fn signed_transfer(from: &Identity, to: NodeId, amount: u64) -> Tx {
+    fn signed_transfer(from: &Identity, to: NodeId, amount: u128) -> Tx {
         let kind = TxKind::Transfer { from: from.node_id(), to, amount };
         let data = bincode::serialize(&kind).unwrap();
         let sig = from.sign(&data);
@@ -1060,7 +1069,7 @@ mod tests {
         let mut chain = Chain::genesis();
         let id = make_identity("reward");
         seal_and_append(&mut chain, &id);
-        assert_eq!(chain.balance(&id.node_id()), Chain::emission_rate(1) as i64);
+        assert_eq!(chain.balance(&id.node_id()), Chain::emission_rate(1) as i128);
     }
 
     #[test]
@@ -1081,7 +1090,7 @@ mod tests {
 
         assert_eq!(
             chain.balance(&alice.node_id()),
-            alice_before - 10 + Chain::emission_rate(3) as i64,
+            alice_before - 10 + Chain::emission_rate(3) as i128,
         );
         assert_eq!(chain.balance(&bob.node_id()), 10);
     }
@@ -1090,11 +1099,11 @@ mod tests {
 
     #[test]
     fn emission_rate_schedule() {
-        assert_eq!(Chain::emission_rate(0), 1_000);
-        assert_eq!(Chain::emission_rate(209_999), 1_000);
-        assert_eq!(Chain::emission_rate(210_000), 500);
-        assert_eq!(Chain::emission_rate(420_000), 250);
-        assert_eq!(Chain::emission_rate(630_000), 125);
+        assert_eq!(Chain::emission_rate(0), 1_000 * CREDIT);
+        assert_eq!(Chain::emission_rate(209_999), 1_000 * CREDIT);
+        assert_eq!(Chain::emission_rate(210_000), 500 * CREDIT);
+        assert_eq!(Chain::emission_rate(420_000), 250 * CREDIT);
+        assert_eq!(Chain::emission_rate(630_000), 125 * CREDIT);
         assert_eq!(Chain::emission_rate(u64::MAX), 0);
     }
 
@@ -1243,7 +1252,7 @@ mod tests {
 
     // ----- Job lifecycle tests -----
 
-    fn signed_job_bid(payer: &Identity, job_id: [u8; 32], bid: u64) -> Tx {
+    fn signed_job_bid(payer: &Identity, job_id: [u8; 32], bid: u128) -> Tx {
         let kind = TxKind::JobBid {
             job_id,
             payer: payer.node_id(),
@@ -1264,7 +1273,7 @@ mod tests {
         host: &Identity,
         payer: &Identity,
         job_id: [u8; 32],
-        cost: u64,
+        cost: u128,
     ) -> Tx {
         let payer_sig = payer.sign(&payer_settle_bytes(&job_id, &host.node_id(), cost));
         let kind = TxKind::JobSettle {
@@ -1282,8 +1291,8 @@ mod tests {
     }
 
     /// Mine enough blocks so `payer` has at least `min` credits.
-    fn fund(chain: &mut Chain, payer: &Identity, min: u64) {
-        while (chain.balance(&payer.node_id()) as u64) < min {
+    fn fund(chain: &mut Chain, payer: &Identity, min: u128) {
+        while chain.balance(&payer.node_id()) < min as i128 {
             assert!(seal_and_append(chain, payer));
         }
     }
@@ -1313,11 +1322,11 @@ mod tests {
 
         assert_eq!(
             chain.balance(&payer.node_id()),
-            payer_before - cost as i64,
+            payer_before - cost as i128,
         );
         assert_eq!(
             chain.balance(&host.node_id()),
-            host_before + cost as i64 + Chain::emission_rate(chain.tip().index) as i64,
+            host_before + cost as i128 + Chain::emission_rate(chain.tip().index) as i128,
         );
     }
 
@@ -1545,7 +1554,7 @@ mod tests {
         assert!(chain.append(block), "valid TrustGrant must be accepted");
     }
 
-    fn signed_heartbeat(host: &Identity, cell_id: NodeId, amount: u64, epoch: u64) -> Tx {
+    fn signed_heartbeat(host: &Identity, cell_id: NodeId, amount: u128, epoch: u64) -> Tx {
         let kind = TxKind::Heartbeat { cell: cell_id, host: host.node_id(), amount, epoch };
         let data = bincode::serialize(&kind).unwrap();
         let sig = host.sign(&data);
@@ -1558,13 +1567,14 @@ mod tests {
         let cell = make_identity("hb-cell");
         let mut chain = Chain::genesis();
         fund(&mut chain, &cell, 1_000);
+        let before = chain.balance(&cell.node_id());
 
         let hb = signed_heartbeat(&host, cell.node_id(), 100, 0);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, hb], host.node_id());
         block.seal(&host);
         assert!(chain.append(block), "valid heartbeat must be accepted");
-        assert_eq!(chain.balance(&cell.node_id()), 1_000 - 100);
+        assert_eq!(chain.balance(&cell.node_id()), before - 100);
         assert_eq!(chain.last_heartbeat_epoch(&cell.node_id(), &host.node_id()), Some(0));
     }
 
@@ -1827,7 +1837,7 @@ mod tests {
         assert!(balance_after_two_rewards > 0);
 
         // First spend: transfer half to victim. Chain height 3.
-        let spend_amount = 1u64;
+        let spend_amount = 1u128;
         let transfer = signed_transfer(&miner, victim.node_id(), spend_amount);
         let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, transfer.clone()], miner.node_id());
@@ -2011,14 +2021,17 @@ mod tests {
         let eve = make_identity("xtd-eve");
         let mut chain = Chain::genesis();
         fund(&mut chain, &alice, 1_000);
+        let bal = chain.balance(&alice.node_id()) as u128;
+        // Each spend is 80% of the balance; together (160%) they exceed it.
+        let spend = bal * 8 / 10;
 
-        let transfer = signed_transfer(&alice, eve.node_id(), 800);
-        let bid = signed_job_bid(&alice, [42u8; 32], 800);
+        let transfer = signed_transfer(&alice, eve.node_id(), spend);
+        let bid = signed_job_bid(&alice, [42u8; 32], spend);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, transfer, bid], host.node_id());
         block.seal(&host);
         assert!(!chain.append(block), "transfer + bid exceeding free balance must be rejected");
-        assert_eq!(chain.balance(&alice.node_id()), 1_000, "alice's balance must be unchanged");
+        assert_eq!(chain.balance(&alice.node_id()), bal as i128, "alice's balance must be unchanged");
     }
 
     // Attack 10: Cross-type in-block double-spend — Transfer + Heartbeat.
@@ -2026,23 +2039,25 @@ mod tests {
     // the same credits in one block. Before the fix the heartbeat balance check did not see
     // the in-block transfer; now it does.
     //
-    // fund(&mut chain, &bob, 500) yields exactly 1000 credits (emission_rate=1000, one block).
-    // 800 (transfer) + 800 (heartbeat) = 1600 > 1000, so the block must be rejected.
+    // One mined block funds bob with emission_rate(1) base units. A transfer and a heartbeat
+    // each for 80% of that balance sum to 160% — the block must be rejected.
     #[test]
     fn transfer_and_heartbeat_same_credits_rejected() {
         let host = make_identity("xth-host");
         let bob = make_identity("xth-bob");
         let eve = make_identity("xth-eve");
         let mut chain = Chain::genesis();
-        fund(&mut chain, &bob, 500); // bob accumulates exactly 1000 credits
+        fund(&mut chain, &bob, 500);
+        let bal = chain.balance(&bob.node_id()) as u128;
+        let spend = bal * 8 / 10;
 
-        let transfer = signed_transfer(&bob, eve.node_id(), 800);
-        let hb = signed_heartbeat(&host, bob.node_id(), 800, 1);
+        let transfer = signed_transfer(&bob, eve.node_id(), spend);
+        let hb = signed_heartbeat(&host, bob.node_id(), spend, 1);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, transfer, hb], host.node_id());
         block.seal(&host);
         assert!(!chain.append(block), "transfer + heartbeat exceeding cell balance must be rejected");
-        assert_eq!(chain.balance(&bob.node_id()), 1_000, "bob's balance must be unchanged");
+        assert_eq!(chain.balance(&bob.node_id()), bal as i128, "bob's balance must be unchanged");
     }
 
     // Attack 11: Block-size bomb — adversary packs more than MAX_TXS_PER_BLOCK transactions.
@@ -2054,7 +2069,7 @@ mod tests {
         let mut chain = Chain::genesis();
         // Fund just enough for MAX_TXS_PER_BLOCK × 1-credit transfers.
         // emission_rate=1000, so 2 blocks suffices for 1024 credits.
-        fund(&mut chain, &miner, MAX_TXS_PER_BLOCK as u64);
+        fund(&mut chain, &miner, MAX_TXS_PER_BLOCK as u128);
 
         let height_before = chain.height();
         let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
@@ -2094,7 +2109,7 @@ mod tests {
         assert_eq!(chain.balance(&miner.node_id()), 0, "miner gets nothing");
         assert_eq!(
             chain.balance(&beneficiary.node_id()),
-            amount as i64,
+            amount as i128,
             "beneficiary receives the full emission"
         );
     }
@@ -2111,6 +2126,7 @@ mod tests {
         let bob = make_identity("rogue-bob");
         let mut chain = Chain::genesis();
         fund(&mut chain, &bob, 1_000);
+        let before = chain.balance(&bob.node_id());
 
         let hb = signed_heartbeat(&mallory, bob.node_id(), 500, 1);
         let reward = signed_uptime_reward(&mallory, chain.tip().index + 1);
@@ -2118,7 +2134,7 @@ mod tests {
         block.seal(&mallory);
         // KNOWN LIMITATION: succeeds without a prior bid; bob is drained without consent.
         assert!(chain.append(block), "rogue heartbeat accepted — known design limitation");
-        assert_eq!(chain.balance(&bob.node_id()), 500, "bob drained 500 credits by rogue host");
+        assert_eq!(chain.balance(&bob.node_id()), before - 500, "bob drained 500 base units by rogue host");
     }
 
     // Attack 14: Zero-amount transfer chain bloat.
@@ -2198,9 +2214,9 @@ mod tests {
         assert!(chain.try_reorg(shadow_blocks), "valid longer shadow fork must win");
         assert_eq!(chain.balance(&bob.node_id()), 0, "Bob's payment erased by reorg");
         // Mallory gets: 500 (transfer from alice) + 2 × emission_rate (shadow blocks 2–3).
-        let mallory_expected = 500i64
-            + Chain::emission_rate(3) as i64
-            + Chain::emission_rate(4) as i64;
+        let mallory_expected = 500i128
+            + Chain::emission_rate(3) as i128
+            + Chain::emission_rate(4) as i128;
         assert_eq!(chain.balance(&mallory.node_id()), mallory_expected, "Mallory receives transfer + mining rewards after reorg");
     }
 }

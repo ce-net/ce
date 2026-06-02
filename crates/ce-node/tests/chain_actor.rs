@@ -586,7 +586,7 @@ async fn adversarial_double_append_same_block_safe() {
     assert_eq!(handle.height().await, 1);
 
     // Balance should reflect exactly one UptimeReward, not two.
-    let expected = Chain::emission_rate(1) as i64;
+    let expected = Chain::emission_rate(1) as i128;
     assert_eq!(handle.balance(id.node_id()).await, expected);
 }
 
@@ -598,7 +598,7 @@ async fn adversarial_emission_overflow_rejected() {
 
     let bad_kind = TxKind::UptimeReward {
         node: id.node_id(),
-        amount: u64::MAX, // way over the schedule
+        amount: u128::MAX, // way over the schedule
         epoch: 1,
     };
     let data = bincode::serialize(&bad_kind).unwrap();
@@ -772,8 +772,8 @@ async fn actor_settled_on_chain_finds_settle_tx() {
     let host = make_identity("settle-host");
     let payer = make_identity("settle-payer");
     let job_id: [u8; 32] = [0xAB; 32];
-    let cost = 100u64;
-    let bid = 500u64;
+    let cost = 100u128;
+    let bid = 500u128;
 
     use ce_chain::payer_settle_bytes;
     let mut raw = Chain::genesis();

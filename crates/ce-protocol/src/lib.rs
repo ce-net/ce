@@ -44,7 +44,8 @@ pub struct Capability {
 pub struct BurnProof {
     /// ID of the Meter or Transfer Tx that was burned.
     pub tx_id: [u8; 32],
-    pub amount: u64,
+    /// Burned amount in base units (1 credit = `ce_chain::CREDIT` base units).
+    pub amount: u128,
     /// Block that confirmed the burn.
     pub block_height: u64,
     pub block_hash: [u8; 32],

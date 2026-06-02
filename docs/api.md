@@ -4,6 +4,8 @@ Base URL: `http://localhost:8844` (configurable via `--api-port`)
 
 All request and response bodies are JSON. All responses include a `Content-Type: application/json` header.
 
+**Credit amounts** (`bid`, `cost`, `amount`, `balance`, burn `amount`) are carried as decimal **strings** of base units, not JSON numbers — `1 credit = 10^18 base units`, and values routinely exceed JavaScript's 2^53 safe-integer limit, so a number would lose precision. Send e.g. `"bid": "1000000000000000000"` for 1 credit. Clients convert to/from human credit decimals.
+
 ---
 
 ## GET /health

@@ -11,7 +11,8 @@
 | **Foreign container** | A Docker container without ce-protocol-1 support. Runs but is invisible to the protocol layer. |
 | **Job** | A Docker container managed by CE (cell or foreign). Identified by `job_id` (= Docker container ID). |
 | **Job ID** | The Docker container ID that CE uses as the job identifier. Single canonical value, returned as `job_id` from the API. |
-| **Credit** | The unit of economic value. Denominated as a `u64` integer. Stored as signed `i64` balances to allow temporary deficits during sync. |
+| **Credit** | The unit of economic value, for display. Internally all amounts are integer **base units** — `1 credit = CREDIT (10^18) base units`, wei-style — so micropayments and decades of halvings stay representable. On-chain amounts are `u128` base units; balances are `i128` (signed, to allow temporary deficits during sync). Never floating point: float arithmetic is non-deterministic across machines and would split consensus. |
+| **Base unit** | The atomic integer unit of value. `CREDIT = 10^18` base units = 1 credit (`ce_chain::CREDIT`). All `TxKind` amounts, balances, and `SUPPLY_CAP` are denominated in base units. The CLI converts to/from human credit decimals for display and input; the HTTP API carries amounts as decimal **strings** (values exceed JSON's 2^53 safe-integer limit). |
 | **Balance** | A node's net credit position: mining rewards + hosting income − job spend. |
 | **Block reward** | Credits earned by the miner of a block. Starts at 1,000, halves every 210,000 blocks. |
 | **Payer** | The node whose balance is debited when a job runs. Identified by `NodeId`. |

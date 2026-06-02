@@ -77,13 +77,44 @@ fn err(code: StatusCode, msg: impl Into<String>) -> Response {
     (code, Json(ErrorBody { error: msg.into() })).into_response()
 }
 
+/// Serde helpers: 128-bit credit amounts (base units) are carried in JSON as decimal
+/// **strings**, not numbers. Values in base units routinely exceed JavaScript's 2^53
+/// safe-integer limit, so a JSON number would silently lose precision. Internally
+/// everything stays integer base units; only the JSON boundary uses strings.
+mod amount_str {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &u128, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+        String::deserialize(d)?.trim().parse().map_err(serde::de::Error::custom)
+    }
+}
+mod amount_str_i128 {
+    use serde::Serializer;
+    // Serialize-only: the i128 field (balance) is response-only.
+    pub fn serialize<S: Serializer>(v: &i128, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+}
+mod amount_str_opt {
+    use serde::Serializer;
+    pub fn serialize<S: Serializer>(v: &Option<u128>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(x) => s.serialize_str(&x.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+}
+
 /// Snapshot returned by GET /status.
 #[derive(Debug, Serialize)]
 pub struct NodeStatusResponse {
     pub node_id: String,
     pub height: u64,
     pub difficulty: u8,
-    pub balance: i64,
+    #[serde(with = "amount_str_i128")]
+    pub balance: i128,
 }
 
 // ----- POST /jobs/bid -----
@@ -98,7 +129,8 @@ pub struct BidRequest {
     pub cpu_cores: u32,
     pub mem_mb: u64,
     pub duration_secs: u64,
-    pub bid: u64,
+    #[serde(with = "amount_str")]
+    pub bid: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,7 +211,8 @@ pub struct JobStatusResponse {
     /// "pending" | "running" | "awaiting_settlement" | "settled" | "failed"
     pub status: String,
     pub container_id: Option<String>,
-    pub cost: Option<u64>,
+    #[serde(with = "amount_str_opt")]
+    pub cost: Option<u128>,
 }
 
 fn status_string(s: &CeJobStatus) -> String {
@@ -218,8 +251,9 @@ async fn job_status(State(state): State<ApiState>, Path(id): Path<String>) -> Re
 
 #[derive(Debug, Deserialize)]
 pub struct SettleRequest {
-    /// Agreed settlement amount in credits.
-    pub cost: u64,
+    /// Agreed settlement amount in base units.
+    #[serde(with = "amount_str")]
+    pub cost: u128,
     /// Payer's Ed25519 signature over payer_settle_bytes(job_id, host, cost) v2, 128 hex chars.
     pub payer_sig: String,
 }
@@ -328,7 +362,8 @@ struct SignalView {
 #[derive(Debug, Serialize)]
 struct BurnProofView {
     tx_id: String,
-    amount: u64,
+    #[serde(with = "amount_str")]
+    amount: u128,
     block_height: u64,
     block_hash: String,
 }
@@ -450,7 +485,7 @@ async fn send_signal(
         .into_response()
 }
 
-fn tx_value(tx: &ce_chain::Tx) -> Option<u64> {
+fn tx_value(tx: &ce_chain::Tx) -> Option<u128> {
     use ce_chain::TxKind;
     match &tx.kind {
         TxKind::Transfer { amount, .. } => Some(*amount),
@@ -726,8 +761,10 @@ struct JobListItem {
     status: String,
     payer: String,
     container_id: Option<String>,
-    cost: Option<u64>,
-    bid: u64,
+    #[serde(with = "amount_str_opt")]
+    cost: Option<u128>,
+    #[serde(with = "amount_str")]
+    bid: u128,
 }
 
 async fn list_jobs(State(state): State<ApiState>) -> Response {
@@ -752,7 +789,8 @@ async fn list_jobs(State(state): State<ApiState>) -> Response {
 pub struct TransferRequest {
     /// Recipient NodeId as 64 hex chars.
     pub to: String,
-    pub amount: u64,
+    #[serde(with = "amount_str")]
+    pub amount: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -770,7 +808,7 @@ async fn transfer(State(state): State<ApiState>, Json(req): Json<TransferRequest
     }
     let from = state.identity.node_id();
     let balance = state.chain.balance(from).await;
-    if balance < req.amount as i64 {
+    if balance < req.amount as i128 {
         return err(
             StatusCode::PAYMENT_REQUIRED,
             format!("balance {balance} insufficient for transfer {}", req.amount),
@@ -962,8 +1000,9 @@ struct TxStreamView {
     id: String,
     origin: String,
     kind: &'static str,
-    /// Credit amount associated with this tx (0 for kinds without one).
-    amount: u64,
+    /// Credit amount in base units associated with this tx (0 for kinds without one).
+    #[serde(with = "amount_str")]
+    amount: u128,
 }
 
 fn tx_stream_view(tx: &Tx) -> TxStreamView {

@@ -437,7 +437,7 @@ async fn job_lifecycle() {
         "cpu_cores": 1,
         "mem_mb": 64,
         "duration_secs": 10,
-        "bid": 100
+        "bid": "100"
     });
     let resp = client
         .post(format!("http://127.0.0.1:{api_payer}/jobs/bid"))
@@ -492,7 +492,7 @@ async fn job_lifecycle() {
     // Compute the payer co-signature.
     let job_id: [u8; 32] =
         hex::decode(&job_id_hex).unwrap().try_into().expect("job_id is 32 bytes");
-    let cost: u64 = 50; // agreed settlement amount (≤ bid)
+    let cost: u128 = 50; // agreed settlement amount (≤ bid), in base units
     let payer_identity = Identity::load_or_generate(&dir_payer.join("identity")).unwrap();
     let host_node_id: [u8; 32] = hex::decode(&node_host.status().await.node_id)
         .unwrap()
@@ -502,7 +502,7 @@ async fn job_lifecycle() {
 
     // Submit the settlement to the host node.
     let settle_body = serde_json::json!({
-        "cost": cost,
+        "cost": cost.to_string(),
         "payer_sig": hex::encode(payer_sig)
     });
     let resp = client

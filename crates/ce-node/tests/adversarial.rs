@@ -136,9 +136,9 @@ async fn attack_double_spend_single_block() {
     let mut b1 = chain.next_block(vec![reward_tx], attacker.node_id());
     b1.seal(&attacker);
     assert!(chain.append(b1));
-    assert_eq!(chain.balance(&attacker.node_id()), reward_amount as i64);
+    assert_eq!(chain.balance(&attacker.node_id()), reward_amount as i128);
 
-    let make_transfer = |amount: u64| -> Tx {
+    let make_transfer = |amount: u128| -> Tx {
         let kind = TxKind::Transfer {
             from: attacker.node_id(),
             to: victim.node_id(),
@@ -155,7 +155,7 @@ async fn attack_double_spend_single_block() {
 
     assert!(!chain.append(bad_block), "chain accepted a double-spend block");
     assert_eq!(chain.height(), 1, "height must not advance after rejected double-spend");
-    assert_eq!(chain.balance(&attacker.node_id()), reward_amount as i64, "balance unchanged");
+    assert_eq!(chain.balance(&attacker.node_id()), reward_amount as i128, "balance unchanged");
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +172,7 @@ async fn attack_burn_proof_theft() {
     let (node_a, dir_a, p2p_a, api_a) = mining_node("bp-a", None).await;
 
     // Wait for node A to mine a burnable tx.
-    let mut burn_info: Option<([u8; 32], u64)> = None;
+    let mut burn_info: Option<([u8; 32], u128)> = None;
     for _ in 0..20 {
         sleep(Duration::from_secs(1)).await;
         if let Some(b) = node_a.any_burnable_tx().await {

@@ -114,9 +114,9 @@ pub struct JobRecord {
     /// Payer co-signature over payer_settle_bytes(job_id, cost), supplied via POST /jobs/:id/settle.
     pub payer_sig: Option<[u8; 64]>,
     /// Agreed settlement cost, set alongside payer_sig.
-    pub cost: Option<u64>,
+    pub cost: Option<u128>,
     /// Original bid amount from the JobBid tx. Used for heartbeat rate calculation.
-    pub bid: u64,
+    pub bid: u128,
     /// Expected job duration in seconds. Used for heartbeat rate calculation.
     pub duration_secs: u64,
 }
@@ -404,15 +404,15 @@ impl Node {
         Ok(node)
     }
 
-    pub async fn balance(&self) -> i64 {
+    pub async fn balance(&self) -> i128 {
         self.chain.balance(self.identity.node_id()).await
     }
 
-    pub async fn any_burnable_tx(&self) -> Option<([u8; 32], u64)> {
+    pub async fn any_burnable_tx(&self) -> Option<([u8; 32], u128)> {
         self.chain.any_burnable_tx().await
     }
 
-    pub async fn any_burnable_tx_by_self(&self) -> Option<([u8; 32], u64)> {
+    pub async fn any_burnable_tx_by_self(&self) -> Option<([u8; 32], u128)> {
         self.chain.any_burnable_tx_by_origin(self.identity.node_id()).await
     }
 
@@ -443,7 +443,7 @@ pub struct NodeStatus {
     pub peer_id: String,
     pub height: u64,
     pub difficulty: u8,
-    pub balance: i64,
+    pub balance: i128,
     pub listen_port: u16,
     pub api_port: u16,
 }
@@ -1188,7 +1188,7 @@ async fn submit_pending_settles(
     pool: &TxPool,
     job_store: &JobStore,
 ) {
-    let ready: Vec<([u8; 32], NodeId, u64, [u8; 64])> = {
+    let ready: Vec<([u8; 32], NodeId, u128, [u8; 64])> = {
         let store = job_store.lock().await;
         store
             .values()
@@ -1247,7 +1247,7 @@ async fn emit_heartbeats(
     job_store: &JobStore,
     heartbeat_epochs: &mut HashMap<NodeId, u64>,
 ) -> Vec<([u8; 32], Option<String>)> {
-    let running: Vec<(NodeId, u64, u64, [u8; 32], Option<String>)> = {
+    let running: Vec<(NodeId, u128, u64, [u8; 32], Option<String>)> = {
         let store = job_store.lock().await;
         store
             .values()
@@ -1259,14 +1259,14 @@ async fn emit_heartbeats(
     let mut to_terminate: Vec<([u8; 32], Option<String>)> = Vec::new();
 
     for (cell, bid, duration_secs, job_id, container_id) in running {
-        let intervals = (duration_secs / 30).max(1);
+        let intervals = (duration_secs / 30).max(1) as u128;
         let amount = bid / intervals;
         if amount == 0 {
             continue;
         }
 
         let cell_balance = chain.balance(cell).await;
-        if cell_balance < amount as i64 {
+        if cell_balance < amount as i128 {
             info!(
                 "cell {} insufficient balance ({cell_balance}) for heartbeat {amount}, \
                  terminating job {}",
@@ -1438,7 +1438,7 @@ fn available_mem_mb() -> u32 {
     4096
 }
 
-fn tx_burn_amount(tx: &Tx) -> Option<u64> {
+fn tx_burn_amount(tx: &Tx) -> Option<u128> {
     match &tx.kind {
         TxKind::Transfer { amount, .. } => Some(*amount),
         TxKind::UptimeReward { amount, .. } => Some(*amount),

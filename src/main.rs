@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use ce_chain::Chain;
+use ce_chain::{Chain, CREDIT};
 use ce_identity::Identity;
 use ce_node::{
     auth::make_auth_headers,
@@ -169,8 +169,9 @@ enum Commands {
     Deploy {
         /// Docker image to run.
         image: String,
+        /// Credits to fund the job with (decimal allowed, e.g. 1000 or 1.5).
         #[arg(long, default_value = "1000")]
-        fund: u64,
+        fund: String,
         #[arg(long, default_value = "1")]
         cpu: u32,
         #[arg(long, default_value = "128")]
@@ -226,7 +227,8 @@ enum Commands {
     Fund {
         /// Recipient NodeId (64 hex chars).
         to: String,
-        amount: u64,
+        /// Credits to transfer (decimal allowed, e.g. 500 or 0.25).
+        amount: String,
         #[arg(long, default_value = "8844")]
         api_port: u16,
     },
@@ -303,6 +305,42 @@ enum FleetCommands {
         #[arg(required = true)]
         tags: Vec<String>,
     },
+}
+
+/// Format base units as a human credit string, trimming trailing fractional zeros.
+/// 1 credit = `CREDIT` (10^18) base units.
+fn format_credits(base: i128) -> String {
+    let sign = if base < 0 { "-" } else { "" };
+    let v = base.unsigned_abs();
+    let whole = v / CREDIT;
+    let frac = v % CREDIT;
+    if frac == 0 {
+        format!("{sign}{whole}")
+    } else {
+        let frac_str = format!("{frac:018}");
+        format!("{sign}{whole}.{}", frac_str.trim_end_matches('0'))
+    }
+}
+
+/// Parse a human credit string (e.g. "1000", "1.5", "0.000001") into base units.
+/// Accepts up to 18 decimal places.
+fn parse_credits(s: &str) -> Result<u128> {
+    let s = s.trim();
+    let (whole_str, frac_str) = s.split_once('.').unwrap_or((s, ""));
+    if frac_str.len() > 18 {
+        return Err(anyhow!("amount '{s}' has more than 18 decimal places"));
+    }
+    let whole: u128 = if whole_str.is_empty() {
+        0
+    } else {
+        whole_str.parse().map_err(|_| anyhow!("invalid amount '{s}'"))?
+    };
+    // Right-pad the fractional part to 18 digits so "5" means 0.5, not 0.000…5.
+    let frac: u128 = format!("{frac_str:0<18}").parse().map_err(|_| anyhow!("invalid amount '{s}'"))?;
+    whole
+        .checked_mul(CREDIT)
+        .and_then(|w| w.checked_add(frac))
+        .ok_or_else(|| anyhow!("amount '{s}' is too large"))
 }
 
 /// Parse a human duration into seconds: `7d`, `24h`, `30m`, `3600s`, or a bare number (seconds).
@@ -609,7 +647,7 @@ async fn main() -> Result<()> {
             println!("  node id  : {}", status.node_id);
             println!("  peer id  : {}", status.peer_id);
             println!("  height   : {}", status.height);
-            println!("  balance  : {}", status.balance);
+            println!("  balance  : {} credits", format_credits(status.balance));
             println!("  p2p port : {}", status.listen_port);
             println!("  api port : {}", status.api_port);
             println!();
@@ -645,7 +683,7 @@ async fn main() -> Result<()> {
             let chain_path = data_dir.join("chain").join("chain.json");
             let identity = Identity::load_or_generate(&identity_dir)?;
             let chain = Chain::load_or_genesis(&chain_path);
-            println!("{}", chain.balance(&identity.node_id()));
+            println!("{} credits", format_credits(chain.balance(&identity.node_id())));
         }
 
         Commands::Status => {
@@ -656,7 +694,7 @@ async fn main() -> Result<()> {
             println!("node id   : {}", identity.node_id_hex());
             println!("height    : {}", chain.height());
             println!("difficulty: {}", chain.difficulty);
-            println!("balance   : {}", chain.balance(&identity.node_id()));
+            println!("balance   : {} credits", format_credits(chain.balance(&identity.node_id())));
         }
 
         Commands::Id => {
@@ -964,13 +1002,15 @@ async fn main() -> Result<()> {
 
         Commands::Deploy { image, fund, cpu, mem, duration, cmd, api_port } => {
             let url = format!("http://127.0.0.1:{api_port}/jobs/bid");
+            // Amounts cross JSON as decimal strings of base units (precision-safe).
+            let bid_base = parse_credits(&fund)?.to_string();
             let body = serde_json::json!({
                 "image": image,
                 "cmd": cmd,
                 "cpu_cores": cpu,
                 "mem_mb": mem,
                 "duration_secs": duration,
-                "bid": fund,
+                "bid": bid_base,
             });
             let client = reqwest::Client::new();
             let resp = client.post(&url).json(&body).send().await?;
@@ -997,13 +1037,18 @@ async fn main() -> Result<()> {
             if jobs.is_empty() {
                 println!("No jobs.");
             } else {
-                println!("{:<66}  {:<22}  {:<8}  payer", "JOB ID", "STATUS", "BID");
+                println!("{:<66}  {:<22}  {:<12}  payer", "JOB ID", "STATUS", "BID");
                 for job in jobs {
                     let id     = job["job_id"].as_str().unwrap_or("?");
                     let status = job["status"].as_str().unwrap_or("?");
-                    let bid    = job["bid"].as_u64().unwrap_or(0);
+                    // bid arrives as a decimal string of base units; show it in credits.
+                    let bid = job["bid"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u128>().ok())
+                        .map(|b| format_credits(b as i128))
+                        .unwrap_or_else(|| "?".into());
                     let payer  = job["payer"].as_str().unwrap_or("?");
-                    println!("{id:<66}  {status:<22}  {bid:<8}  {payer}");
+                    println!("{id:<66}  {status:<22}  {bid:<12}  {payer}");
                 }
             }
         }
@@ -1023,7 +1068,8 @@ async fn main() -> Result<()> {
 
         Commands::Fund { to, amount, api_port } => {
             let url = format!("http://127.0.0.1:{api_port}/transfer");
-            let body = serde_json::json!({ "to": to, "amount": amount });
+            let amount_base = parse_credits(&amount)?.to_string();
+            let body = serde_json::json!({ "to": to, "amount": amount_base });
             let client = reqwest::Client::new();
             let resp = client.post(&url).json(&body).send().await?;
             if !resp.status().is_success() {
@@ -1059,4 +1105,45 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod credit_tests {
+    use super::{format_credits, parse_credits};
+    use ce_chain::CREDIT;
+
+    #[test]
+    fn parse_whole_and_fractional_credits() {
+        assert_eq!(parse_credits("1000").unwrap(), 1_000 * CREDIT);
+        assert_eq!(parse_credits("1").unwrap(), CREDIT);
+        assert_eq!(parse_credits("0.5").unwrap(), CREDIT / 2);
+        assert_eq!(parse_credits("1.5").unwrap(), CREDIT + CREDIT / 2);
+        // 18 decimal places = smallest base unit.
+        assert_eq!(parse_credits("0.000000000000000001").unwrap(), 1);
+        assert_eq!(parse_credits(".25").unwrap(), CREDIT / 4);
+    }
+
+    #[test]
+    fn parse_rejects_too_many_decimals() {
+        assert!(parse_credits("0.0000000000000000001").is_err()); // 19 places
+        assert!(parse_credits("abc").is_err());
+    }
+
+    #[test]
+    fn format_trims_and_round_trips() {
+        assert_eq!(format_credits((1_000 * CREDIT) as i128), "1000");
+        assert_eq!(format_credits(CREDIT as i128), "1");
+        assert_eq!(format_credits((CREDIT / 2) as i128), "0.5");
+        assert_eq!(format_credits(1), "0.000000000000000001");
+        assert_eq!(format_credits(-(CREDIT as i128)), "-1");
+        assert_eq!(format_credits(0), "0");
+    }
+
+    #[test]
+    fn round_trip_random_values() {
+        for credits in ["0", "1", "42", "1000000", "0.123456789012345678", "21000000000"] {
+            let base = parse_credits(credits).unwrap();
+            assert_eq!(format_credits(base as i128), credits, "round-trip {credits}");
+        }
+    }
 }
