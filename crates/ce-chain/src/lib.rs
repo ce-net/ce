@@ -284,6 +284,32 @@ pub const SUPPLY_CAP: u128 = 21_000_000_000 * CREDIT;
 /// zstd magic bytes (little-endian frame magic).
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
+/// Per-node interaction history derived from the chain — the **reputation substrate**.
+/// CE does not score trust; it guarantees these immutable facts, and apps compute their own
+/// per-relationship trust from them. All amounts are base units. Built incrementally as blocks
+/// apply (same pattern as `balances`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodeStats {
+    /// Jobs this node settled as the host (work delivered and paid for).
+    pub jobs_hosted: u64,
+    /// Jobs this node paid for as the payer.
+    pub jobs_paid: u64,
+    /// Heartbeats this node received as host (long-running work it served).
+    pub heartbeats_hosted: u64,
+    /// Heartbeats this node paid as the cell (long-running work it consumed).
+    pub heartbeats_paid: u64,
+    /// Bids this node let expire as payer without settling (host never delivered / no-show).
+    pub expiries: u64,
+    /// Total credits earned hosting work (settlements + heartbeats received).
+    pub earned: u128,
+    /// Total credits spent on work (settlements + heartbeats paid).
+    pub spent: u128,
+    /// Block height at which this node was first seen in an interaction (0 = never).
+    pub first_height: u64,
+    /// Block height of this node's most recent interaction.
+    pub last_height: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chain {
     /// Blocks after the checkpoint (or all blocks if no checkpoint exists).
@@ -318,6 +344,10 @@ pub struct Chain {
     /// Cumulative UptimeReward supply. Avoids O(n) scan in append().
     #[serde(skip, default)]
     total_supply_cache: u128,
+
+    /// Per-node interaction history (reputation substrate). O(1) lookup, built incrementally.
+    #[serde(skip, default)]
+    node_stats: std::collections::HashMap<NodeId, NodeStats>,
 }
 
 impl Chain {
@@ -340,6 +370,7 @@ impl Chain {
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
             total_supply_cache: 0,
+            node_stats: std::collections::HashMap::new(),
         }
     }
 
@@ -351,6 +382,10 @@ impl Chain {
         self.tx_index.clear();
         self.open_bids.clear();
         self.total_supply_cache = 0;
+        // node_stats is rebuilt from available blocks. A pruned light node therefore holds
+        // only post-checkpoint reputation; full history lives on archive nodes (query one of
+        // those for complete reputation). Acceptable for v0.
+        self.node_stats.clear();
 
         // Seed caches from checkpoint if present.
         if let Some(ref cp) = self.checkpoint {
@@ -383,6 +418,14 @@ impl Chain {
                     *self.balances.entry(*payer).or_insert(0) -= *cost as i128;
                     *self.balances.entry(*host).or_insert(0) += *cost as i128;
                     self.open_bids.remove(job_id);
+                    let h = block.index;
+                    let (cost, host, payer) = (*cost, *host, *payer);
+                    let s = self.node_stat(&host, h);
+                    s.jobs_hosted += 1;
+                    s.earned = s.earned.saturating_add(cost);
+                    let s = self.node_stat(&payer, h);
+                    s.jobs_paid += 1;
+                    s.spent = s.spent.saturating_add(cost);
                 }
                 TxKind::Heartbeat { cell, host, amount, epoch } => {
                     *self.balances.entry(*cell).or_insert(0) -= *amount as i128;
@@ -391,17 +434,43 @@ impl Chain {
                     if *epoch >= *e {
                         *e = *epoch;
                     }
+                    let h = block.index;
+                    let (amount, host, cell) = (*amount, *host, *cell);
+                    let s = self.node_stat(&host, h);
+                    s.heartbeats_hosted += 1;
+                    s.earned = s.earned.saturating_add(amount);
+                    let s = self.node_stat(&cell, h);
+                    s.heartbeats_paid += 1;
+                    s.spent = s.spent.saturating_add(amount);
                 }
                 TxKind::JobBid { job_id, payer, bid, .. } => {
                     self.open_bids.insert(*job_id, (*payer, *bid, block.index));
                 }
-                TxKind::JobExpire { job_id, .. } => {
+                TxKind::JobExpire { job_id, payer } => {
                     self.open_bids.remove(job_id);
+                    let h = block.index;
+                    self.node_stat(payer, h).expiries += 1;
                 }
                 TxKind::TrustGrant { .. } => {}
             }
             self.tx_index.insert(tx.id(), (block.index, pos));
         }
+    }
+
+    /// Mutable per-node stats entry, stamping first/last interaction height.
+    fn node_stat(&mut self, node: &NodeId, height: u64) -> &mut NodeStats {
+        let s = self.node_stats.entry(*node).or_default();
+        if s.first_height == 0 {
+            s.first_height = height;
+        }
+        s.last_height = height;
+        s
+    }
+
+    /// Per-node interaction history (reputation substrate). Returns defaults for an
+    /// unknown node. O(1). Apps derive their own trust from these facts.
+    pub fn node_history(&self, node: &NodeId) -> NodeStats {
+        self.node_stats.get(node).cloned().unwrap_or_default()
     }
 
     pub fn tip(&self) -> &Block {
@@ -749,6 +818,7 @@ impl Chain {
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
             total_supply_cache: 0,
+            node_stats: std::collections::HashMap::new(),
         };
         reorg_chain.rebuild_caches();
         for block in new_suffix {
@@ -784,6 +854,7 @@ impl Chain {
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
             total_supply_cache: 0,
+            node_stats: std::collections::HashMap::new(),
         };
         snap.rebuild_caches();
 
@@ -1096,6 +1167,57 @@ mod tests {
     }
 
     // ----- Emission schedule -----
+
+    #[test]
+    fn node_history_tracks_settlements_and_heartbeats() {
+        let host = make_identity("hist-host");
+        let payer = make_identity("hist-payer");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 2_000);
+
+        // Bid then settle a job for 600 base units.
+        let job_id = [9u8; 32];
+        let bid = signed_job_bid(&payer, job_id, 1_000);
+        let r1 = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut b = chain.next_block(vec![r1, bid], host.node_id());
+        b.seal(&host);
+        assert!(chain.append(b));
+
+        let settle = signed_job_settle(&host, &payer, job_id, 600);
+        let r2 = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut b = chain.next_block(vec![r2, settle], host.node_id());
+        b.seal(&host);
+        assert!(chain.append(b));
+
+        let hs = chain.node_history(&host.node_id());
+        assert_eq!(hs.jobs_hosted, 1, "host settled one job");
+        assert_eq!(hs.earned, 600);
+        assert_eq!(hs.jobs_paid, 0);
+        assert!(hs.first_height >= 1 && hs.last_height >= hs.first_height);
+
+        let ps = chain.node_history(&payer.node_id());
+        assert_eq!(ps.jobs_paid, 1, "payer paid one job");
+        assert_eq!(ps.spent, 600);
+        assert_eq!(ps.jobs_hosted, 0);
+
+        // A heartbeat cell -> host updates both sides.
+        let cell = make_identity("hist-cell");
+        fund(&mut chain, &cell, 2_000);
+        let hb = signed_heartbeat(&host, cell.node_id(), 50, 1);
+        let r3 = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut b = chain.next_block(vec![r3, hb], host.node_id());
+        b.seal(&host);
+        assert!(chain.append(b));
+
+        assert_eq!(chain.node_history(&host.node_id()).heartbeats_hosted, 1);
+        assert_eq!(chain.node_history(&cell.node_id()).heartbeats_paid, 1);
+        assert_eq!(chain.node_history(&cell.node_id()).spent, 50);
+
+        // Unknown node returns defaults.
+        let zero = chain.node_history(&make_identity("hist-stranger").node_id());
+        assert_eq!(zero.jobs_hosted, 0);
+        assert_eq!(zero.first_height, 0);
+    }
 
     #[test]
     fn emission_rate_schedule() {

@@ -11,7 +11,7 @@
 /// flooding sync requests can't OOM the node.
 
 use anyhow::Result;
-use ce_chain::{Block, Chain, Tx, TxKind};
+use ce_chain::{Block, Chain, NodeStats, Tx, TxKind};
 use ce_identity::NodeId;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,6 +39,8 @@ pub struct SyncSnap {
 pub enum ChainCmd {
     // --- reads ---
     Balance { node: NodeId, reply: oneshot::Sender<i128> },
+    /// Per-node interaction history (reputation substrate).
+    NodeHistory { node: NodeId, reply: oneshot::Sender<NodeStats> },
     Height { reply: oneshot::Sender<u64> },
     Difficulty { reply: oneshot::Sender<u8> },
     /// Combined height + difficulty + balance — avoids two round-trips in status handlers.
@@ -76,6 +78,12 @@ impl ChainHandle {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::Balance { node, reply: tx }).await;
         rx.await.unwrap_or(0)
+    }
+
+    pub async fn node_history(&self, node: NodeId) -> NodeStats {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.0.send(ChainCmd::NodeHistory { node, reply: tx }).await;
+        rx.await.unwrap_or_default()
     }
 
     pub async fn height(&self) -> u64 {
@@ -199,6 +207,9 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
         match cmd {
             ChainCmd::Balance { node, reply } => {
                 let _ = reply.send(chain.balance(&node));
+            }
+            ChainCmd::NodeHistory { node, reply } => {
+                let _ = reply.send(chain.node_history(&node));
             }
             ChainCmd::Height { reply } => {
                 let _ = reply.send(chain.height());

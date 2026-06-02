@@ -654,6 +654,39 @@ async fn mesh_kill_bad_node_id_returns_400() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Reputation read (GET /history/:node_id)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_unknown_node_returns_zeros() {
+    let (_node, _dir, api) = start_node("history-zero").await;
+    let stranger = make_identity("history-stranger");
+    let v: serde_json::Value = reqwest::get(format!(
+        "http://127.0.0.1:{api}/history/{}",
+        hex::encode(stranger.node_id())
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(v["jobs_hosted"].as_u64(), Some(0));
+    assert_eq!(v["earned"].as_str(), Some("0"), "amounts are base-unit strings");
+    assert_eq!(v["first_height"].as_u64(), Some(0), "a stranger has no recorded interactions");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_bad_node_id_returns_400() {
+    let (_node, _dir, api) = start_node("history-bad").await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{api}/history/not-hex"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Auth module unit-level integration check
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -22,7 +22,7 @@ to a believable planet-scale launch is called out at the end.
 | **Relay scaling + relay incentives** | One relay ≠ a planet. Many relays, discovered dynamically, **earning credits** for relaying; DHT tuned for millions of peers. | [CE] | Eng |
 | **Data layer** — content-addressed, chunked, paid P2P transfer | `sync` is one-file HTTP today. Datasets, weights, inputs, and results need BitTorrent/IPFS-shaped paid distribution. | [CE]+[app] | Hard |
 | ~~Mesh-routed deploy (`Deploy`/`Kill` over `/ce/rpc/1`)~~ ✅ Done | Directed placement on a specific host: `RpcRequest::Deploy`/`Kill`, host tracks the job (heartbeat-billed, killable), `Deploy`/`Kill` grant-enforced, `POST /mesh-deploy`/`/mesh-kill`, `ce deploy --on <device>` / `ce kill --on <device>`. | [CE] | Eng |
-| Reputation read index (`history(node_id)`) | Read-only index over settlements/heartbeats/expiries so apps derive per-relationship trust without a full chain scan. | [CE] | Eng |
+| ~~Reputation read index (`history(node_id)`)~~ ✅ Done | Incremental per-node `NodeStats` cache (jobs hosted/paid, heartbeats, earned/spent, first/last height); `GET /history/:node_id`; `ce-rs` exposes `history()` and `swarm` trust-tiers placement by it. (Pruned light nodes hold only post-checkpoint history; archive nodes are complete.) | [CE] | Eng |
 | Stake / bond tx | Bootstrap trust with risked credits; extends the escrow model. Start as visible commitment (auto-slash needs a fault oracle). | [CE] | Hard |
 | Verifiable randomness beacon (block-hash based) | Lets schedulers prove non-collusive random host selection for the redundancy verification path. | [CE] | Eng |
 

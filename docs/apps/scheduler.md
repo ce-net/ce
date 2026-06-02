@@ -118,8 +118,9 @@ The substrate is mostly there; a few primitives would make this app cleaner. The
 
 - **Random/independent placement helper** — atlas exists; a client-side "pick R uncorrelated hosts"
   is app logic, but a verifiable randomness beacon (e.g. block hash) helps prove non-collusion.
-- **Reputation read over history** — clients can scan the chain today; a convenience index
-  (`history(node_id) → settlements/heartbeats/expiries`) is borderline-CE (read-only, generic).
+- ~~**Reputation read over history**~~ ✅ Done — `GET /history/:node_id` returns per-node
+  `NodeStats` (jobs hosted/paid, heartbeats, earned/spent, first/last height). swarm's `run`
+  already trust-tiers placement by `delivered_work()`. Richer trust models layer on top.
 - **Stake / bond tx** — a lockable, conditionally-releasable collateral. Candidate CE primitive
   (extends the escrow model), but auto-slash adjudication is hard in a trustless setting — start
   with stake-as-visible-commitment.

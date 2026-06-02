@@ -1211,6 +1211,48 @@ async fn get_atlas(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, Json(entries)).into_response()
 }
 
+// ----- GET /history/:node_id -----
+//
+// Per-node interaction history (the reputation substrate). CE reports the immutable facts;
+// apps derive their own per-relationship trust. Amounts are base-unit strings.
+
+#[derive(Debug, Serialize)]
+struct HistoryResponse {
+    node_id: String,
+    jobs_hosted: u64,
+    jobs_paid: u64,
+    heartbeats_hosted: u64,
+    heartbeats_paid: u64,
+    expiries: u64,
+    #[serde(with = "amount_str")]
+    earned: u128,
+    #[serde(with = "amount_str")]
+    spent: u128,
+    first_height: u64,
+    last_height: u64,
+}
+
+async fn get_history(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    let node_id: NodeId = match hex::decode(&id).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "node_id must be 64 hex chars"),
+    };
+    let s = state.chain.node_history(node_id).await;
+    let resp = HistoryResponse {
+        node_id: id,
+        jobs_hosted: s.jobs_hosted,
+        jobs_paid: s.jobs_paid,
+        heartbeats_hosted: s.heartbeats_hosted,
+        heartbeats_paid: s.heartbeats_paid,
+        expiries: s.expiries,
+        earned: s.earned,
+        spent: s.spent,
+        first_height: s.first_height,
+        last_height: s.last_height,
+    };
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
 // ----- Router -----
 
 #[allow(clippy::too_many_arguments)]
@@ -1276,6 +1318,7 @@ pub async fn start(
         .route("/health", get(|| async { "ok" }))
         .route("/bootstrap", get(get_bootstrap))
         .route("/atlas", get(get_atlas))
+        .route("/history/:node_id", get(get_history))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))

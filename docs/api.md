@@ -238,6 +238,33 @@ Self-tags are advertised only while a node is mining (the capacity-broadcast loo
 
 ---
 
+## GET /history/:node_id
+
+A node's on-chain interaction history — the **reputation substrate**. CE reports the immutable
+facts; apps derive their own per-relationship trust (there is no global reputation score). Built
+incrementally as blocks apply. Amounts are base-unit strings.
+
+**Response** `200 OK`
+```json
+{
+  "node_id": "a3f2...",
+  "jobs_hosted": 12,        // jobs settled as host (work delivered + paid)
+  "jobs_paid": 3,           // jobs paid for as payer
+  "heartbeats_hosted": 40,  // heartbeats received hosting long-running cells
+  "heartbeats_paid": 5,
+  "expiries": 0,            // bids this node let expire as payer without settling
+  "earned": "7200000000000000000000",
+  "spent": "900000000000000000000",
+  "first_height": 41,
+  "last_height": 1180
+}
+```
+A node with no interactions returns all-zero fields (`first_height: 0`). Bad node id → `400`.
+Pruned light nodes hold only post-checkpoint history; query an **archive node** for the complete
+record.
+
+---
+
 ## GET /signals
 
 Returns the last 100 validated CEP-1 signals seen by this node (newest at the end).

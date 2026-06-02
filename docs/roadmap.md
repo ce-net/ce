@@ -641,8 +641,9 @@ with the critical path called out.
 - ~~**Mesh-routed deploy**~~ ✅ Done — directed placement on a specific host over `/ce/rpc/1`
   (`RpcRequest::Deploy`/`Kill`, `Deploy`/`Kill` grant-enforced, `POST /mesh-deploy`/`/mesh-kill`,
   `ce deploy --on <device>`). The host tracks the job so it is heartbeat-billed and killable.
-- **Reputation read over history** — a read-only `history(node_id)` index over settlements/
-  heartbeats/expiries so apps can derive per-relationship trust without a full chain scan.
+- ~~**Reputation read over history**~~ ✅ Done — incremental `NodeStats` cache + `GET /history/:node_id`
+  (jobs hosted/paid, heartbeats, earned/spent, first/last height). `ce-rs` exposes `history()`;
+  `swarm` trust-tiers placement by delivered work.
 - **Stake / bond tx** — lockable, conditionally-released collateral (extends the escrow model)
   to bootstrap trust; start as visible commitment (auto-slash needs a fault oracle).
 - **Verifiable randomness beacon** — e.g. block hash, to let schedulers prove non-collusive
