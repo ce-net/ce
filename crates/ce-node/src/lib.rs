@@ -144,6 +144,10 @@ pub struct AppMessage {
     pub payload_hex: String,
     /// Unix seconds when this node received it.
     pub received_at: u64,
+    /// Set when this is a request expecting a reply (Stage 3): pass it to `/mesh/reply` to answer.
+    /// `None` for fire-and-forget messages and pub/sub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_token: Option<u64>,
 }
 
 /// Bounded ring of recently-received app messages (best-effort snapshot for `GET /mesh/messages`).
@@ -851,6 +855,25 @@ async fn mesh_event_loop(
                 );
                 peer_segments.insert(node_id, held_segments);
             }
+            MeshEvent::AppGossip { from, topic, payload } => {
+                // A verified app pub/sub message — deliver it to the local app via the same inbox
+                // + stream as directed messages (the app filters by topic).
+                let msg = AppMessage {
+                    from: hex::encode(from),
+                    topic,
+                    payload_hex: hex::encode(&payload),
+                    received_at: now_secs(),
+                    reply_token: None,
+                };
+                {
+                    let mut ring = app_inbox.lock().await;
+                    if ring.len() >= APP_INBOX_CAPACITY {
+                        ring.pop_front();
+                    }
+                    ring.push_back(msg.clone());
+                }
+                let _ = app_msg_tx.send(msg);
+            }
             MeshEvent::PeerConnected(peer) => {
                 info!("peer connected: {peer}");
                 let snap = chain.sync_snap().await;
@@ -952,10 +975,8 @@ async fn mesh_event_loop(
                             from: hex::encode(from_node),
                             topic: topic.clone(),
                             payload_hex: hex::encode(payload),
-                            received_at: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
+                            received_at: now_secs(),
+                            reply_token: None,
                         };
                         {
                             let mut ring = app_inbox.lock().await;
@@ -971,6 +992,36 @@ async fn mesh_event_loop(
                         RpcResponse::Error("sender identity mismatch".into())
                     };
                     let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
+                } else if let RpcRequest::AppRequest { from_node, topic, payload } = &request {
+                    // Sync request/response (Stage 3): authenticate, surface to the app tagged with
+                    // the reply token (= this RPC's correlation id), and DO NOT respond yet — the
+                    // app answers via `/mesh/reply`, which sends `AppReply` back over this channel.
+                    let authentic = ce_mesh::peer_id_from_node_id(from_node)
+                        .map(|p| p == from_peer)
+                        .unwrap_or(false);
+                    if authentic {
+                        let msg = AppMessage {
+                            from: hex::encode(from_node),
+                            topic: topic.clone(),
+                            payload_hex: hex::encode(payload),
+                            received_at: now_secs(),
+                            reply_token: Some(correlation_id),
+                        };
+                        {
+                            let mut ring = app_inbox.lock().await;
+                            if ring.len() >= APP_INBOX_CAPACITY {
+                                ring.pop_front();
+                            }
+                            ring.push_back(msg.clone());
+                        }
+                        let _ = app_msg_tx.send(msg);
+                        // No respond_rpc here — the app replies later via /mesh/reply.
+                    } else {
+                        warn!("app request: from_node/from_peer mismatch — dropping");
+                        let _ = mesh_handle
+                            .respond_rpc(correlation_id, RpcResponse::Error("sender identity mismatch".into()))
+                            .await;
+                    }
                 } else {
                     handle_incoming_rpc(
                         from_peer,
@@ -1184,6 +1235,7 @@ fn handle_incoming_rpc(
         RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
         RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
         RpcRequest::AppMessage { .. } => unreachable!("AppMessage handled in event loop"),
+        RpcRequest::AppRequest { .. } => unreachable!("AppRequest handled in event loop"),
     };
     let grant = match grant_bytes.as_deref().map(bincode::deserialize::<SignedGrant>) {
         Some(Ok(g)) => Some(g),
@@ -1231,6 +1283,7 @@ fn handle_incoming_rpc(
         RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
         RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
         RpcRequest::AppMessage { .. } => unreachable!("AppMessage handled in event loop"),
+        RpcRequest::AppRequest { .. } => unreachable!("AppRequest handled in event loop"),
         RpcRequest::SyncFile { path, data, .. } => {
             let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
             let home_canon = home.canonicalize().unwrap_or(home.clone());
@@ -1781,6 +1834,11 @@ fn has_gpu() -> bool {
 
 fn num_cpus() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Unix seconds now (saturating to 0 before the epoch).
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 fn available_mem_mb() -> u32 {

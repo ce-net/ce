@@ -1,18 +1,30 @@
 # App messaging — design
 
-**Status: Stage 1 (directed messages) done.** The keystone primitive for building control
-systems on CE: an app can send a **signed, directed message to a specific node** over the
-relay-traversed mesh, and receive messages addressed to it. Control is "send a command to node X,
-get telemetry back" — without an app-facing message primitive, every app has to smuggle its
-protocol through CEP-1 broadcast or fork the node.
+**Status: Stages 1–3 done.** The keystone primitive for building control systems on CE: apps can
+send signed directed messages, publish/subscribe on topics, and do synchronous request/response —
+all over the relay-traversed mesh. Control is "send a command to node X, get telemetry back";
+without these, every app had to smuggle its protocol through CEP-1 broadcast or fork the node.
 
-Stage 1 ✅: `RpcRequest::AppMessage { from_node, topic, payload }` → `AppAck` over `/ce/rpc/1`
-(the receiving node verifies `from_node` against the Noise PeerId, then enqueues + fans out);
-`POST /mesh/send`, `GET /mesh/messages` (snapshot ring), `GET /mesh/messages/stream` (SSE, mirrors
-`/signals/stream`); `ce-rs` `send_message` / `messages` + an `AppMessage` type. Authentication is
-CE (the sender NodeId is verified); authorization is the app (it inspects `from`). Tested across
-two in-process nodes (`app_message_delivered_across_mesh`). Next: Stage 2 app pub/sub, Stage 3 a
-sync request/response helper.
+Stage 1 ✅ **directed messages**: `RpcRequest::AppMessage { from_node, topic, payload }` → `AppAck`
+over `/ce/rpc/1` (the receiving node verifies `from_node` against the Noise PeerId, then enqueues +
+fans out); `POST /mesh/send`, `GET /mesh/messages` (snapshot ring), `GET /mesh/messages/stream`
+(SSE); `ce-rs` `send_message` / `messages`.
+
+Stage 2 ✅ **pub/sub**: `POST /mesh/subscribe` + `POST /mesh/publish` over per-topic gossipsub
+(`ce-app/<topic>`). Messages are **signed** (`AppPubSubMsg`) so subscribers verify authorship —
+gossip is relayed, not point-to-point authenticated — and a nonce keeps identical publishes from
+being deduped. Received messages land in the same inbox/stream (the app filters by topic). `ce-rs`
+`subscribe` / `publish`. (Subscriptions last for the node's life; unsubscribe + per-topic GC is a
+refinement.)
+
+Stage 3 ✅ **request/response**: `RpcRequest::AppRequest` reuses the inbound RPC correlation — the
+receiving node surfaces the request to its app with a `reply_token` and holds the response channel
+open until the app answers via `POST /mesh/reply`, which sends `AppReply` back. `POST /mesh/request`
+blocks (with a timeout) for the reply. `ce-rs` `request` / `reply`.
+
+Authentication is CE (sender NodeId verified on every path); authorization is the app (it inspects
+`from`). Tested across two in-process nodes: `app_message_delivered_across_mesh`,
+`app_pubsub_delivers_to_subscriber`, `app_request_reply_roundtrip`.
 
 ## What CE already has (and the gap)
 
@@ -48,12 +60,13 @@ the SSE stream to avoid missing messages; the snapshot is for polling/debugging.
 
 ## Staged plan
 
-- **Stage 1 — directed messages (this).** `AppMessage` RPC, inbox ring + SSE, `/mesh/send` +
+- **Stage 1 ✅ — directed messages.** `AppMessage` RPC, inbox ring + SSE, `/mesh/send` +
   `/mesh/messages[/stream]`, `ce-rs` send/receive. Authenticated, relay-routed, app-namespaced.
-- **Stage 2 — app pub/sub.** App-defined gossip topics (publish/subscribe), distinct from CEP-1;
-  for telemetry fan-out and discovery beacons.
-- **Stage 3 — sync request/response helper.** A node-side convenience that correlates a reply to a
-  request across the inbox (true RPC), so apps don't hand-roll reply matching.
+- **Stage 2 ✅ — app pub/sub.** App-defined gossip topics (`ce-app/<topic>`), signed; for telemetry
+  fan-out and discovery beacons. `/mesh/subscribe` + `/mesh/publish`.
+- **Stage 3 ✅ — sync request/response.** `AppRequest`/`AppReply` reuse the inbound RPC correlation:
+  the node holds the response channel open until the app answers via `/mesh/reply`. `/mesh/request`
+  blocks for the reply. No hand-rolled correlation in the app.
 
 ## CE vs app
 

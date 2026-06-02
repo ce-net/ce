@@ -14,7 +14,7 @@ use bollard::{container::RemoveContainerOptions, Docker};
 use ce_chain::{channel_receipt_bytes, payer_settle_bytes, Block, ChunkReceipt, Tx, TxKind};
 use ce_container::{exec_in_container, ExecSpec};
 use ce_identity::{verify, Identity, NodeId};
-use ce_mesh::{MeshHandle, RpcRequest, RpcResponse, peer_id_from_node_id};
+use ce_mesh::{AppPubSubMsg, MeshHandle, RpcRequest, RpcResponse, app_pubsub_bytes, peer_id_from_node_id};
 use ce_protocol::{BurnProof, Capability, CellAddress, CellSignal};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -1672,6 +1672,116 @@ async fn stream_messages(
     Sse::new(sse_broadcast(rx, |m: &AppMessage| m.clone())).keep_alive(KeepAlive::default())
 }
 
+#[derive(Debug, Deserialize)]
+struct AppRequestRequest {
+    /// Recipient NodeId (64 hex).
+    to: String,
+    topic: String,
+    #[serde(default)]
+    payload_hex: String,
+    /// How long to wait for the peer's app to reply, in milliseconds (default 30s).
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+/// Send a request to a node and wait for its app's reply (sync request/response, `POST
+/// /mesh/request`). The peer surfaces the request to its app, which answers via `/mesh/reply`;
+/// the reply payload is returned here. Times out if the app does not answer.
+async fn mesh_request(State(state): State<ApiState>, Json(req): Json<AppRequestRequest>) -> Response {
+    let to: NodeId = match hex::decode(&req.to).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "to must be 64 hex chars"),
+    };
+    let payload = match hex::decode(&req.payload_hex) {
+        Ok(p) => p,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "payload_hex must be valid hex"),
+    };
+    let peer_id = match peer_id_from_node_id(&to) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad recipient id: {e}")),
+    };
+    let timeout = std::time::Duration::from_millis(req.timeout_ms.unwrap_or(30_000));
+    let rpc = RpcRequest::AppRequest { from_node: state.host_node_id, topic: req.topic, payload };
+    match tokio::time::timeout(timeout, state.mesh_handle.send_rpc(peer_id, rpc)).await {
+        Ok(Ok(RpcResponse::AppReply { payload })) => {
+            (StatusCode::OK, Json(serde_json::json!({ "payload_hex": hex::encode(payload) }))).into_response()
+        }
+        Ok(Ok(RpcResponse::Error(e))) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(Ok(_)) => err(StatusCode::BAD_GATEWAY, "unexpected response"),
+        Ok(Err(e)) => err(StatusCode::BAD_GATEWAY, format!("mesh request failed: {e}")),
+        Err(_) => err(StatusCode::GATEWAY_TIMEOUT, "peer app did not reply in time"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplyRequest {
+    /// The `reply_token` from the inbound request message.
+    token: u64,
+    #[serde(default)]
+    payload_hex: String,
+}
+
+/// Answer a request previously received with a `reply_token` (`POST /mesh/reply`). Sends the
+/// reply back over the held mesh channel to the original requester.
+async fn mesh_reply(State(state): State<ApiState>, Json(req): Json<ReplyRequest>) -> Response {
+    let payload = match hex::decode(&req.payload_hex) {
+        Ok(p) => p,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "payload_hex must be valid hex"),
+    };
+    match state.mesh_handle.respond_rpc(req.token, RpcResponse::AppReply { payload }).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "replied" }))).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("reply failed: {e}")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribeRequest {
+    topic: String,
+}
+
+/// Subscribe this node to an app pub/sub topic so received messages land in the inbox + stream
+/// (`POST /mesh/subscribe`). Idempotent; the subscription lasts for the node's lifetime.
+async fn subscribe_topic(State(state): State<ApiState>, Json(req): Json<SubscribeRequest>) -> Response {
+    match state.mesh_handle.subscribe_app(&req.topic).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "subscribed" }))).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("subscribe failed: {e}")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PublishRequest {
+    topic: String,
+    #[serde(default)]
+    payload_hex: String,
+}
+
+/// Publish a signed app pub/sub message to a topic (`POST /mesh/publish`). The node signs the
+/// message with its identity (so subscribers verify authorship) and broadcasts it; it also
+/// subscribes to the topic so it participates in the topic mesh.
+async fn publish_topic(State(state): State<ApiState>, Json(req): Json<PublishRequest>) -> Response {
+    let payload = match hex::decode(&req.payload_hex) {
+        Ok(p) => p,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "payload_hex must be valid hex"),
+    };
+    // Subscribe so we're in the topic mesh before publishing (idempotent).
+    let _ = state.mesh_handle.subscribe_app(&req.topic).await;
+
+    let nonce = state.send_nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let sig = state.identity.sign(&app_pubsub_bytes(&req.topic, &payload, nonce));
+    let msg = AppPubSubMsg {
+        from: state.host_node_id,
+        topic: req.topic.clone(),
+        payload,
+        nonce,
+        sig: sig.to_vec(),
+    };
+    let data = bincode::serialize(&msg).expect("serialize app pubsub");
+    match state.mesh_handle.publish_app(&req.topic, data).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "published" }))).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("publish failed: {e}")),
+    }
+}
+
 // ----- Router -----
 
 #[allow(clippy::too_many_arguments)]
@@ -1757,6 +1867,10 @@ pub async fn start(
         .route("/mesh/send", post(send_message))
         .route("/mesh/messages", get(list_messages))
         .route("/mesh/messages/stream", get(stream_messages))
+        .route("/mesh/subscribe", post(subscribe_topic))
+        .route("/mesh/publish", post(publish_topic))
+        .route("/mesh/request", post(mesh_request))
+        .route("/mesh/reply", post(mesh_reply))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))

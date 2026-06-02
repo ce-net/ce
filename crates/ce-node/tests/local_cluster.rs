@@ -883,6 +883,169 @@ fn host_node_id(dir: &PathBuf) -> ce_identity::NodeId {
     Identity::load_or_generate(&dir.join("identity")).unwrap().node_id()
 }
 
+/// App request/reply (Stage 3): A sends a request to B and gets B's app's reply synchronously.
+/// A responder task on B watches its inbox for the request's reply token and answers via
+/// `/mesh/reply`; A's `/mesh/request` returns that reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn app_request_reply_roundtrip() {
+    let (p2p_a, api_a) = alloc_ports();
+    let dir_a = tmpdir("rr-requester");
+    let _node_a = Node::start(NodeConfig {
+        listen_port: p2p_a,
+        bootstrap_peers: vec![],
+        data_dir: dir_a.clone(),
+        api_port: api_a,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    sleep(Duration::from_millis(600)).await;
+
+    let bs = bootstrap_addr(&dir_a, p2p_a);
+    let (p2p_b, api_b) = alloc_ports();
+    let dir_b = tmpdir("rr-responder");
+    let _node_b = Node::start(NodeConfig {
+        listen_port: p2p_b,
+        bootstrap_peers: vec![bs],
+        data_dir: dir_b.clone(),
+        api_port: api_b,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let b_id = host_node_id(&dir_b);
+
+    sleep(Duration::from_secs(2)).await; // mesh connect
+
+    // B's app: watch the inbox for a request with a reply token and answer "pong".
+    let responder = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        for _ in 0..40 {
+            sleep(Duration::from_millis(250)).await;
+            let msgs: serde_json::Value =
+                reqwest::get(format!("http://127.0.0.1:{api_b}/mesh/messages"))
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+            if let Some(token) = msgs
+                .as_array()
+                .and_then(|a| a.iter().find_map(|m| m["reply_token"].as_u64()))
+            {
+                client
+                    .post(format!("http://127.0.0.1:{api_b}/mesh/reply"))
+                    .json(&serde_json::json!({ "token": token, "payload_hex": hex::encode(b"pong") }))
+                    .send()
+                    .await
+                    .unwrap();
+                return;
+            }
+        }
+    });
+
+    // A issues the request and blocks until B's app replies.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api_a}/mesh/request"))
+        .json(&serde_json::json!({
+            "to": hex::encode(b_id),
+            "topic": "rpc",
+            "payload_hex": hex::encode(b"ping"),
+            "timeout_ms": 15000
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "request should get a reply");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["payload_hex"], hex::encode(b"pong"), "A receives B's reply");
+    responder.await.unwrap();
+}
+
+/// App pub/sub: a message published on a topic reaches a subscriber on another node, verified.
+/// Both nodes subscribe to `telemetry`; A publishes; B's inbox shows it with A as the signed
+/// sender and the payload intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn app_pubsub_delivers_to_subscriber() {
+    let (p2p_a, api_a) = alloc_ports();
+    let dir_a = tmpdir("ps-publisher");
+    let _node_a = Node::start(NodeConfig {
+        listen_port: p2p_a,
+        bootstrap_peers: vec![],
+        data_dir: dir_a.clone(),
+        api_port: api_a,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let a_id = Identity::load_or_generate(&dir_a.join("identity")).unwrap().node_id();
+
+    sleep(Duration::from_millis(600)).await;
+
+    let bs = bootstrap_addr(&dir_a, p2p_a);
+    let (p2p_b, api_b) = alloc_ports();
+    let _node_b = Node::start(NodeConfig {
+        listen_port: p2p_b,
+        bootstrap_peers: vec![bs],
+        data_dir: tmpdir("ps-subscriber"),
+        api_port: api_b,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    sleep(Duration::from_secs(2)).await; // mesh connect
+
+    let client = reqwest::Client::new();
+    // Both subscribe so they share the topic's gossipsub mesh.
+    for api in [api_a, api_b] {
+        let r = client
+            .post(format!("http://127.0.0.1:{api}/mesh/subscribe"))
+            .json(&serde_json::json!({ "topic": "telemetry" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    // Let gossipsub form the topic mesh (graft), then publish from A repeatedly while polling B —
+    // the first publishes may land before B has grafted.
+    let payload_hex = hex::encode(b"metric");
+    let mut found = None;
+    for _ in 0..15 {
+        sleep(Duration::from_secs(1)).await;
+        let _ = client
+            .post(format!("http://127.0.0.1:{api_a}/mesh/publish"))
+            .json(&serde_json::json!({ "topic": "telemetry", "payload_hex": payload_hex }))
+            .send()
+            .await
+            .unwrap();
+        let msgs: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{api_b}/mesh/messages"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(m) = msgs.as_array().and_then(|a| a.iter().find(|m| m["topic"] == "telemetry")) {
+            found = Some(m.clone());
+            break;
+        }
+    }
+    let m = found.expect("subscriber B should receive the published message");
+    assert_eq!(m["from"], hex::encode(a_id), "publisher is the signed sender");
+    assert_eq!(m["payload_hex"], payload_hex, "payload intact");
+}
+
 /// App messaging: a directed message from one node arrives in another's inbox, authenticated.
 /// Node A sends to node B over the mesh; B's `/mesh/messages` shows it with A as the verified
 /// sender and the payload intact.

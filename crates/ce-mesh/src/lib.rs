@@ -149,6 +149,14 @@ pub enum RpcRequest {
         topic: String,
         payload: Vec<u8>,
     },
+    /// A directed application request expecting a reply (sync request/response, Stage 3). The
+    /// receiving node surfaces it to its app tagged with a reply token and holds the response
+    /// channel open until the app answers via `/mesh/reply`, which sends back `AppReply`.
+    AppRequest {
+        from_node: NodeId,
+        topic: String,
+        payload: Vec<u8>,
+    },
 }
 
 impl RpcRequest {
@@ -160,7 +168,8 @@ impl RpcRequest {
             | Self::Deploy { from_node, .. }
             | Self::Kill { from_node, .. }
             | Self::FetchChunk { from_node, .. }
-            | Self::AppMessage { from_node, .. } => *from_node,
+            | Self::AppMessage { from_node, .. }
+            | Self::AppRequest { from_node, .. } => *from_node,
         }
     }
 }
@@ -180,6 +189,8 @@ pub enum RpcResponse {
     ChunkData { cid: [u8; 32], bytes: Vec<u8> },
     /// The receiving node enqueued a directed `AppMessage` for the local app.
     AppAck,
+    /// The app's reply to an `AppRequest`.
+    AppReply { payload: Vec<u8> },
     /// The remote node rejected the request (trust failure, Docker error, etc.).
     Error(String),
 }
@@ -261,6 +272,31 @@ struct SegmentManifest {
     held_segments: Vec<u64>,
 }
 
+// ----- App pub/sub wire type -----
+
+/// Gossip topics for app pub/sub are namespaced under this prefix, so they never collide with
+/// CE-internal topics and the receiver can recognise them generically.
+pub const APP_TOPIC_PREFIX: &str = "ce-app/";
+
+/// A published application message (app pub/sub, Stage 2). Broadcast on `ce-app/<topic>`. Signed
+/// by the publisher so any receiver verifies authorship (gossip is relayed, not point-to-point
+/// authenticated). `nonce` keeps otherwise-identical publishes unique so gossipsub doesn't dedup
+/// them. The 64-byte signature travels as a `Vec<u8>` to avoid serde's array-size limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppPubSubMsg {
+    pub from: NodeId,
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub nonce: u64,
+    pub sig: Vec<u8>,
+}
+
+/// Canonical bytes the publisher signs for an app pub/sub message: domain-separated over the
+/// topic, payload, and nonce.
+pub fn app_pubsub_bytes(topic: &str, payload: &[u8], nonce: u64) -> Vec<u8> {
+    bincode::serialize(&(b"ce-app-pubsub-v1", topic, payload, nonce)).unwrap_or_default()
+}
+
 // ----- Command channel -----
 
 enum MeshCommand {
@@ -293,6 +329,10 @@ enum MeshCommand {
         key: [u8; 32],
         reply_tx: oneshot::Sender<Vec<PeerId>>,
     },
+    /// Subscribe this node's gossipsub to an app pub/sub topic (`ce-app/<topic>`).
+    SubscribeApp { topic: String },
+    /// Publish pre-signed `AppPubSubMsg` bytes to an app pub/sub topic (`ce-app/<topic>`).
+    PublishApp { topic: String, data: Vec<u8> },
 }
 
 // ----- Public event type -----
@@ -306,6 +346,8 @@ pub enum MeshEvent {
     PeerHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32], oldest_block: u64 },
     /// A peer broadcast their archive segment manifest.
     PeerSegments { node_id: NodeId, held_segments: Vec<u64> },
+    /// A verified app pub/sub message arrived on a subscribed `ce-app/<topic>` topic.
+    AppGossip { from: NodeId, topic: String, payload: Vec<u8> },
     SyncRequest { from_node: NodeId, from_height: u64 },
     SyncBlocks { for_node: NodeId, blocks: Vec<Block> },
     CellSignal(CellSignal),
@@ -443,6 +485,16 @@ impl MeshHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.send(MeshCommand::FindProviders { key: cid, reply_tx }).await?;
         reply_rx.await.map_err(|_| anyhow!("find_providers: actor dropped before response"))
+    }
+
+    /// Subscribe to an app pub/sub topic so this node receives its messages (`ce-app/<topic>`).
+    pub async fn subscribe_app(&self, topic: &str) -> Result<()> {
+        self.send(MeshCommand::SubscribeApp { topic: topic.to_string() }).await
+    }
+
+    /// Publish pre-signed `AppPubSubMsg` bytes to an app pub/sub topic (`ce-app/<topic>`).
+    pub async fn publish_app(&self, topic: &str, data: Vec<u8>) -> Result<()> {
+        self.send(MeshCommand::PublishApp { topic: topic.to_string(), data }).await
     }
 
     async fn send(&self, cmd: MeshCommand) -> Result<()> {
@@ -872,6 +924,18 @@ impl Mesh {
                 let qid = self.swarm.behaviour_mut().kademlia.get_providers(record_key);
                 self.pending_providers.insert(qid, (reply_tx, std::collections::HashSet::new()));
             }
+            MeshCommand::SubscribeApp { topic } => {
+                let t = gossipsub::IdentTopic::new(format!("{APP_TOPIC_PREFIX}{topic}"));
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&t) {
+                    debug!("subscribe app topic {topic}: {e}");
+                }
+            }
+            MeshCommand::PublishApp { topic, data } => {
+                let t = gossipsub::IdentTopic::new(format!("{APP_TOPIC_PREFIX}{topic}"));
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(t, data) {
+                    debug!("publish app topic {topic}: {e}");
+                }
+            }
         }
     }
 
@@ -1000,6 +1064,25 @@ fn decode_gossip(message: gossipsub::Message, topics: &Topics) -> Option<MeshEve
                 held_segments: m.held_segments,
             }),
             Err(e) => { warn!("bad segment manifest: {e}"); None }
+        }
+    } else if let Some(app_topic) = t.as_str().strip_prefix(APP_TOPIC_PREFIX) {
+        // App pub/sub: verify the publisher's signature before delivering (gossip is relayed,
+        // so per-message authorship must be proven by the signature, not the transport).
+        match bincode::deserialize::<AppPubSubMsg>(&message.data) {
+            Ok(m) => {
+                let sig: [u8; 64] = match m.sig.as_slice().try_into() {
+                    Ok(s) => s,
+                    Err(_) => { warn!("app pubsub: bad signature length"); return None; }
+                };
+                let signed = app_pubsub_bytes(&m.topic, &m.payload, m.nonce);
+                if m.topic == app_topic && ce_identity::verify(&m.from, &signed, &sig).is_ok() {
+                    Some(MeshEvent::AppGossip { from: m.from, topic: m.topic, payload: m.payload })
+                } else {
+                    warn!("app pubsub: signature/topic mismatch — dropping");
+                    None
+                }
+            }
+            Err(e) => { warn!("bad app pubsub message: {e}"); None }
         }
     } else {
         None
