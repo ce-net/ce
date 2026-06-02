@@ -132,6 +132,26 @@ pub(crate) type JobStore = Arc<Mutex<HashMap<[u8; 32], JobRecord>>>;
 /// under-charge, never over-charge); the host still closes the channel with the highest receipt.
 pub(crate) type DataServedLedger = Arc<Mutex<HashMap<[u8; 32], u128>>>;
 
+/// A directed application message received from a mesh peer (app-messaging inbox item). `from` is
+/// the Noise-authenticated sender, so the app can trust who sent it; `payload` is opaque to CE.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppMessage {
+    /// Authenticated sender NodeId (hex).
+    pub from: String,
+    /// App-chosen topic namespace.
+    pub topic: String,
+    /// Opaque payload, hex-encoded for JSON transport.
+    pub payload_hex: String,
+    /// Unix seconds when this node received it.
+    pub received_at: u64,
+}
+
+/// Bounded ring of recently-received app messages (best-effort snapshot for `GET /mesh/messages`).
+/// Apps consume the SSE stream to avoid missing messages; this is for polling/debugging.
+pub(crate) type AppInbox = Arc<Mutex<VecDeque<AppMessage>>>;
+
+const APP_INBOX_CAPACITY: usize = 200;
+
 // ----- Node config -----
 
 pub struct NodeConfig {
@@ -272,6 +292,8 @@ impl Node {
         let (signal_tx, _signal_rx0) = broadcast::channel::<CellSignal>(64);
         let (block_tx, _block_rx0) = broadcast::channel::<Block>(32);
         let (tx_tx, _tx_rx0) = broadcast::channel::<Tx>(256);
+        let app_inbox: AppInbox = Arc::new(Mutex::new(VecDeque::with_capacity(APP_INBOX_CAPACITY)));
+        let (app_msg_tx, _app_rx0) = broadcast::channel::<AppMessage>(128);
         let send_nonce = Arc::new(AtomicU64::new(0));
         let job_store: JobStore = Arc::new(Mutex::new(HashMap::new()));
         let atlas: Atlas = Arc::new(Mutex::new(HashMap::new()));
@@ -359,6 +381,8 @@ impl Node {
             let runtimes_m = runtimes.clone();
             let data_price = node.config.data_price_per_byte;
             let data_served: DataServedLedger = Arc::new(Mutex::new(HashMap::new()));
+            let app_inbox2 = app_inbox.clone();
+            let app_msg_tx2 = app_msg_tx.clone();
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain2,
@@ -384,6 +408,8 @@ impl Node {
                     runtimes_m,
                     data_price,
                     data_served,
+                    app_inbox2,
+                    app_msg_tx2,
                 )
                 .await;
             });
@@ -458,6 +484,8 @@ impl Node {
                     docker3,
                     self_tags3,
                     tls_seed,
+                    app_inbox,
+                    app_msg_tx,
                 )
                 .await
                 {
@@ -593,6 +621,8 @@ async fn mesh_event_loop(
     runtimes: Vec<Arc<dyn Runtime>>,
     data_price_per_byte: u128,
     data_served: DataServedLedger,
+    app_inbox: AppInbox,
+    app_msg_tx: broadcast::Sender<AppMessage>,
 ) {
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
@@ -910,6 +940,37 @@ async fn mesh_event_loop(
                         };
                         let _ = handle.respond_rpc(correlation_id, resp).await;
                     });
+                } else if let RpcRequest::AppMessage { from_node, topic, payload } = &request {
+                    // Authenticate the sender (Noise PeerId must match the claimed NodeId), then
+                    // enqueue + fan out so the local app can consume it. CE authenticates; the
+                    // app authorizes (it inspects `from` and decides what to honor).
+                    let authentic = ce_mesh::peer_id_from_node_id(from_node)
+                        .map(|p| p == from_peer)
+                        .unwrap_or(false);
+                    let resp = if authentic {
+                        let msg = AppMessage {
+                            from: hex::encode(from_node),
+                            topic: topic.clone(),
+                            payload_hex: hex::encode(payload),
+                            received_at: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        };
+                        {
+                            let mut ring = app_inbox.lock().await;
+                            if ring.len() >= APP_INBOX_CAPACITY {
+                                ring.pop_front();
+                            }
+                            ring.push_back(msg.clone());
+                        }
+                        let _ = app_msg_tx.send(msg);
+                        RpcResponse::AppAck
+                    } else {
+                        warn!("app message: from_node/from_peer mismatch — dropping");
+                        RpcResponse::Error("sender identity mismatch".into())
+                    };
+                    let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
                 } else {
                     handle_incoming_rpc(
                         from_peer,
@@ -1122,6 +1183,7 @@ fn handle_incoming_rpc(
         RpcRequest::Kill { grant, .. } => (Permission::Kill, grant.clone()),
         RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
         RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
+        RpcRequest::AppMessage { .. } => unreachable!("AppMessage handled in event loop"),
     };
     let grant = match grant_bytes.as_deref().map(bincode::deserialize::<SignedGrant>) {
         Some(Ok(g)) => Some(g),
@@ -1168,6 +1230,7 @@ fn handle_incoming_rpc(
         }
         RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
         RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
+        RpcRequest::AppMessage { .. } => unreachable!("AppMessage handled in event loop"),
         RpcRequest::SyncFile { path, data, .. } => {
             let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
             let home_canon = home.canonicalize().unwrap_or(home.clone());

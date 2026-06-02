@@ -141,6 +141,14 @@ pub enum RpcRequest {
         /// transport. Required when the provider charges for data; `None` for free/open serving.
         receipt: Option<Vec<u8>>,
     },
+    /// A directed application message (the app-messaging primitive). `topic` is an app-chosen
+    /// namespace and `payload` is opaque to CE. The receiver verifies `from_node` against the
+    /// Noise PeerId, then surfaces it to the local app (inbox + SSE). Replies with `AppAck`.
+    AppMessage {
+        from_node: NodeId,
+        topic: String,
+        payload: Vec<u8>,
+    },
 }
 
 impl RpcRequest {
@@ -151,7 +159,8 @@ impl RpcRequest {
             | Self::SegmentFetch { from_node, .. }
             | Self::Deploy { from_node, .. }
             | Self::Kill { from_node, .. }
-            | Self::FetchChunk { from_node, .. } => *from_node,
+            | Self::FetchChunk { from_node, .. }
+            | Self::AppMessage { from_node, .. } => *from_node,
         }
     }
 }
@@ -169,6 +178,8 @@ pub enum RpcResponse {
     Killed,
     /// The requested content-addressed chunk's bytes. The caller verifies `sha256(bytes) == cid`.
     ChunkData { cid: [u8; 32], bytes: Vec<u8> },
+    /// The receiving node enqueued a directed `AppMessage` for the local app.
+    AppAck,
     /// The remote node rejected the request (trust failure, Docker error, etc.).
     Error(String),
 }

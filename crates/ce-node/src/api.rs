@@ -30,7 +30,8 @@ use std::{
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
-    Atlas, CeJobStatus, ChainHandle, JobRecord, JobStore, PeerCapacity, SignalRing, TxPool,
+    AppInbox, AppMessage, Atlas, CeJobStatus, ChainHandle, JobRecord, JobStore, PeerCapacity,
+    SignalRing, TxPool,
 };
 
 /// Per-sender last-accepted timestamp (ms). Used to enforce strictly increasing
@@ -51,6 +52,10 @@ struct ApiState {
     block_tx: broadcast::Sender<Block>,
     /// Push channel — subscribers receive every accepted transaction instantly.
     tx_tx: broadcast::Sender<Tx>,
+    /// Recent inbound app-message ring (snapshot for `GET /mesh/messages`).
+    app_inbox: AppInbox,
+    /// Push channel — subscribers receive every inbound app message instantly.
+    app_msg_tx: broadcast::Sender<AppMessage>,
     send_nonce: Arc<AtomicU64>,
     job_store: JobStore,
     pool: TxPool,
@@ -1614,6 +1619,59 @@ async fn data_fetch(State(state): State<ApiState>, Json(req): Json<DataFetchRequ
     }
 }
 
+// ----- App messaging (POST /mesh/send, GET /mesh/messages[/stream]) -----
+
+#[derive(Debug, Deserialize)]
+struct SendMessageRequest {
+    /// Recipient NodeId (64 hex).
+    to: String,
+    /// App-chosen topic namespace.
+    topic: String,
+    /// Opaque payload, hex-encoded.
+    #[serde(default)]
+    payload_hex: String,
+}
+
+/// Send a directed, signed application message to a node over the mesh (`POST /mesh/send`). The
+/// receiving node enqueues it for its local app; `AppAck` confirms enqueue.
+async fn send_message(State(state): State<ApiState>, Json(req): Json<SendMessageRequest>) -> Response {
+    let to: NodeId = match hex::decode(&req.to).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "to must be 64 hex chars"),
+    };
+    let payload = match hex::decode(&req.payload_hex) {
+        Ok(p) => p,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "payload_hex must be valid hex"),
+    };
+    let peer_id = match peer_id_from_node_id(&to) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad recipient id: {e}")),
+    };
+    let rpc = RpcRequest::AppMessage { from_node: state.host_node_id, topic: req.topic, payload };
+    match state.mesh_handle.send_rpc(peer_id, rpc).await {
+        Ok(RpcResponse::AppAck) => {
+            (StatusCode::OK, Json(serde_json::json!({ "status": "delivered" }))).into_response()
+        }
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::BAD_GATEWAY, "unexpected response"),
+        Err(e) => err(StatusCode::BAD_GATEWAY, format!("mesh send failed: {e}")),
+    }
+}
+
+/// Snapshot of recently-received app messages (`GET /mesh/messages`).
+async fn list_messages(State(state): State<ApiState>) -> Response {
+    let msgs: Vec<AppMessage> = state.app_inbox.lock().await.iter().cloned().collect();
+    (StatusCode::OK, Json(msgs)).into_response()
+}
+
+/// SSE push stream of inbound app messages (`GET /mesh/messages/stream`).
+async fn stream_messages(
+    State(state): State<ApiState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.app_msg_tx.subscribe();
+    Sse::new(sse_broadcast(rx, |m: &AppMessage| m.clone())).keep_alive(KeepAlive::default())
+}
+
 // ----- Router -----
 
 #[allow(clippy::too_many_arguments)]
@@ -1638,6 +1696,8 @@ pub async fn start(
     // When set, serve the API over TLS with a cert keyed by this Ed25519 seed (the node
     // identity). Clients pin the cert against the node's NodeId. None = plain HTTP.
     tls_seed: Option<[u8; 32]>,
+    app_inbox: AppInbox,
+    app_msg_tx: broadcast::Sender<AppMessage>,
 ) -> Result<()> {
     if docker.is_none() {
         tracing::warn!("Docker unavailable — job routes and exec will return 503");
@@ -1654,6 +1714,8 @@ pub async fn start(
         signal_tx,
         block_tx,
         tx_tx,
+        app_inbox,
+        app_msg_tx,
         send_nonce,
         job_store,
         pool,
@@ -1692,6 +1754,9 @@ pub async fn start(
         .route("/blobs", post(put_blob))
         .route("/blobs/:hash", get(get_blob))
         .route("/data/fetch", post(data_fetch))
+        .route("/mesh/send", post(send_message))
+        .route("/mesh/messages", get(list_messages))
+        .route("/mesh/messages/stream", get(stream_messages))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))

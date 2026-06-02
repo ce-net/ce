@@ -882,3 +882,79 @@ async fn wasm_deploy_stages_module_from_mesh() {
 fn host_node_id(dir: &PathBuf) -> ce_identity::NodeId {
     Identity::load_or_generate(&dir.join("identity")).unwrap().node_id()
 }
+
+/// App messaging: a directed message from one node arrives in another's inbox, authenticated.
+/// Node A sends to node B over the mesh; B's `/mesh/messages` shows it with A as the verified
+/// sender and the payload intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn app_message_delivered_across_mesh() {
+    let (p2p_a, api_a) = alloc_ports();
+    let dir_a = tmpdir("msg-sender");
+    let _node_a = Node::start(NodeConfig {
+        listen_port: p2p_a,
+        bootstrap_peers: vec![],
+        data_dir: dir_a.clone(),
+        api_port: api_a,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let a_id = Identity::load_or_generate(&dir_a.join("identity")).unwrap().node_id();
+
+    sleep(Duration::from_millis(600)).await;
+
+    let bs = bootstrap_addr(&dir_a, p2p_a);
+    let (p2p_b, api_b) = alloc_ports();
+    let dir_b = tmpdir("msg-receiver");
+    let _node_b = Node::start(NodeConfig {
+        listen_port: p2p_b,
+        bootstrap_peers: vec![bs],
+        data_dir: dir_b.clone(),
+        api_port: api_b,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let b_id = host_node_id(&dir_b);
+
+    sleep(Duration::from_secs(2)).await; // mesh connect
+
+    let client = reqwest::Client::new();
+    // "ping" in hex.
+    let payload_hex = hex::encode(b"ping");
+    let resp = client
+        .post(format!("http://127.0.0.1:{api_a}/mesh/send"))
+        .json(&serde_json::json!({
+            "to": hex::encode(b_id),
+            "topic": "control",
+            "payload_hex": payload_hex,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "mesh/send should report delivered");
+
+    // B's inbox should show the message, from A, intact.
+    let mut found = None;
+    for _ in 0..10 {
+        sleep(Duration::from_millis(500)).await;
+        let msgs: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{api_b}/mesh/messages"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(m) = msgs.as_array().and_then(|a| a.first()) {
+            found = Some(m.clone());
+            break;
+        }
+    }
+    let m = found.expect("B should receive the app message");
+    assert_eq!(m["from"], hex::encode(a_id), "sender is the authenticated NodeId");
+    assert_eq!(m["topic"], "control");
+    assert_eq!(m["payload_hex"], payload_hex, "payload intact");
+}
