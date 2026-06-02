@@ -270,7 +270,13 @@ mod tests {
     use ce_identity::Identity;
 
     fn id(tag: &str) -> Identity {
-        let dir = std::env::temp_dir().join(format!("ce-grant-test-{}-{tag}", std::process::id()));
+        // Unique dir per identity: tests run in parallel within one process, so a dir keyed only
+        // by (pid, tag) lets two tests calling fixture() race on the same `node.key`.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("ce-grant-test-{}-{n}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Identity::load_or_generate(&dir).unwrap()
     }
