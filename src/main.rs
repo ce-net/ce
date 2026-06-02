@@ -82,6 +82,11 @@ enum Commands {
         /// Serve the HTTP API over TLS (cert keyed by this node's identity; clients pin the NodeId).
         #[arg(long)]
         tls: bool,
+        /// Advertise this node as a relay charging this many base units per minute (0 = free,
+        /// discoverable relay). Omit to not advertise as a relay. Clients open a payment channel
+        /// and stream receipts to stay paid-up.
+        #[arg(long)]
+        relay_price_per_min: Option<u128>,
     },
     /// Show this node's credit balance.
     Balance,
@@ -721,7 +726,7 @@ async fn main() -> Result<()> {
     let data_dir = data_dir(cli.data_dir);
 
     match cli.command {
-        Commands::Start { port, api_port, bootstrap, relay, no_mine, light, tls } => {
+        Commands::Start { port, api_port, bootstrap, relay, no_mine, light, tls, relay_price_per_min } => {
             // CE_BOOTSTRAP_PEERS: colon-separated list of bootstrap multiaddrs.
             // Useful for Docker/systemd deployments where CLI flags are inconvenient.
             let mut bootstrap_peers = bootstrap;
@@ -756,6 +761,7 @@ async fn main() -> Result<()> {
                 mine: !no_mine,
                 prune_keep: if light { Some(ce_chain::PRUNE_KEEP_BLOCKS) } else { None },
                 tls,
+                relay_price_per_min,
                 ..Default::default()
             };
             let node = Node::start(config).await?;

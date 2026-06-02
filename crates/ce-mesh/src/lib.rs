@@ -175,6 +175,16 @@ pub enum RpcRequest {
         topic: String,
         payload: Vec<u8>,
     },
+    /// Pay a relay for relay service: a payment-channel receipt (the relay is the channel `host`,
+    /// the sender the `payer`). The relay verifies it against the on-chain channel and its price,
+    /// records the payment, and marks the payer paid-up. `payer_sig` is the 64-byte signature over
+    /// `channel_receipt_bytes(channel_id, relay, cumulative)`, as a Vec to avoid serde array limits.
+    RelayReceipt {
+        from_node: NodeId,
+        channel_id: [u8; 32],
+        cumulative: u128,
+        payer_sig: Vec<u8>,
+    },
 }
 
 impl RpcRequest {
@@ -187,7 +197,8 @@ impl RpcRequest {
             | Self::Kill { from_node, .. }
             | Self::FetchChunk { from_node, .. }
             | Self::AppMessage { from_node, .. }
-            | Self::AppRequest { from_node, .. } => *from_node,
+            | Self::AppRequest { from_node, .. }
+            | Self::RelayReceipt { from_node, .. } => *from_node,
         }
     }
 }
@@ -209,6 +220,8 @@ pub enum RpcResponse {
     AppAck,
     /// The app's reply to an `AppRequest`.
     AppReply { payload: Vec<u8> },
+    /// The relay accepted and recorded a `RelayReceipt`.
+    RelayAck,
     /// The remote node rejected the request (trust failure, Docker error, etc.).
     Error(String),
 }

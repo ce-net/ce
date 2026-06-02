@@ -154,6 +154,16 @@ pub struct AppMessage {
 /// Apps consume the SSE stream to avoid missing messages; this is for polling/debugging.
 pub(crate) type AppInbox = Arc<Mutex<VecDeque<AppMessage>>>;
 
+/// Relay-side per-channel accounting: channel_id → (first_receipt_secs, paid_cumulative). A relay
+/// charges per minute of relay time; a receipt must cover `price * minutes_elapsed`. In-memory
+/// (resets on restart, which can only under-charge); the relay closes the channel to collect.
+#[derive(Debug, Clone, Default)]
+pub struct RelayAccount {
+    pub first_receipt_secs: u64,
+    pub paid_cumulative: u128,
+}
+pub(crate) type RelayMeter = Arc<Mutex<HashMap<[u8; 32], RelayAccount>>>;
+
 const APP_INBOX_CAPACITY: usize = 200;
 
 // ----- Node config -----
@@ -186,6 +196,10 @@ pub struct NodeConfig {
     /// (the default). When non-zero, a `FetchChunk` must carry a payment-channel receipt whose
     /// cumulative covers the running cost, or the provider refuses to serve.
     pub data_price_per_byte: u128,
+    /// If set, this node advertises itself as a relay charging this many base units per minute
+    /// (`0` = a free, discoverable relay). `None` (default) = not advertised as a relay. Clients
+    /// open a payment channel with the relay and stream `RelayReceipt`s to stay paid-up.
+    pub relay_price_per_min: Option<u128>,
 }
 
 impl Default for NodeConfig {
@@ -203,6 +217,7 @@ impl Default for NodeConfig {
             disable_local_discovery: false,
             tls: false,
             data_price_per_byte: 0,
+            relay_price_per_min: None,
         }
     }
 }
@@ -387,6 +402,8 @@ impl Node {
             let data_served: DataServedLedger = Arc::new(Mutex::new(HashMap::new()));
             let app_inbox2 = app_inbox.clone();
             let app_msg_tx2 = app_msg_tx.clone();
+            let relay_price = node.config.relay_price_per_min;
+            let relay_meter: RelayMeter = Arc::new(Mutex::new(HashMap::new()));
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain2,
@@ -414,6 +431,8 @@ impl Node {
                     data_served,
                     app_inbox2,
                     app_msg_tx2,
+                    relay_price,
+                    relay_meter,
                 )
                 .await;
             });
@@ -627,6 +646,8 @@ async fn mesh_event_loop(
     data_served: DataServedLedger,
     app_inbox: AppInbox,
     app_msg_tx: broadcast::Sender<AppMessage>,
+    relay_price_per_min: Option<u128>,
+    relay_meter: RelayMeter,
 ) {
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
@@ -637,6 +658,11 @@ async fn mesh_event_loop(
         let held = ce_chain::list_archive_segments(&archive_dir);
         if !held.is_empty() {
             let _ = mesh_handle.announce_segments(our_node_id, held).await;
+        }
+        // Advertise as a relay so clients can discover us (provider records expire — re-advertised
+        // on the segment ticker below).
+        if relay_price_per_min.is_some() {
+            let _ = mesh_handle.advertise_service("relay").await;
         }
     }
 
@@ -650,6 +676,9 @@ async fn mesh_event_loop(
             _ = segment_announce_ticker.tick() => {
                 let held = ce_chain::list_archive_segments(&archive_dir);
                 let _ = mesh_handle.announce_segments(our_node_id, held).await;
+                if relay_price_per_min.is_some() {
+                    let _ = mesh_handle.advertise_service("relay").await;
+                }
                 continue;
             }
             _ = sync_retry_ticker.tick() => {
@@ -1022,6 +1051,25 @@ async fn mesh_event_loop(
                             .respond_rpc(correlation_id, RpcResponse::Error("sender identity mismatch".into()))
                             .await;
                     }
+                } else if let RpcRequest::RelayReceipt { from_node, channel_id, cumulative, payer_sig } = &request {
+                    // A client paying us for relay service. Verify the receipt against the on-chain
+                    // channel (we must be the host) and our per-minute price, then record it.
+                    let channel_id = *channel_id;
+                    let cumulative = *cumulative;
+                    let payer = *from_node;
+                    let sig_vec = payer_sig.clone();
+                    let price = relay_price_per_min;
+                    let chain2 = chain.clone();
+                    let meter = relay_meter.clone();
+                    let relay_id = our_node_id;
+                    let handle = mesh_handle.clone();
+                    tokio::spawn(async move {
+                        let resp = relay_record_receipt(
+                            &chain2, &meter, price, relay_id, payer, channel_id, cumulative, sig_vec,
+                        )
+                        .await;
+                        let _ = handle.respond_rpc(correlation_id, resp).await;
+                    });
                 } else {
                     handle_incoming_rpc(
                         from_peer,
@@ -1102,6 +1150,82 @@ async fn mesh_event_loop(
                 let _ = signal_tx.send(signal);
             }
         }
+    }
+}
+
+// ----- Relay payment authorization -----
+
+/// Decide whether a relay should accept a payment receipt for relay service. Pure + unit-testable.
+/// The relay charges `price_per_min` per minute; `minutes_elapsed` is how long this channel has
+/// been relaying (at least 1 — the first minute is charged up front). A valid receipt must cover
+/// `price * minutes`, stay within capacity, name this relay as host, and carry a valid payer
+/// signature. Returns the cumulative to record (the high-water mark), or a refusal reason.
+fn relay_authorize(
+    price_per_min: u128,
+    minutes_elapsed: u64,
+    capacity: u128,
+    payer: &NodeId,
+    relay: &NodeId,
+    receipt: &ChunkReceipt,
+) -> Result<u128, String> {
+    if !verify_chunk_receipt_sig(payer, relay, receipt) {
+        return Err("invalid receipt signature".into());
+    }
+    if receipt.cumulative > capacity {
+        return Err("receipt cumulative exceeds channel capacity".into());
+    }
+    let required = price_per_min.saturating_mul(minutes_elapsed.max(1) as u128);
+    if receipt.cumulative < required {
+        return Err("receipt does not cover the relay time used".into());
+    }
+    Ok(receipt.cumulative)
+}
+
+/// Verify and record an incoming relay payment receipt against the on-chain channel and our price.
+#[allow(clippy::too_many_arguments)]
+async fn relay_record_receipt(
+    chain: &ChainHandle,
+    meter: &RelayMeter,
+    price: Option<u128>,
+    relay: NodeId,
+    payer: NodeId,
+    channel_id: [u8; 32],
+    cumulative: u128,
+    payer_sig: Vec<u8>,
+) -> RpcResponse {
+    let Some(price_per_min) = price else {
+        return RpcResponse::Error("this node is not a relay".into());
+    };
+    let sig: [u8; 64] = match payer_sig.as_slice().try_into() {
+        Ok(s) => s,
+        Err(_) => return RpcResponse::Error("bad signature length".into()),
+    };
+    // The channel must exist on-chain with us as host and the sender as payer.
+    let chan = chain
+        .list_channels()
+        .await
+        .into_iter()
+        .find(|(id, ..)| id == &channel_id)
+        .map(|(_, p, h, cap, _)| (p, h, cap));
+    let Some((chan_payer, chan_host, capacity)) = chan else {
+        return RpcResponse::Error("unknown or unsettled channel".into());
+    };
+    if chan_host != relay || chan_payer != payer {
+        return RpcResponse::Error("channel not hosted by this relay for this payer".into());
+    }
+    let receipt = ChunkReceipt { channel_id, cumulative, payer_sig: sig };
+    let now = now_secs();
+    let mut guard = meter.lock().await;
+    let acct = guard
+        .entry(channel_id)
+        .or_insert_with(|| RelayAccount { first_receipt_secs: now, paid_cumulative: 0 });
+    let minutes = (now.saturating_sub(acct.first_receipt_secs) / 60) + 1;
+    match relay_authorize(price_per_min, minutes, capacity, &payer, &relay, &receipt) {
+        Ok(new_cum) => {
+            acct.paid_cumulative = acct.paid_cumulative.max(new_cum);
+            RpcResponse::RelayAck
+        }
+        Err(reason) => RpcResponse::Error(format!("relay payment rejected: {reason}")),
     }
 }
 
@@ -1236,6 +1360,7 @@ fn handle_incoming_rpc(
         RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
         RpcRequest::AppMessage { .. } => unreachable!("AppMessage handled in event loop"),
         RpcRequest::AppRequest { .. } => unreachable!("AppRequest handled in event loop"),
+        RpcRequest::RelayReceipt { .. } => unreachable!("RelayReceipt handled in event loop"),
     };
     let grant = match grant_bytes.as_deref().map(bincode::deserialize::<SignedGrant>) {
         Some(Ok(g)) => Some(g),
@@ -1284,6 +1409,7 @@ fn handle_incoming_rpc(
         RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
         RpcRequest::AppMessage { .. } => unreachable!("AppMessage handled in event loop"),
         RpcRequest::AppRequest { .. } => unreachable!("AppRequest handled in event loop"),
+        RpcRequest::RelayReceipt { .. } => unreachable!("RelayReceipt handled in event loop"),
         RpcRequest::SyncFile { path, data, .. } => {
             let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
             let home_canon = home.canonicalize().unwrap_or(home.clone());
@@ -2006,6 +2132,45 @@ mod chunk_payment_tests {
         let forged = receipt(&other, &host_id, channel_id, 10_000);
         let chan2 = Some((payer.node_id(), host_id, 1_000_000));
         assert!(authorize_chunk_serve(10, 1000, &host_id, Some(&forged), chan2, 0)
+            .unwrap_err()
+            .contains("signature"));
+    }
+
+    #[test]
+    fn relay_free_accepts_any_valid_receipt() {
+        let payer = ident("rl-free-p");
+        let relay = ident("rl-free-h");
+        let r = receipt(&payer, &relay.node_id(), [1u8; 32], 0);
+        assert_eq!(relay_authorize(0, 5, 1_000, &payer.node_id(), &relay.node_id(), &r), Ok(0));
+    }
+
+    #[test]
+    fn relay_priced_requires_time_coverage() {
+        let payer = ident("rl-p");
+        let relay = ident("rl-h");
+        let other = ident("rl-o");
+        let relay_id = relay.node_id();
+        let chan = [2u8; 32];
+
+        // Price 100/min over 3 minutes => required 300; a covering receipt is accepted.
+        let ok = receipt(&payer, &relay_id, chan, 300);
+        assert_eq!(relay_authorize(100, 3, 10_000, &payer.node_id(), &relay_id, &ok), Ok(300));
+
+        // Below the time-based requirement.
+        let low = receipt(&payer, &relay_id, chan, 200);
+        assert!(relay_authorize(100, 3, 10_000, &payer.node_id(), &relay_id, &low)
+            .unwrap_err()
+            .contains("does not cover"));
+
+        // Beyond channel capacity.
+        let over = receipt(&payer, &relay_id, chan, 5_000);
+        assert!(relay_authorize(100, 3, 1_000, &payer.node_id(), &relay_id, &over)
+            .unwrap_err()
+            .contains("capacity"));
+
+        // Signed by the wrong key.
+        let forged = receipt(&other, &relay_id, chan, 300);
+        assert!(relay_authorize(100, 3, 10_000, &payer.node_id(), &relay_id, &forged)
             .unwrap_err()
             .contains("signature"));
     }

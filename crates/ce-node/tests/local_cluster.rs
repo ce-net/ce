@@ -883,6 +883,65 @@ fn host_node_id(dir: &PathBuf) -> ce_identity::NodeId {
     Identity::load_or_generate(&dir.join("identity")).unwrap().node_id()
 }
 
+/// Relay incentives: a relay payment routes over the mesh to the relay, which verifies it against
+/// the on-chain channel. With no such channel the relay refuses — exercising the RelayReceipt RPC
+/// path and the relay's channel/price check end-to-end. (The happy path's signature logic is
+/// covered deterministically by the relay_authorize unit tests.)
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_rejects_payment_without_channel() {
+    // Relay A — advertises as a paid relay.
+    let (p2p_a, api_a) = alloc_ports();
+    let dir_a = tmpdir("relay-host");
+    let _node_a = Node::start(NodeConfig {
+        listen_port: p2p_a,
+        bootstrap_peers: vec![],
+        data_dir: dir_a.clone(),
+        api_port: api_a,
+        mine: false,
+        disable_local_discovery: true,
+        relay_price_per_min: Some(100),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let a_id = host_node_id(&dir_a);
+
+    sleep(Duration::from_millis(600)).await;
+
+    // Client B — bootstrapped to A.
+    let bs = bootstrap_addr(&dir_a, p2p_a);
+    let (p2p_b, api_b) = alloc_ports();
+    let _node_b = Node::start(NodeConfig {
+        listen_port: p2p_b,
+        bootstrap_peers: vec![bs],
+        data_dir: tmpdir("relay-client"),
+        api_port: api_b,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    sleep(Duration::from_secs(2)).await; // mesh connect
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api_b}/relay/pay"))
+        .json(&serde_json::json!({
+            "relay": hex::encode(a_id),
+            "channel_id": hex::encode([0u8; 32]),
+            "cumulative": "100"
+        }))
+        .send()
+        .await
+        .unwrap();
+    // The RPC reached the relay and was rejected (no such channel) — not a transport failure.
+    assert_eq!(resp.status(), 502, "relay should reject payment for an unknown channel");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("unknown or unsettled channel"), "got: {body}");
+}
+
 /// Naming: a claimed name resolves to the claiming node once the claim tx is mined.
 #[tokio::test(flavor = "multi_thread")]
 async fn name_claim_resolves_after_mining() {

@@ -114,6 +114,7 @@ async fn live_node_syncs_from_relay() {
         disable_local_discovery: false,
         tls: false,
         data_price_per_byte: 0,
+        relay_price_per_min: None,
     };
 
     let node = Node::start(config).await.expect("node start failed");
@@ -163,6 +164,7 @@ async fn live_light_node_prunes_and_archives() {
         disable_local_discovery: false,
         tls: false,
         data_price_per_byte: 0,
+        relay_price_per_min: None,
     };
 
     let node = Node::start(config).await.expect("node start failed");

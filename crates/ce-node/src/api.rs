@@ -1478,6 +1478,54 @@ async fn list_channels(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, Json(chans)).into_response()
 }
 
+// ----- Relay payment (POST /relay/pay) -----
+
+#[derive(Debug, Deserialize)]
+struct RelayPayRequest {
+    /// The relay's NodeId (64 hex) — the channel host being paid.
+    relay: String,
+    /// Open payment channel this node (payer) holds with the relay.
+    channel_id: String,
+    /// Cumulative total authorised to the relay so far (base units, decimal string). The caller
+    /// raises it over time to keep paying for ongoing relay service.
+    #[serde(with = "amount_str")]
+    cumulative: u128,
+}
+
+/// Pay a relay for relay service (`POST /relay/pay`). Signs a payment-channel receipt and sends it
+/// to the relay over the mesh; the relay verifies it against the channel and its price and records
+/// it. Called on the PAYER (client) node. Re-call periodically with a rising cumulative.
+async fn relay_pay(State(state): State<ApiState>, Json(req): Json<RelayPayRequest>) -> Response {
+    let relay: NodeId = match hex::decode(&req.relay).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "relay must be 64 hex chars"),
+    };
+    let channel_id: [u8; 32] = match hex::decode(&req.channel_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "channel_id must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&relay) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad relay id: {e}")),
+    };
+    // Sign the receipt: payer authorises the relay (host) to redeem up to `cumulative`.
+    let sig = state.identity.sign(&channel_receipt_bytes(&channel_id, &relay, req.cumulative));
+    let rpc = RpcRequest::RelayReceipt {
+        from_node: state.host_node_id,
+        channel_id,
+        cumulative: req.cumulative,
+        payer_sig: sig.to_vec(),
+    };
+    match state.mesh_handle.send_rpc(peer_id, rpc).await {
+        Ok(RpcResponse::RelayAck) => {
+            (StatusCode::OK, Json(serde_json::json!({ "status": "paid" }))).into_response()
+        }
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::BAD_GATEWAY, "unexpected response"),
+        Err(e) => err(StatusCode::BAD_GATEWAY, format!("relay payment failed: {e}")),
+    }
+}
+
 // ----- Naming (POST /names/claim, GET /names/:name) -----
 
 #[derive(Debug, Deserialize)]
@@ -1937,6 +1985,7 @@ pub async fn start(
         .route("/names/:name", get(resolve_name))
         .route("/discovery/advertise", post(advertise_service))
         .route("/discovery/find/:service", get(find_service))
+        .route("/relay/pay", post(relay_pay))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))
