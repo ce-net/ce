@@ -539,9 +539,11 @@ name = "ce-container"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bollard",
  "ce-chain",
  "ce-identity",
+ "ce-runtime",
  "futures",
  "hex",
  "serde",
@@ -609,6 +611,7 @@ dependencies = [
  "ce-identity",
  "ce-mesh",
  "ce-protocol",
+ "ce-runtime",
  "ce-tls",
  "directories",
  "dirs-next",

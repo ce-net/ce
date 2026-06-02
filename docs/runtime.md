@@ -4,10 +4,12 @@ How CE runs a unit of work, independent of *how* it runs. This is the structural
 WASM (and later, the browser) join Docker as execution backends without disturbing the consensus,
 economy, or placement layers.
 
-**Status: staged.** Stage 1 (this) — the `ce-runtime` seam crate. Stage 2 — `ce-container`
-implements the trait; `ce-node` dispatches through it. Stage 3 — the `ce-wasm` backend
-(wasmtime) + content-addressed module store. The **browser node** is a separate, larger project
-(its own repo) and is explicitly out of scope here.
+**Status: staged.** Stage 1 ✅ — the `ce-runtime` seam crate. Stage 2 ✅ — `ce-container`'s
+`DockerRuntime` implements the trait; `ce-node` holds a `Vec<Arc<dyn Runtime>>` registry and
+dispatches the mesh Deploy/Kill path through it (Docker still works; the seam is proven). Stage 3
+(next) — the `ce-wasm` backend (wasmtime) + content-addressed module store + `Workload` over the
+`JobBid` wire + rerouting the local job-manager launch. The **browser node** is a separate, larger
+project (its own repo) and is explicitly out of scope here.
 
 ## Three separable concerns (do not conflate)
 

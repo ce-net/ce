@@ -350,3 +350,53 @@ fn compute_cost(cpu_ms: u64, mem_mb: u64, interval_secs: u64) -> u64 {
     let mem_credits = mem_gb_secs * CREDITS_PER_GB_SECOND;
     cpu_credits + mem_credits
 }
+
+/// `Runtime` backend that runs workloads as sandboxed Docker containers — the Docker impl of the
+/// `ce-runtime` seam. WASM (`ce-wasm`) plugs in as a sibling impl; `ce-node` dispatches by tag.
+pub struct DockerRuntime {
+    manager: ContainerManager,
+    host_node_id: NodeId,
+}
+
+impl DockerRuntime {
+    pub async fn new(host_node_id: NodeId) -> Result<Self> {
+        Ok(Self { manager: ContainerManager::new(host_node_id).await?, host_node_id })
+    }
+}
+
+#[async_trait::async_trait]
+impl ce_runtime::Runtime for DockerRuntime {
+    fn tag(&self) -> &'static str {
+        "docker"
+    }
+
+    async fn launch(
+        &self,
+        workload: &ce_runtime::Workload,
+        limits: &ce_runtime::Limits,
+        job_id: [u8; 32],
+    ) -> Result<ce_runtime::Handle> {
+        let (image, cmd, env) = match workload {
+            ce_runtime::Workload::Docker { image, cmd, env } => (image.clone(), cmd.clone(), env.clone()),
+            other => {
+                return Err(anyhow!("docker runtime cannot run a '{}' workload", other.required_tag()));
+            }
+        };
+        // `payer` here only populates the container's informational ce.payer label; the
+        // authoritative payer for billing lives in ce-node's JobRecord (heartbeat loop).
+        let spec = JobSpec {
+            job_id,
+            image,
+            cmd,
+            env,
+            cpu_cores: limits.cpu_cores,
+            mem_mb: limits.mem_mb,
+            payer: self.host_node_id,
+        };
+        Ok(ce_runtime::Handle(self.manager.launch_job(&spec).await?))
+    }
+
+    async fn stop(&self, handle: &ce_runtime::Handle) -> Result<()> {
+        self.manager.stop_job(&handle.0).await
+    }
+}

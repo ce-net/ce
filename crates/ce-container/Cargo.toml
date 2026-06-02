@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 ce-chain = { path = "../ce-chain" }
 ce-identity = { path = "../ce-identity" }
+ce-runtime = { path = "../ce-runtime" }
+async-trait = "0.1"
 bollard = "0.17"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
