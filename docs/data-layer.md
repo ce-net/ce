@@ -1,8 +1,16 @@
 # Data layer — design
 
-**Status: planning.** Content-addressed, chunked, P2P, paid object distribution — so jobs can
+**Status: Stage 1 done.** Content-addressed, chunked, P2P, paid object distribution — so jobs can
 get their inputs (datasets, model weights, code) and return their outputs at scale, instead of
 today's one-file `sync`. The frontier's reach for compute has a twin: data has to move too.
+
+Stage 1 ✅ (in `ce-rs`): the `data` module — `Manifest` (`ce-object-v1`: chunk CIDs + sizes),
+pure `chunk_object`/`reassemble`/`cid` (sha256, matches the node's `/blobs` keying), and
+`CeClient::put_object`/`get_object` layering the existing blob store into whole-object upload/fetch
+with per-chunk verification. Decisions locked: Kademlia provider records (Stage 2), fixed 1 MiB
+chunks, per-chunk channel receipts (Stage 3), scope = transfer + addressing + caching + paid
+serving (storage-with-proofs is the separate market). Next: **Stage 2** — `FetchChunk` mesh RPC +
+DHT provider records so a node pulls chunks it lacks.
 
 The good news: this is **mostly assembly of primitives CE already has**, not a new system.
 
