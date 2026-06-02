@@ -630,6 +630,12 @@ The first app — a distributed **work scheduler** (fan out N tasks, verify per 
 assurance dial, gate opaque work behind earned trust, optional Raft coordinator HA) — is
 specified in **`docs/apps/scheduler.md`**.
 
+The full **committed pre-launch capability roadmap** — payment channels, WASM/browser
+runtimes, relay incentives, the data layer, GPU support, durable storage, TEE attestation,
+verifiable compute, safety/abuse handling, chain maturity, key recovery, governance, and the
+interconnect/topology caveat — is in **`docs/frontier.md`**, tagged by CE-vs-app and difficulty,
+with the critical path called out.
+
 ### Substrate gaps the scheduler surfaced (planned)
 
 - **Mesh-routed deploy** — `JobBid` is local-only today; remote placement over `/ce/rpc/1`

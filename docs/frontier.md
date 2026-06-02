@@ -1,0 +1,98 @@
+# CE Frontier — committed pre-launch capability roadmap
+
+Everything CE must grow, beyond the foundation already built, to deliver the vision:
+*every computer on Earth sharing compute — the world's largest throughput machine.*
+
+This is the **committed pre-launch scope**. It is large on purpose. Each item is tagged:
+
+- **[CE]** a node-enforced/generic primitive (lives in the substrate) · **[app]** a client/policy layer on top
+- Difficulty: **Eng** (known how) · **Hard** (significant, some unknowns) · **Research** (open problem; pick narrow wins)
+
+Ordering is by dependency, not priority — later phases assume earlier ones. The **critical path**
+to a believable planet-scale launch is called out at the end.
+
+---
+
+## Phase A — Scale foundations (mandatory; the vision can't physically run without these)
+
+| Item | Why | Tag | Diff |
+|---|---|---|---|
+| **Payment channels / off-chain micropayments** | `Heartbeat` every ~30s × millions of cells floods any single chain. Open a channel on-chain, stream signed micropayments off-chain, settle the net. Caps the signal-pay economy without it. | [CE] | Hard |
+| **Lightweight runtimes — WASM + browser worker** | "Every computer on Earth" = phones, browsers, Docker-less laptops. Docker-only excludes ~95% of devices; a WASM sandbox + browser tab turns every web visitor into a node. | [CE] | Hard |
+| **Relay scaling + relay incentives** | One relay ≠ a planet. Many relays, discovered dynamically, **earning credits** for relaying; DHT tuned for millions of peers. | [CE] | Eng |
+| **Data layer** — content-addressed, chunked, paid P2P transfer | `sync` is one-file HTTP today. Datasets, weights, inputs, and results need BitTorrent/IPFS-shaped paid distribution. | [CE]+[app] | Hard |
+| Mesh-routed deploy (`Deploy`/`Kill` over `/ce/rpc/1`) | `JobBid` is local-only; the scheduler can't place on a remote host without it. Grant perms already reserved. | [CE] | Eng |
+| Reputation read index (`history(node_id)`) | Read-only index over settlements/heartbeats/expiries so apps derive per-relationship trust without a full chain scan. | [CE] | Eng |
+| Stake / bond tx | Bootstrap trust with risked credits; extends the escrow model. Start as visible commitment (auto-slash needs a fault oracle). | [CE] | Hard |
+| Verifiable randomness beacon (block-hash based) | Lets schedulers prove non-collusive random host selection for the redundancy verification path. | [CE] | Eng |
+
+## Phase B — Capability (what makes "supercomputer" real)
+
+| Item | Why | Tag | Diff |
+|---|---|---|---|
+| **First-class GPU / accelerator support** | GPU passthrough into cells, CUDA, multi-GPU. Central to the AI/HPC use case. | [CE] | Hard |
+| Verifiable capability / benchmarking | Nodes will lie about hardware ("I'm an H100"). Attested benchmarks (FLOPS, bandwidth, GPU model) feed placement. | [CE] | Hard |
+| **Durable trustless storage market** | Stateful work (DBs, checkpoints) needs replicated durable storage + proof-of-storage + redundancy. Filecoin-shaped subsystem; pairs with the trust gradient. | [CE]+[app] | Research |
+| Checkpoint / migrate / preempt | Long jobs on volunteer machines lose hosts; checkpoint-and-restart-elsewhere makes a flaky mesh usable for >minutes work. | [CE]+[app] | Hard |
+
+## Phase C — Trust & verification frontier (highest leverage, hardest)
+
+| Item | Why | Tag | Diff |
+|---|---|---|---|
+| **TEE / confidential-compute attestation** (SGX/SEV, GPU CC) | The biggest lever on verification: hardware proof that "this exact code ran unmodified" lets you trust opaque work *without* a track record — can collapse the earned-trust tier. | [CE] | Research |
+| Verifiable computation (ZK / fraud proofs / optimistic+challenge) | General "prove the work was correct." Unsolved at general scale; target narrow, asymmetric (easy-to-verify) workloads first. | [CE]+[app] | Research |
+| Reputation system + scheduler | The first apps (`docs/apps/scheduler.md`), reading the history index, computing per-relationship trust, tiering work. | [app] | Eng |
+
+## Phase D — Safety & security (launch-blocking in their own right)
+
+| Item | Why | Tag | Diff |
+|---|---|---|---|
+| Sandbox-escape hardening + **network egress control** | A cell must not DDoS, reach the host's LAN, or escape gVisor. Running strangers' code on volunteers' machines is the core attack surface. | [CE] | Hard |
+| Resource-abuse limits | Prevent crypto-mining / runaway use inside cells beyond what was paid for. | [CE] | Eng |
+| **Transport encryption** (TLS from identity key) | CE auth proves authenticity, not confidentiality; plain HTTP leaks payloads. Known gap. | [CE] | Eng |
+| Mesh/API rate-limiting + DoS resistance | `MAX_TXS_PER_BLOCK` exists; the mesh and API need their own. | [CE] | Eng |
+| **Abuse / illegal-use policy** | Permissionless compute attracts botnets, illegal content, "attack X for me." In real tension with trustlessness; host-side acceptance rules + egress policy + opt-outs. The thing that gets a network shut down if ignored. | [CE]+[app] | Hard |
+
+## Phase E — Chain maturity
+
+| Item | Why | Tag | Diff |
+|---|---|---|---|
+| Longest-chain reorg / fork choice | Currently first-wins; needs a real reorg in the mesh loop. | [CE] | Eng |
+| Chain checkpoints | Collectively-signed tip every N blocks; freeze the prefix (Phase 1d). | [CE] | Eng |
+| Throughput | Largely solved by payment channels (Phase A) moving micropayments off-chain. | [CE] | Hard |
+| **PoW security revisit** | Emission is kept, but PoW still hands *ledger* control to whoever hashes most — the concern you raised. The chain-secures-money / signal-pay-secures-work split is right; the chain's own 51% resistance at scale must be confronted deliberately. | [CE] | Research |
+
+## Phase F — Identity, recovery, UX, governance
+
+| Item | Why | Tag | Diff |
+|---|---|---|---|
+| **Key recovery** (social / hardware-key) | Lose your node key → lose all credits. Essential before real value rides on it. | [CE]+[app] | Hard |
+| Wallets + mobile/web clients | Onboarding for non-CLI users. | [app] | Eng |
+| Human-readable node names | On-chain NameClaim (Phase 5e). | [CE] | Eng |
+| **Protocol governance** | How does a *trustless* network upgrade its own rules without a central authority? Versioning + fork coordination. | [CE]+[app] | Research |
+
+## Cross-cutting — the physics caveat
+
+CE will be staggering at **throughput** (embarrassingly-parallel / loosely-coupled: rendering,
+batch inference, parameter sweeps, Monte Carlo, search) — plausibly dwarfing any supercomputer.
+It will **not** beat InfiniBand at latency-bound tightly-coupled HPC unless the scheduler does
+**topology-aware co-location** (place a tightly-coupled cohort in one region/datacenter). Position
+honestly: *the world's largest throughput machine*, not its fastest tightly-coupled one. Topology-
+aware placement [app, using atlas locality hints — [CE]] is the bridge for the HPC cases.
+
+---
+
+## Critical path to a planet-scale launch
+
+If the rest is the destination, this is the spine:
+
+1. **Payment channels** — unlocks the micropayment economy past a few thousand cells. [CE, Hard]
+2. **WASM / browser runtime** — turns billions of devices into nodes. [CE, Hard]
+3. **Relay incentives + scaling** — reach beyond one box. [CE, Eng]
+4. **Data layer** — get inputs/outputs/datasets to and from cells at scale. [CE, Hard]
+5. **TEE attestation** — the highest-leverage bet: makes the trust gradient mostly evaporate. [CE, Research]
+
+Plus the Phase D safety set, which is launch-blocking regardless of how far the capability work gets.
+
+> This is the long game. Build it primitive by primitive, each one generic and node-enforced where
+> it belongs and an app where it doesn't (`docs/primitives.md`), each shipped behind tests and docs.
