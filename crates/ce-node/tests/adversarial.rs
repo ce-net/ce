@@ -377,7 +377,7 @@ async fn attack_job_bid_zero_balance() {
             "cpu_cores": 1,
             "mem_mb": 128,
             "duration_secs": 30,
-            "bid": 1_000_000
+            "bid": "1000000"
         }))
         .send()
         .await

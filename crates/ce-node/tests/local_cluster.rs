@@ -220,7 +220,7 @@ async fn api_job_bid_rejects_zero_balance() {
         "cpu_cores": 1,
         "mem_mb": 128,
         "duration_secs": 30,
-        "bid": 100
+        "bid": "100"
     });
     let resp = client
         .post(format!("http://127.0.0.1:{api}/jobs/bid"))

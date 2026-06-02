@@ -171,7 +171,7 @@ async fn run_propagation_test(cluster: &Cluster) -> anyhow::Result<()> {
         "cpu_cores": 1,
         "mem_mb": 128,
         "duration_secs": 60,
-        "bid": 100
+        "bid": "100"
     });
 
     let resp = client
