@@ -49,7 +49,7 @@ to a believable planet-scale launch is called out at the end.
 |---|---|---|---|
 | Sandbox-escape hardening + **network egress control** | A cell must not DDoS, reach the host's LAN, or escape gVisor. Running strangers' code on volunteers' machines is the core attack surface. | [CE] | Hard |
 | Resource-abuse limits | Prevent crypto-mining / runaway use inside cells beyond what was paid for. | [CE] | Eng |
-| **Transport encryption** (TLS from identity key) | CE auth proves authenticity, not confidentiality; plain HTTP leaks payloads. Known gap. | [CE] | Eng |
+| **Transport encryption** (TLS from identity key) | CE auth proves authenticity, not confidentiality; plain HTTP leaks payloads. **`ce-tls` crate done** (self-signed cert keyed by the node's Ed25519 identity + NodeId-pinned verifier, tested); serving the API over TLS + pinned clients is the next wiring step. The mesh (`/ce/rpc/1`) is already Noise-encrypted. | [CE] | Eng |
 | Mesh/API rate-limiting + DoS resistance | `MAX_TXS_PER_BLOCK` exists; the mesh and API need their own. | [CE] | Eng |
 | **Abuse / illegal-use policy** | Permissionless compute attracts botnets, illegal content, "attack X for me." In real tension with trustlessness; host-side acceptance rules + egress policy + opt-outs. The thing that gets a network shut down if ignored. | [CE]+[app] | Hard |
 

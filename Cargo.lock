@@ -615,6 +615,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ce-tls"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ce-identity",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
