@@ -1,6 +1,6 @@
 # Data layer — design
 
-**Status: Stages 1–2 done.** Content-addressed, chunked, P2P, paid object distribution — so jobs
+**Status: Stages 1–3 done.** Content-addressed, chunked, P2P, paid object distribution — so jobs
 can get their inputs (datasets, model weights, code) and return their outputs at scale, instead of
 today's one-file `sync`. The frontier's reach for compute has a twin: data has to move too.
 
@@ -17,11 +17,25 @@ query's final step); `GET /blobs/:hash` falls back to discover → fetch → **v
 hash** → cache + re-announce (so popular data self-replicates). Integration-tested across two
 in-process nodes (`blob_fetched_across_mesh`).
 
-Decisions locked: Kademlia provider records, fixed 1 MiB chunks, per-chunk channel receipts
-(Stage 3), scope = transfer + addressing + caching + paid serving (storage-with-proofs is the
-separate market). Next: **Stage 3** — paid serving (per-chunk channel receipts) + trust-gated
-provider selection; and **Stage 4** — `Workload` I/O by CID. Parallel multi-provider fetch
-(swarming) and periodic provider-record refresh are refinements on the Stage 2 base.
+Stage 3 ✅ (in `ce-chain` + `ce-mesh` + `ce-node` + `ce-rs`): **paid serving** over the existing
+payment-channel primitive. `ce-chain::ChunkReceipt` (the payer's signature over the *same*
+`channel_receipt_bytes` the chain validates at close) + `verify_chunk_receipt_sig`; `FetchChunk`
+gains an opaque `receipt`; a node config `data_price_per_byte` (0 = free, the default). The
+provider enforces payment in the `FetchChunk` handler via the pure, unit-tested
+`authorize_chunk_serve` — channel must exist with this node as host, receipt cumulative must cover
+`served + chunk cost` and stay within capacity, and the payer signature must verify — tracking an
+in-memory per-channel high-water mark (so it's paid as it serves; the host still closes with the
+highest receipt). The payer fetches via `POST /data/fetch` (signs the receipt, pulls, verifies
+against the cid) / `ce-rs` `fetch_chunk_paid`. Tested: receipt accept/reject + the full
+authorization decision with real signatures (unit), and a charging provider refusing a free fetch
+over the real mesh (`paid_provider_refuses_free_fetch`).
+
+Decisions locked: Kademlia provider records, fixed 1 MiB chunks, per-chunk channel receipts,
+scope = transfer + addressing + caching + paid serving (storage-with-proofs is the separate
+market). Next: **Stage 4** — `Workload` I/O by CID (host fetches inputs, publishes outputs).
+Refinements: mesh-advertised pricing + auto provider selection (the capacity signal's `u32`
+version field can't carry a `u128` price — price is an out-of-band/config knob for now), parallel
+multi-provider fetch (swarming), and periodic provider-record refresh.
 
 The good news: this is **mostly assembly of primitives CE already has**, not a new system.
 
@@ -88,9 +102,10 @@ the scheduler (`swarm`) stages data to chosen hosts before dispatch.
   held chunks; `FetchChunk { cid }` mesh RPC (verified); fetched chunks are cached and re-announced
   (popular data self-replicates). A node now pulls an object it doesn't have from the mesh.
   (Parallel multi-provider fetch / swarming is a refinement on top.)
-- **Stage 3 — paid serving + trust-gated selection.** Per-chunk channel receipts (provider earns);
-  providers advertise a price/MB; requesters pick cheap+trusted providers; free within an admin
-  fleet. Free-riding bounded by small chunks + pay-as-you-go + reputation.
+- **Stage 3 ✅ — paid serving.** Per-chunk channel receipts (provider earns); a `data_price_per_byte`
+  knob (0 = free); the provider verifies a receipt covering the running cost before serving.
+  Free-riding bounded by small chunks + pay-as-you-go + the receipt's high-water mark. (Mesh-
+  advertised pricing + cheap/trusted auto-selection is a refinement; price is config/out-of-band.)
 - **Stage 4 — job integration.** `Workload` inputs/outputs by CID; host fetches inputs, publishes
   outputs; `swarm` stages data ahead of dispatch.
 - *(Separate, later: durable storage market — proof-of-storage, replication incentives.)*

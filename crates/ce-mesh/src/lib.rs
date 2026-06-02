@@ -137,6 +137,9 @@ pub enum RpcRequest {
     FetchChunk {
         from_node: NodeId,
         cid: [u8; 32],
+        /// Optional payment-channel receipt (bincode of `ce_chain::ChunkReceipt`), opaque to the
+        /// transport. Required when the provider charges for data; `None` for free/open serving.
+        receipt: Option<Vec<u8>>,
     },
 }
 

@@ -13,7 +13,7 @@ pub fn peer_id_from_identity(identity: &ce_identity::Identity) -> anyhow::Result
 
 use anyhow::Result;
 use bollard::Docker;
-use ce_chain::{Block, Chain, Tx, TxKind};
+use ce_chain::{Block, Chain, ChunkReceipt, Tx, TxKind, verify_chunk_receipt_sig};
 use ce_container::{ContainerManager, ExecSpec, JobSpec, exec_in_container};
 use ce_runtime::Runtime;
 use ce_identity::{Identity, NodeId};
@@ -126,6 +126,12 @@ pub struct JobRecord {
 /// Shared job store: maps CE job_id ([u8;32]) → job record.
 pub(crate) type JobStore = Arc<Mutex<HashMap<[u8; 32], JobRecord>>>;
 
+/// Provider-side data-layer accounting: channel_id → cumulative value already served on it.
+/// Each priced chunk requires a receipt whose cumulative exceeds this by at least the chunk's
+/// cost; the new cumulative is then recorded. In-memory (resets on restart, which can only
+/// under-charge, never over-charge); the host still closes the channel with the highest receipt.
+pub(crate) type DataServedLedger = Arc<Mutex<HashMap<[u8; 32], u128>>>;
+
 // ----- Node config -----
 
 pub struct NodeConfig {
@@ -152,6 +158,10 @@ pub struct NodeConfig {
     pub disable_local_discovery: bool,
     /// Serve the HTTP API over TLS (cert keyed by the node identity; clients pin the NodeId).
     pub tls: bool,
+    /// Price (base units) charged per byte served from the data layer. `0` = free/open serving
+    /// (the default). When non-zero, a `FetchChunk` must carry a payment-channel receipt whose
+    /// cumulative covers the running cost, or the provider refuses to serve.
+    pub data_price_per_byte: u128,
 }
 
 impl Default for NodeConfig {
@@ -168,6 +178,7 @@ impl Default for NodeConfig {
             archive_density: ce_chain::ARCHIVE_DENSITY,
             disable_local_discovery: false,
             tls: false,
+            data_price_per_byte: 0,
         }
     }
 }
@@ -346,6 +357,8 @@ impl Node {
             let self_tags2 = self_tags.clone();
             let job_store_m = job_store.clone();
             let runtimes_m = runtimes.clone();
+            let data_price = node.config.data_price_per_byte;
+            let data_served: DataServedLedger = Arc::new(Mutex::new(HashMap::new()));
             tokio::spawn(async move {
                 mesh_event_loop(
                     chain2,
@@ -369,6 +382,8 @@ impl Node {
                     self_tags2,
                     job_store_m,
                     runtimes_m,
+                    data_price,
+                    data_served,
                 )
                 .await;
             });
@@ -576,6 +591,8 @@ async fn mesh_event_loop(
     self_tags: Vec<String>,
     job_store: JobStore,
     runtimes: Vec<Arc<dyn Runtime>>,
+    data_price_per_byte: u128,
+    data_served: DataServedLedger,
 ) {
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
@@ -837,15 +854,55 @@ async fn mesh_event_loop(
                         };
                         let _ = handle.respond_rpc(correlation_id, resp).await;
                     });
-                } else if let RpcRequest::FetchChunk { cid, .. } = &request {
-                    // Serve a content-addressed chunk from the local blob store (open, like
-                    // SegmentFetch). The blob file is keyed by hex(cid); the requester re-verifies.
+                } else if let RpcRequest::FetchChunk { cid, receipt, .. } = &request {
+                    // Serve a content-addressed chunk from the local blob store. Free when
+                    // data_price_per_byte == 0 (open, like SegmentFetch); otherwise the request
+                    // must carry a payment-channel receipt covering the running cost (Stage 3).
                     let cid = *cid;
+                    let receipt = receipt.clone();
                     let blobs_dir = data_dir.join("blobs");
                     let handle = mesh_handle.clone();
+                    let price = data_price_per_byte;
+                    let chain2 = chain.clone();
+                    let ledger = data_served.clone();
+                    let host = our_node_id;
                     tokio::spawn(async move {
                         let resp = match std::fs::read(blobs_dir.join(hex::encode(cid))) {
-                            Ok(bytes) => RpcResponse::ChunkData { cid, bytes },
+                            Ok(bytes) if price == 0 => RpcResponse::ChunkData { cid, bytes },
+                            Ok(bytes) => {
+                                let parsed = receipt
+                                    .as_ref()
+                                    .and_then(|b| bincode::deserialize::<ChunkReceipt>(b).ok());
+                                let channel = match &parsed {
+                                    Some(r) => chain2
+                                        .list_channels()
+                                        .await
+                                        .into_iter()
+                                        .find(|(id, ..)| id == &r.channel_id)
+                                        .map(|(_, payer, h, cap, _)| (payer, h, cap)),
+                                    None => None,
+                                };
+                                let mut guard = ledger.lock().await;
+                                let key = parsed.as_ref().map(|r| r.channel_id).unwrap_or_default();
+                                let served = guard.get(&key).copied().unwrap_or(0);
+                                match authorize_chunk_serve(
+                                    price,
+                                    bytes.len(),
+                                    &host,
+                                    parsed.as_ref(),
+                                    channel,
+                                    served,
+                                ) {
+                                    Ok(new_cumulative) => {
+                                        guard.insert(key, new_cumulative);
+                                        drop(guard);
+                                        RpcResponse::ChunkData { cid, bytes }
+                                    }
+                                    Err(reason) => {
+                                        RpcResponse::Error(format!("payment required: {reason}"))
+                                    }
+                                }
+                            }
                             Err(_) => RpcResponse::Error(format!(
                                 "chunk {} not held",
                                 hex::encode(&cid[..4])
@@ -933,6 +990,46 @@ async fn mesh_event_loop(
             }
         }
     }
+}
+
+// ----- Data-layer chunk payment authorization -----
+
+/// Decide whether to serve a priced chunk, given the attached receipt and channel state. Pure and
+/// deterministic so it can be unit-tested with real signatures. Returns the new cumulative value
+/// to record for the channel on success, or a human reason on refusal.
+///
+/// - `price_per_byte == 0` → always free (returns `served` unchanged).
+/// - otherwise a receipt is required; the channel must exist with this node as host; the receipt's
+///   cumulative must cover `served + chunk cost`, stay within capacity, and carry a valid payer
+///   signature. The returned cumulative becomes the new high-water mark for the channel.
+fn authorize_chunk_serve(
+    price_per_byte: u128,
+    chunk_len: usize,
+    host: &NodeId,
+    receipt: Option<&ChunkReceipt>,
+    channel: Option<(NodeId, NodeId, u128)>, // (payer, host, capacity) from the chain
+    served: u128,
+) -> Result<u128, String> {
+    if price_per_byte == 0 {
+        return Ok(served);
+    }
+    let cost = price_per_byte.saturating_mul(chunk_len as u128);
+    let receipt = receipt.ok_or("no receipt (provider charges for data)")?;
+    let (payer, chan_host, capacity) = channel.ok_or("unknown or unsettled channel")?;
+    if &chan_host != host {
+        return Err("channel is not hosted by this node".into());
+    }
+    let owed = served.saturating_add(cost);
+    if receipt.cumulative < owed {
+        return Err("receipt cumulative does not cover the chunk cost".into());
+    }
+    if receipt.cumulative > capacity {
+        return Err("receipt cumulative exceeds channel capacity".into());
+    }
+    if !verify_chunk_receipt_sig(&payer, host, receipt) {
+        return Err("invalid receipt signature".into());
+    }
+    Ok(receipt.cumulative)
 }
 
 // ----- Incoming mesh RPC handler -----
@@ -1652,5 +1749,87 @@ mod capability_tag_tests {
         assert_eq!(parsed.mem_mb, 16_384);
         assert_eq!(parsed.running_jobs, 2);
         assert_eq!(parsed.tags, vec!["gpu".to_string(), "linux".to_string(), "docker".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod chunk_payment_tests {
+    use super::*;
+    use ce_chain::channel_receipt_bytes;
+    use ce_identity::Identity;
+
+    fn ident(seed: &str) -> Identity {
+        let dir = std::env::temp_dir().join(format!("ce-pay-{seed}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Identity::load_or_generate(&dir).unwrap()
+    }
+
+    fn receipt(payer: &Identity, host: &NodeId, channel_id: [u8; 32], cumulative: u128) -> ChunkReceipt {
+        let payer_sig = payer.sign(&channel_receipt_bytes(&channel_id, host, cumulative));
+        ChunkReceipt { channel_id, cumulative, payer_sig }
+    }
+
+    #[test]
+    fn free_serving_needs_no_receipt() {
+        let host = ident("free-host").node_id();
+        assert_eq!(authorize_chunk_serve(0, 1024, &host, None, None, 0), Ok(0));
+    }
+
+    #[test]
+    fn priced_serving_requires_a_receipt() {
+        let host = ident("ph").node_id();
+        let e = authorize_chunk_serve(10, 100, &host, None, None, 0).unwrap_err();
+        assert!(e.contains("no receipt"), "{e}");
+    }
+
+    #[test]
+    fn valid_receipt_authorizes_and_advances_cumulative() {
+        let payer = ident("ok-payer");
+        let host = ident("ok-host");
+        let host_id = host.node_id();
+        let channel_id = [3u8; 32];
+        let capacity = 1_000_000u128;
+        // Price 10/byte, 1000-byte chunk => cost 10_000. Receipt covers it.
+        let r = receipt(&payer, &host_id, channel_id, 10_000);
+        let chan = Some((payer.node_id(), host_id, capacity));
+        let new_cum = authorize_chunk_serve(10, 1000, &host_id, Some(&r), chan, 0).unwrap();
+        assert_eq!(new_cum, 10_000, "records the receipt's cumulative as served");
+    }
+
+    #[test]
+    fn rejects_insufficient_capacity_or_coverage_or_wrong_host_or_bad_sig() {
+        let payer = ident("bad-payer");
+        let host = ident("bad-host");
+        let other = ident("bad-other");
+        let host_id = host.node_id();
+        let channel_id = [4u8; 32];
+
+        // Cumulative below cost (cost = 10 * 1000 = 10_000, already served 5_000 => owed 15_000).
+        let low = receipt(&payer, &host_id, channel_id, 12_000);
+        let chan = Some((payer.node_id(), host_id, 1_000_000));
+        assert!(authorize_chunk_serve(10, 1000, &host_id, Some(&low), chan, 5_000)
+            .unwrap_err()
+            .contains("does not cover"));
+
+        // Cumulative beyond channel capacity.
+        let over = receipt(&payer, &host_id, channel_id, 50_000);
+        let small = Some((payer.node_id(), host_id, 20_000));
+        assert!(authorize_chunk_serve(10, 1000, &host_id, Some(&over), small, 0)
+            .unwrap_err()
+            .contains("capacity"));
+
+        // Channel hosted by someone else.
+        let r = receipt(&payer, &host_id, channel_id, 10_000);
+        let foreign = Some((payer.node_id(), other.node_id(), 1_000_000));
+        assert!(authorize_chunk_serve(10, 1000, &host_id, Some(&r), foreign, 0)
+            .unwrap_err()
+            .contains("not hosted"));
+
+        // Signature by the wrong key (other signs but channel payer is `payer`).
+        let forged = receipt(&other, &host_id, channel_id, 10_000);
+        let chan2 = Some((payer.node_id(), host_id, 1_000_000));
+        assert!(authorize_chunk_serve(10, 1000, &host_id, Some(&forged), chan2, 0)
+            .unwrap_err()
+            .contains("signature"));
     }
 }

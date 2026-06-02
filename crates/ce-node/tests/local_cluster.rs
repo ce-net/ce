@@ -720,3 +720,65 @@ async fn blob_fetched_across_mesh() {
     let got = fetched.expect("B should fetch the blob from A across the mesh");
     assert_eq!(got, payload, "fetched bytes must match the stored payload exactly");
 }
+
+/// Data layer Stage 3 gate: a provider that charges for data refuses a free (receiptless) fetch.
+/// Node A sets a non-zero data price and stores a blob; node B's plain `GET /blobs/:hash` (which
+/// attaches no payment receipt) must not succeed — the provider declines to serve it for free.
+#[tokio::test(flavor = "multi_thread")]
+async fn paid_provider_refuses_free_fetch() {
+    let (p2p_a, api_a) = alloc_ports();
+    let dir_a = tmpdir("paid-provider");
+    let _node_a = Node::start(NodeConfig {
+        listen_port: p2p_a,
+        bootstrap_peers: vec![],
+        data_dir: dir_a.clone(),
+        api_port: api_a,
+        mine: false,
+        disable_local_discovery: true,
+        data_price_per_byte: 1, // charge for data
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    sleep(Duration::from_millis(600)).await;
+
+    let bs = bootstrap_addr(&dir_a, p2p_a);
+    let (p2p_b, api_b) = alloc_ports();
+    let _node_b = Node::start(NodeConfig {
+        listen_port: p2p_b,
+        bootstrap_peers: vec![bs],
+        data_dir: tmpdir("paid-fetcher"),
+        api_port: api_b,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let client = reqwest::Client::new();
+    let payload = b"this costs credits".to_vec();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api_a}/blobs"))
+        .body(payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let hash = v["hash"].as_str().unwrap().to_string();
+
+    // B's free GET must never succeed: A discovers as a provider but declines to serve unpaid.
+    for _ in 0..4 {
+        sleep(Duration::from_millis(1500)).await;
+        let r = client
+            .get(format!("http://127.0.0.1:{api_b}/blobs/{hash}"))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(r.status(), 200, "charging provider must not serve a free fetch");
+    }
+}

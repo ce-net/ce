@@ -113,6 +113,7 @@ async fn live_node_syncs_from_relay() {
         archive_density: 0.0,
         disable_local_discovery: false,
         tls: false,
+        data_price_per_byte: 0,
     };
 
     let node = Node::start(config).await.expect("node start failed");
@@ -161,6 +162,7 @@ async fn live_light_node_prunes_and_archives() {
         archive_density: ARCHIVE_DENSITY,
         disable_local_discovery: false,
         tls: false,
+        data_price_per_byte: 0,
     };
 
     let node = Node::start(config).await.expect("node start failed");

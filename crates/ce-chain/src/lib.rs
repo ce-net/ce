@@ -214,6 +214,24 @@ pub fn channel_receipt_bytes(channel_id: &[u8; 32], host: &NodeId, cumulative: u
     bincode::serialize(&(b"ce-channel-receipt-v1", channel_id, host, cumulative)).unwrap_or_default()
 }
 
+/// An off-chain payment-channel receipt carried with a data-layer chunk fetch (Stage 3): the
+/// payer's signature over `channel_receipt_bytes(channel_id, host, cumulative)`, authorising the
+/// host to redeem up to `cumulative` later via `ChannelClose`. The provider is paid as it serves —
+/// each chunk requires a receipt whose cumulative covers the running cost. The signed bytes are
+/// identical to the on-chain closing receipt, so the same receipts settle the channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkReceipt {
+    pub channel_id: [u8; 32],
+    pub cumulative: u128,
+    #[serde(with = "sig_serde")]
+    pub payer_sig: [u8; 64],
+}
+
+/// Verify a chunk receipt's signature against the channel's `payer` and `host`.
+pub fn verify_chunk_receipt_sig(payer: &NodeId, host: &NodeId, r: &ChunkReceipt) -> bool {
+    verify(payer, &channel_receipt_bytes(&r.channel_id, host, r.cumulative), &r.payer_sig).is_ok()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
     pub kind: TxKind,
@@ -1358,6 +1376,29 @@ mod tests {
             channel_receipt_bytes(&chan, &host.node_id(), 1_000),
             channel_receipt_bytes(&chan, &host.node_id(), 1_001)
         );
+    }
+
+    #[test]
+    fn chunk_receipt_verifies_and_rejects() {
+        let payer = make_identity("chunk-payer");
+        let host = make_identity("chunk-host");
+        let other = make_identity("chunk-other");
+        let channel_id = [9u8; 32];
+        let cumulative = 5_000u128;
+
+        let payer_sig = payer.sign(&channel_receipt_bytes(&channel_id, &host.node_id(), cumulative));
+        let receipt = ChunkReceipt { channel_id, cumulative, payer_sig };
+
+        // Survives a bincode round-trip (it travels as opaque bytes in FetchChunk).
+        let wire = bincode::serialize(&receipt).unwrap();
+        let decoded: ChunkReceipt = bincode::deserialize(&wire).unwrap();
+        assert!(verify_chunk_receipt_sig(&payer.node_id(), &host.node_id(), &decoded));
+
+        // Wrong host, wrong payer, or a forged cumulative all fail verification.
+        assert!(!verify_chunk_receipt_sig(&payer.node_id(), &other.node_id(), &receipt));
+        assert!(!verify_chunk_receipt_sig(&other.node_id(), &host.node_id(), &receipt));
+        let forged = ChunkReceipt { cumulative: cumulative + 1, ..receipt.clone() };
+        assert!(!verify_chunk_receipt_sig(&payer.node_id(), &host.node_id(), &forged));
     }
 
     fn signed_channel_open(

@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use bollard::{container::RemoveContainerOptions, Docker};
-use ce_chain::{channel_receipt_bytes, payer_settle_bytes, Block, Tx, TxKind};
+use ce_chain::{channel_receipt_bytes, payer_settle_bytes, Block, ChunkReceipt, Tx, TxKind};
 use ce_container::{exec_in_container, ExecSpec};
 use ce_identity::{verify, Identity, NodeId};
 use ce_mesh::{MeshHandle, RpcRequest, RpcResponse, peer_id_from_node_id};
@@ -1515,7 +1515,7 @@ async fn fetch_chunk_from_mesh(state: &ApiState, cid: [u8; 32]) -> Option<Vec<u8
     .ok()?;
 
     for peer in providers {
-        let req = RpcRequest::FetchChunk { from_node: state.host_node_id, cid };
+        let req = RpcRequest::FetchChunk { from_node: state.host_node_id, cid, receipt: None };
         if let Ok(RpcResponse::ChunkData { bytes, .. }) = state.mesh_handle.send_rpc(peer, req).await
         {
             let got: [u8; 32] = Sha256::digest(&bytes).into();
@@ -1530,6 +1530,69 @@ async fn fetch_chunk_from_mesh(state: &ApiState, cid: [u8; 32]) -> Option<Vec<u8
         }
     }
     None
+}
+
+#[derive(Debug, Deserialize)]
+struct DataFetchRequest {
+    /// The provider (channel host) to fetch from and pay.
+    provider: String,
+    /// Content id (sha256 hex) of the chunk to fetch.
+    cid: String,
+    /// Open payment channel this node (payer) holds with the provider.
+    channel_id: String,
+    /// Monotonic cumulative this node authorises the provider to redeem — must cover the running
+    /// cost of all chunks fetched on this channel so far. The caller tracks it across fetches.
+    #[serde(with = "amount_str")]
+    cumulative: u128,
+}
+
+/// Paid chunk fetch (Stage 3): sign a payment-channel receipt for `cumulative` and pull the chunk
+/// from `provider` over the mesh, paying as we go. Called on the PAYER node. The provider verifies
+/// the receipt before serving; we verify the returned bytes against `cid`, then cache + announce.
+async fn data_fetch(State(state): State<ApiState>, Json(req): Json<DataFetchRequest>) -> Response {
+    let provider: NodeId = match hex::decode(&req.provider).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "provider must be 64 hex chars"),
+    };
+    let mut cid = [0u8; 32];
+    if hex::decode_to_slice(&req.cid, &mut cid).is_err() {
+        return err(StatusCode::BAD_REQUEST, "cid must be 64 hex chars");
+    }
+    let channel_id: [u8; 32] = match hex::decode(&req.channel_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "channel_id must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&provider) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad provider id: {e}")),
+    };
+
+    // Sign the receipt: payer authorises the provider (host) to redeem up to `cumulative`.
+    let payer_sig = state.identity.sign(&channel_receipt_bytes(&channel_id, &provider, req.cumulative));
+    let receipt = ChunkReceipt { channel_id, cumulative: req.cumulative, payer_sig };
+    let receipt_bytes = bincode::serialize(&receipt).expect("serialize receipt");
+
+    let rpc = RpcRequest::FetchChunk {
+        from_node: state.host_node_id,
+        cid,
+        receipt: Some(receipt_bytes),
+    };
+    match state.mesh_handle.send_rpc(peer_id, rpc).await {
+        Ok(RpcResponse::ChunkData { bytes, .. }) => {
+            let got: [u8; 32] = Sha256::digest(&bytes).into();
+            if got != cid {
+                return err(StatusCode::BAD_GATEWAY, "provider returned bytes that do not match cid");
+            }
+            let dir = state.data_dir.join("blobs");
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(hex::encode(cid)), &bytes);
+            let _ = state.mesh_handle.provide_chunk(cid).await;
+            (StatusCode::OK, bytes).into_response()
+        }
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::BAD_GATEWAY, "unexpected response"),
+        Err(e) => err(StatusCode::BAD_GATEWAY, format!("mesh fetch failed: {e}")),
+    }
 }
 
 // ----- Router -----
@@ -1609,6 +1672,7 @@ pub async fn start(
         .route("/channels/:id/expire", post(channel_expire))
         .route("/blobs", post(put_blob))
         .route("/blobs/:hash", get(get_blob))
+        .route("/data/fetch", post(data_fetch))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))
