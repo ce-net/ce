@@ -641,6 +641,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ce-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ce-tls"
 version = "0.1.0"
 dependencies = [

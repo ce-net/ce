@@ -2,6 +2,7 @@
 members = [
     "crates/ce-identity",
     "crates/ce-tls",
+    "crates/ce-runtime",
     "crates/ce-chain",
     "crates/ce-mesh",
     "crates/ce-container",
