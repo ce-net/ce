@@ -618,6 +618,29 @@ Cost: 1000 credits. Duration: 210,000 blocks. Name collision: first-wins per cha
 
 ---
 
+## Platform model & apps
+
+CE is a **trustless compute substrate**; products are apps built on its primitives. The
+governing rule — *CE owns generic node-enforced mechanism; apps own policy* — and the full
+primitive surface (identity, ledger, atlas, jobs, exec, heartbeats, CEP-1 messaging, grants,
+fleet) are specified in **`docs/primitives.md`**, which also lists what CE deliberately does
+*not* provide and how the **trust gradient** lets apps run untrusted compute safely.
+
+The first app — a distributed **work scheduler** (fan out N tasks, verify per a per-job
+assurance dial, gate opaque work behind earned trust, optional Raft coordinator HA) — is
+specified in **`docs/apps/scheduler.md`**.
+
+### Substrate gaps the scheduler surfaced (planned)
+
+- **Mesh-routed deploy** — `JobBid` is local-only today; remote placement over `/ce/rpc/1`
+  (the reserved `Deploy`/`Kill` grant permissions) is needed for cross-mesh fan-out.
+- **Reputation read over history** — a read-only `history(node_id)` index over settlements/
+  heartbeats/expiries so apps can derive per-relationship trust without a full chain scan.
+- **Stake / bond tx** — lockable, conditionally-released collateral (extends the escrow model)
+  to bootstrap trust; start as visible commitment (auto-slash needs a fault oracle).
+- **Verifiable randomness beacon** — e.g. block hash, to let schedulers prove non-collusive
+  random host selection for the redundancy verification path.
+
 ## What CE is NOT
 
 - Not a smart contract platform (chain rules are hardcoded, not programmable)
