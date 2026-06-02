@@ -10,6 +10,7 @@ ce-mesh = { path = "../ce-mesh" }
 ce-container = { path = "../ce-container" }
 ce-protocol = { path = "../ce-protocol" }
 ce-runtime = { path = "../ce-runtime" }
+ce-wasm = { path = "../ce-wasm" }
 ce-tls = { path = "../ce-tls" }
 tokio-rustls = "0.26"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }

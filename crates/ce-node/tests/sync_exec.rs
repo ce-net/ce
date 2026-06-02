@@ -819,3 +819,28 @@ async fn tls_handshake_pins_node_identity() {
     let tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", api)).await.unwrap();
     assert!(bad.connect(name, tcp2).await.is_err(), "wrong pin must be rejected");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Content-addressed blob store (POST/GET /blobs) — backs WASM module delivery
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_post_get_roundtrip() {
+    let (_node, _dir, api) = start_node("blobs").await;
+    let client = reqwest::Client::new();
+    let body = b"a content-addressed blob (e.g. a wasm module)".to_vec();
+
+    let put: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{api}/blobs"))
+        .body(body.clone())
+        .send().await.unwrap().json().await.unwrap();
+    let hash = put["hash"].as_str().unwrap().to_string();
+    assert_eq!(hash.len(), 64, "blob hash is 64 hex chars");
+
+    let got = client.get(format!("http://127.0.0.1:{api}/blobs/{hash}")).send().await.unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    assert_eq!(got.bytes().await.unwrap().as_ref(), body.as_slice(), "GET returns the exact bytes");
+
+    let miss = client.get(format!("http://127.0.0.1:{api}/blobs/{}", "0".repeat(64))).send().await.unwrap();
+    assert_eq!(miss.status(), StatusCode::NOT_FOUND, "unknown hash is 404");
+}

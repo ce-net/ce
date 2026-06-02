@@ -902,9 +902,17 @@ struct MeshDeployRequest {
     /// Optional relay circuit multiaddr dial hint.
     #[serde(default)]
     hint_multiaddr: String,
-    image: String,
+    /// Docker image (Docker workload). Mutually exclusive with `wasm_module`.
+    #[serde(default)]
+    image: Option<String>,
     #[serde(default)]
     cmd: Vec<String>,
+    /// WASM module content hash, 64 hex (Wasm workload). Mutually exclusive with `image`.
+    #[serde(default)]
+    wasm_module: Option<String>,
+    /// Exported entry function for a Wasm workload (default "entry").
+    #[serde(default)]
+    wasm_entry: Option<String>,
     cpu_cores: u32,
     mem_mb: u64,
     duration_secs: u64,
@@ -914,6 +922,27 @@ struct MeshDeployRequest {
     /// Optional scoped grant token (from `ce grant`), forwarded to the host.
     #[serde(default)]
     grant: Option<String>,
+}
+
+/// Build the polymorphic `Workload` from a deploy request (Docker via `image`, or Wasm via
+/// `wasm_module`), returning its bincode bytes for the RPC.
+fn workload_bytes(req: &MeshDeployRequest) -> Result<Vec<u8>, Response> {
+    let workload = if let Some(image) = &req.image {
+        ce_runtime::Workload::Docker { image: image.clone(), cmd: req.cmd.clone(), env: vec![] }
+    } else if let Some(hash_hex) = &req.wasm_module {
+        let module_hash: [u8; 32] = hex::decode(hash_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "wasm_module must be 64 hex chars"))?;
+        ce_runtime::Workload::Wasm {
+            module_hash,
+            entry: req.wasm_entry.clone().unwrap_or_else(|| "entry".to_string()),
+            args: vec![],
+        }
+    } else {
+        return Err(err(StatusCode::BAD_REQUEST, "provide either `image` or `wasm_module`"));
+    };
+    Ok(bincode::serialize(&workload).unwrap_or_default())
 }
 
 /// Decode an optional grant token to RPC-ready bincode bytes; validates the token.
@@ -936,9 +965,10 @@ async fn mesh_deploy(State(state): State<ApiState>, Json(req): Json<MeshDeployRe
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
     };
-    if req.image.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "image must not be empty");
-    }
+    let workload = match workload_bytes(&req) {
+        Ok(w) => w,
+        Err(resp) => return resp,
+    };
     let grant = match grant_to_bytes(&req.grant) {
         Ok(g) => g,
         Err(resp) => return resp,
@@ -949,8 +979,7 @@ async fn mesh_deploy(State(state): State<ApiState>, Json(req): Json<MeshDeployRe
 
     let rpc_req = RpcRequest::Deploy {
         from_node: state.host_node_id,
-        image: req.image,
-        cmd: req.cmd,
+        workload,
         cpu_cores: req.cpu_cores,
         mem_mb: req.mem_mb,
         duration_secs: req.duration_secs,
@@ -1432,6 +1461,35 @@ async fn submit_tx(state: &ApiState, kind: TxKind, origin: NodeId) {
     let _ = state.mesh_handle.broadcast_tx(&tx).await;
 }
 
+// ----- Content-addressed blobs (PUT/GET /blobs) -----
+//
+// A minimal content-addressed store (a precursor to the data layer): upload bytes, get back their
+// sha256; fetch by hash. WASM modules referenced by `Workload::Wasm { module_hash }` are resolved
+// from here. The hash is self-verifying, so blobs are immutable and tamper-evident.
+
+async fn put_blob(State(state): State<ApiState>, body: axum::body::Bytes) -> Response {
+    let hash: [u8; 32] = Sha256::digest(&body).into();
+    let hex = hex::encode(hash);
+    let dir = state.data_dir.join("blobs");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("blob dir: {e}"));
+    }
+    if let Err(e) = std::fs::write(dir.join(&hex), &body) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("store blob: {e}"));
+    }
+    (StatusCode::CREATED, Json(serde_json::json!({ "hash": hex }))).into_response()
+}
+
+async fn get_blob(State(state): State<ApiState>, Path(hash): Path<String>) -> Response {
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return err(StatusCode::BAD_REQUEST, "hash must be 64 hex chars");
+    }
+    match std::fs::read(state.data_dir.join("blobs").join(&hash)) {
+        Ok(bytes) => (StatusCode::OK, bytes).into_response(),
+        Err(_) => err(StatusCode::NOT_FOUND, "blob not found"),
+    }
+}
+
 // ----- Router -----
 
 #[allow(clippy::too_many_arguments)]
@@ -1507,6 +1565,8 @@ pub async fn start(
         .route("/channels/receipt", post(channel_receipt))
         .route("/channels/:id/close", post(channel_close))
         .route("/channels/:id/expire", post(channel_expire))
+        .route("/blobs", post(put_blob))
+        .route("/blobs/:hash", get(get_blob))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))

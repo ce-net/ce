@@ -113,8 +113,9 @@ pub enum RpcRequest {
     /// `bid` is the funding (base units) the deployer commits; billing draws it down.
     Deploy {
         from_node: NodeId,
-        image: String,
-        cmd: Vec<String>,
+        /// The workload to run, as bincode of `ce_runtime::Workload` (Docker or Wasm). Opaque to
+        /// the transport; the receiving node decodes and dispatches it to a matching runtime.
+        workload: Vec<u8>,
         cpu_cores: u32,
         mem_mb: u64,
         duration_secs: u64,

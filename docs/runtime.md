@@ -4,12 +4,14 @@ How CE runs a unit of work, independent of *how* it runs. This is the structural
 WASM (and later, the browser) join Docker as execution backends without disturbing the consensus,
 economy, or placement layers.
 
-**Status: staged.** Stage 1 ✅ — the `ce-runtime` seam crate. Stage 2 ✅ — `ce-container`'s
-`DockerRuntime` implements the trait; `ce-node` holds a `Vec<Arc<dyn Runtime>>` registry and
-dispatches the mesh Deploy/Kill path through it (Docker still works; the seam is proven). Stage 3
-(next) — the `ce-wasm` backend (wasmtime) + content-addressed module store + `Workload` over the
-`JobBid` wire + rerouting the local job-manager launch. The **browser node** is a separate, larger
-project (its own repo) and is explicitly out of scope here.
+**Status: Stages 1–3 done.** Stage 1 ✅ `ce-runtime` seam crate. Stage 2 ✅ `ce-container`'s
+`DockerRuntime` impl + `ce-node` `Vec<Arc<dyn Runtime>>` registry dispatch. Stage 3 ✅ the
+`ce-wasm` backend (wasmtime, fuel-metered + memory-capped), a content-addressed blob store
+(`POST/GET /blobs`), `Workload` carried over the mesh Deploy wire (so Docker *or* Wasm deploys),
+the `wasm` capability self-tag (every node), and `ce-rs` `put_blob`/`mesh_deploy_wasm`. A
+Docker-less machine can now host WASM work. **Refinements:** WASI/args + epoch interruption in
+`ce-wasm`, a `ce` CLI for wasm deploy + blob upload, and rerouting the *local* job-manager launch
+through the registry. The **browser node** remains a separate project (its own repo).
 
 ## Three separable concerns (do not conflate)
 

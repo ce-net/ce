@@ -223,6 +223,14 @@ impl Node {
                 Err(e) => warn!("docker runtime init: {e}"),
             }
         }
+        // WASM runs everywhere (no external daemon), so every node offers it. Modules are
+        // resolved from the content-addressed blob store under the data dir.
+        let blobs_dir = config.data_dir.join("blobs");
+        let _ = std::fs::create_dir_all(&blobs_dir);
+        match ce_wasm::WasmRuntime::new(blobs_dir) {
+            Ok(rt) => runtimes.push(Arc::new(rt)),
+            Err(e) => warn!("wasm runtime init: {e}"),
+        }
 
         // Capability self-tags, computed once and shared by the capacity broadcast (what we
         // advertise) and both auth enforcement points (what grant selectors match against),
@@ -1022,10 +1030,16 @@ fn handle_incoming_rpc(
                 let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
             });
         }
-        RpcRequest::Deploy { image, cmd, cpu_cores, mem_mb, duration_secs, bid, .. } => {
-            // Dispatch through the runtime registry (ce-runtime seam). Today the only backend
-            // is Docker; ce-wasm will join here and serve Wasm workloads transparently.
-            let workload = ce_runtime::Workload::Docker { image, cmd, env: vec![] };
+        RpcRequest::Deploy { workload, cpu_cores, mem_mb, duration_secs, bid, .. } => {
+            // Decode the polymorphic workload (Docker | Wasm) and dispatch through the runtime
+            // registry — the first runtime whose can_run matches its required tag.
+            let workload: ce_runtime::Workload = match bincode::deserialize(&workload) {
+                Ok(w) => w,
+                Err(_) => {
+                    reject("malformed workload".into());
+                    return;
+                }
+            };
             let limits = ce_runtime::Limits { cpu_cores, mem_mb };
             let Some(runtime) = runtimes.iter().find(|r| r.can_run(&workload)).cloned() else {
                 reject(format!("no runtime for a '{}' workload on this node", workload.required_tag()));
@@ -1483,6 +1497,8 @@ fn capability_tags(docker_available: bool, cpu_cores: u32, mem_mb: u32) -> Vec<S
     if docker_available {
         tags.push("docker".into());
     }
+    // Every node can run WebAssembly (wasmtime is built in — no external daemon).
+    tags.push("wasm".into());
     if has_gpu() {
         tags.push("gpu".into());
     }
