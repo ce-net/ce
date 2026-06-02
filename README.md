@@ -83,8 +83,8 @@ cargo build --release
 ce id
 # ce node id : 7a3f9b... (copy this)
 
-# On your local machine
-ce devices add desktop 7a3f9b... --addr 192.168.1.10:8844
+# On your local machine (trust by node ID; no address — traffic routes over the mesh)
+ce devices add desktop 7a3f9b...
 ```
 
 ### Manual bootstrap (advanced)
@@ -267,7 +267,7 @@ ce balance
 ce id
 
 # Node-to-node services (sync files and run sandboxed commands on trusted peers)
-ce devices add <name>               # register a trusted peer (prompts for node ID + addr)
+ce devices add <name> <node-id>     # trust a peer by node ID (no address; mesh-routed)
 ce devices ls                       # list registered peers
 ce devices revoke <name>            # remove trust
 ce sync <src> <device:remote-path>  # push files to a peer

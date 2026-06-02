@@ -46,16 +46,16 @@ ce id
 # output: 7a3f9b2c...  (64 hex chars)
 ```
 
-**On your primary machine, register it:**
+**On your primary machine, register it (trust is by node ID — no address):**
 ```bash
-ce devices add desktop 7a3f9b2c... --addr 192.168.1.10:8844
-ce devices add laptop  4d8e1f0a... --addr 192.168.1.20:8844
+ce devices add desktop 7a3f9b2c...
+ce devices add laptop  4d8e1f0a...
 ```
 
-If the device is behind NAT (not on the same LAN), use the relay address instead:
-```bash
-ce devices add laptop 4d8e1f0a... --addr <relay-ip>:8844
-```
+No IP:port is needed, on the LAN or behind NAT. Device-to-device traffic
+(`exec`/`sync`/`deploy`) routes through the mesh over libp2p, and the relay handles
+NAT traversal. Each command talks to your *local* node (`--api-port`, default 8844),
+which signs and forwards the request to the target.
 
 **Verify the device list:**
 ```bash

@@ -175,7 +175,7 @@ addr    = "192.168.1.10:8844"
 
 CLI commands implemented:
 ```
-ce devices add <name>          # prompts for node ID and API address
+ce devices add <name> <node-id>   # trust a peer by node ID (no address needed)
 ce devices ls                  # list registered devices
 ce devices revoke <name>       # remove trust
 ```

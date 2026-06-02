@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use ce_chain::{Chain, CREDIT};
 use ce_identity::Identity;
 use ce_node::{
-    auth::make_auth_headers,
     devices::Devices,
     grants::{Constraints, Permission, Selector, SignedGrant},
     Node, NodeConfig,
@@ -96,7 +95,7 @@ enum Commands {
     Id,
     /// Manage trusted devices (personal mesh OS).
     ///
-    /// Quick add: ce devices add desktop <node-id> --addr 192.168.1.10:8844
+    /// Quick add: ce devices add desktop <node-id>
     Devices {
         #[command(subcommand)]
         command: DevicesCommands,
@@ -162,10 +161,12 @@ enum Commands {
     Sync {
         src: String,
         dst: String,
-        /// Scoped capability grant token (from `ce grant`), if you are not a full admin
-        /// on the target. Sent as the X-CE-Grant header.
+        /// Scoped capability grant token (from `ce grant`), if you are not a full admin on the
+        /// target. (Not yet forwarded through the mesh proxy — see roadmap.)
         #[arg(long)]
         grant: Option<String>,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
     },
     /// Execute a command on a remote CE node inside a sandboxed container.
     ///
@@ -179,10 +180,12 @@ enum Commands {
         /// Working directory (relative to ~/). Defaults to ~/workspace.
         #[arg(long)]
         cwd: Option<String>,
-        /// Scoped capability grant token (from `ce grant`), if you are not a full admin
-        /// on the target. Sent as the X-CE-Grant header.
+        /// Scoped capability grant token (from `ce grant`), if you are not a full admin on the
+        /// target. (Not yet forwarded through the mesh proxy — see roadmap.)
         #[arg(long)]
         grant: Option<String>,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -288,17 +291,17 @@ enum Commands {
 enum DevicesCommands {
     /// Add a trusted device.
     ///
-    /// Quick usage: ce devices add desktop <node-id> --addr 192.168.1.10:8844
+    /// Quick usage: ce devices add desktop <node-id>
     /// Get the node ID on the target machine with: ce id
+    ///
+    /// Trust is by node ID only. Device-to-device traffic (exec, sync, deploy) routes through the
+    /// CE mesh over libp2p, so no IP:port is needed — NAT-traversal is handled by the relay.
     Add {
         /// Friendly name for the device (e.g. "desktop", "laptop").
         name: String,
         /// Node ID (64 hex chars). Run `ce id` on the target machine to get it.
         /// If omitted, you will be prompted interactively.
         node_id: Option<String>,
-        /// API address (host:port). If omitted, you will be prompted interactively.
-        #[arg(long)]
-        addr: Option<String>,
         /// Owner tag to attach (repeatable): --tag build --tag home
         #[arg(long = "tag")]
         tags: Vec<String>,
@@ -748,6 +751,13 @@ async fn main() -> Result<()> {
                 let auto = fetch_bootstrap_peers().await;
                 if !auto.is_empty() {
                     println!("Connecting to ce-net.com mesh ({} relay peers)...", auto.len());
+                    // The ce-net.com bootstrap peers are public relays. Unless relays were given
+                    // explicitly, register them as relays too: a node behind NAT then reserves a
+                    // circuit and becomes reachable from `ce start` alone — no `--relay` needed.
+                    // (A publicly-reachable node just logs a harmless self-dial warning.)
+                    if relay_peers.is_empty() {
+                        relay_peers.extend(auto.iter().cloned());
+                    }
                     bootstrap_peers.extend(auto);
                 }
             }
@@ -831,7 +841,7 @@ async fn main() -> Result<()> {
         Commands::Devices { command } => {
             let path = devices_path(&data_dir);
             match command {
-                DevicesCommands::Add { name, node_id, addr, tags } => {
+                DevicesCommands::Add { name, node_id, tags } => {
                     use std::io::{BufRead, Write};
 
                     let node_id_hex = match node_id {
@@ -851,19 +861,10 @@ async fn main() -> Result<()> {
                         .try_into()
                         .map_err(|_| anyhow!("node ID must be exactly 32 bytes"))?;
 
-                    let addr_str = match addr {
-                        Some(a) => a,
-                        None => {
-                            print!("API address (host:port, e.g. 192.168.1.10:8844): ");
-                            std::io::stdout().flush()?;
-                            let mut s = String::new();
-                            std::io::stdin().lock().read_line(&mut s)?;
-                            s.trim().to_string()
-                        }
-                    };
-
                     let mut devices = Devices::load_or_empty(&path);
-                    devices.add(&name, node_id, &addr_str);
+                    // Address is unused for mesh-routed traffic (trust is by node ID); kept empty
+                    // in the registry for the legacy direct-HTTP path only.
+                    devices.add(&name, node_id, "");
                     if !tags.is_empty() {
                         devices.add_tags(&name, &tags)?;
                     }
@@ -1136,18 +1137,27 @@ async fn main() -> Result<()> {
             println!("{}", sg.encode());
         }
 
-        Commands::Sync { src, dst, grant } => {
+        Commands::Sync { src, dst, grant, api_port } => {
             // Parse destination: "device:path"
             let (device_name, remote_path) = dst
                 .split_once(':')
                 .ok_or_else(|| anyhow!("dst must be in <device>:<path> format, e.g. desktop:~/code/ce"))?;
 
-            let identity_dir = data_dir.join("identity");
-            let identity = Identity::load_or_generate(&identity_dir)?;
+            if grant.is_some() {
+                eprintln!("note: --grant is not yet forwarded through the mesh proxy; ignoring it");
+            }
 
             let dev_path = devices_path(&data_dir);
             let devices = Devices::load_or_empty(&dev_path);
-            let (_, addr) = devices.get(device_name)?;
+            let (node_id, _addr) = devices.get(device_name)?;
+            let node_id_hex = hex::encode(node_id);
+
+            // Remote root is relative to the target's home (the mesh-sync endpoint joins it under ~/).
+            let remote_root = remote_path
+                .trim_start_matches("~/")
+                .trim_start_matches('~')
+                .trim_start_matches('/')
+                .trim_end_matches('/');
 
             let src_path = std::path::Path::new(&src);
             let client = reqwest::Client::new();
@@ -1166,31 +1176,26 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Build the remote path: remote_path/relative
-                let remote_path_expanded = if remote_path.starts_with('~') {
-                    remote_path.trim_start_matches("~/").trim_start_matches('~').to_string()
+                let rel_str = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let remote_file = if remote_root.is_empty() {
+                    rel_str
                 } else {
-                    remote_path.to_string()
+                    format!("{remote_root}/{rel_str}")
                 };
-                let remote_file = format!("{}/{}", remote_path_expanded.trim_end_matches('/'), rel.display());
-                let api_path = format!("/sync/{remote_file}");
-                let url = format!("http://{addr}{api_path}");
+                // Route through the LOCAL node's mesh proxy (libp2p, NAT-traversing). The local node
+                // signs the write with its own identity, so no per-request auth header is needed.
+                let url = format!("http://127.0.0.1:{api_port}/mesh-sync/{node_id_hex}/{remote_file}");
 
                 let file_bytes = std::fs::read(entry.path())?;
-                let auth = make_auth_headers(&identity, "PUT", &api_path, &file_bytes);
-                let mut req = client.put(&url).body(file_bytes);
-                for (k, v) in &auth {
-                    req = req.header(k, v);
-                }
-                if let Some(token) = &grant {
-                    req = req.header("X-CE-Grant", token);
-                }
-
-                let resp = req.send().await?;
+                let resp = client.put(&url).body(file_bytes).send().await?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
-                    eprintln!("WARN: {} → {status}: {body}", rel.display());
+                    eprintln!("WARN: {} -> {status}: {body}", rel.display());
                 } else {
                     synced += 1;
                 }
@@ -1199,35 +1204,28 @@ async fn main() -> Result<()> {
             println!("Synced {synced} files to {device_name}:{remote_path} ({skipped} ignored).");
         }
 
-        Commands::Exec { machine, image, cwd, grant, command } => {
+        Commands::Exec { machine, image, cwd, grant, command, api_port } => {
             if command.is_empty() {
                 return Err(anyhow!("specify a command to run, e.g. ce exec desktop --image rust:latest cargo build"));
             }
-
-            let identity_dir = data_dir.join("identity");
-            let identity = Identity::load_or_generate(&identity_dir)?;
+            if grant.is_some() {
+                eprintln!("note: --grant is not yet forwarded through the mesh proxy; ignoring it");
+            }
 
             let dev_path = devices_path(&data_dir);
             let devices = Devices::load_or_empty(&dev_path);
-            let (_, addr) = devices.get(&machine)?;
+            let (node_id, _addr) = devices.get(&machine)?;
 
-            let url = format!("http://{addr}/exec");
-            let mut body = serde_json::json!({ "image": image, "cmd": command });
-            if let Some(c) = cwd {
-                body["cwd"] = serde_json::Value::String(c);
-            }
-            let body_bytes = serde_json::to_vec(&body)?;
-            let auth = make_auth_headers(&identity, "POST", "/exec", &body_bytes);
+            // Route through the LOCAL node's mesh proxy (libp2p) to the target host.
+            let url = format!("http://127.0.0.1:{api_port}/mesh-exec");
+            let body = serde_json::json!({
+                "node_id": hex::encode(node_id),
+                "image": image,
+                "cmd": command,
+                "cwd": cwd,
+            });
             let client = reqwest::Client::new();
-            let mut req = client.post(&url).body(body_bytes).header("content-type", "application/json");
-            for (k, v) in &auth {
-                req = req.header(k, v);
-            }
-            if let Some(token) = &grant {
-                req = req.header("X-CE-Grant", token);
-            }
-
-            let resp = req.send().await?;
+            let resp = client.post(&url).json(&body).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
