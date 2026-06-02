@@ -537,6 +537,14 @@ impl Chain {
         self.node_stats.get(node).cloned().unwrap_or_default()
     }
 
+    /// List open payment channels: (channel_id, payer, host, capacity, expiry_height).
+    pub fn list_channels(&self) -> Vec<([u8; 32], NodeId, NodeId, u128, u64)> {
+        self.open_channels
+            .iter()
+            .map(|(id, (payer, host, capacity, expiry))| (*id, *payer, *host, *capacity, *expiry))
+            .collect()
+    }
+
     pub fn tip(&self) -> &Block {
         self.blocks.last().expect("chain always has genesis")
     }

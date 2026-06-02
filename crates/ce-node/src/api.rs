@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use bollard::{container::RemoveContainerOptions, Docker};
-use ce_chain::{payer_settle_bytes, Block, Tx, TxKind};
+use ce_chain::{channel_receipt_bytes, payer_settle_bytes, Block, Tx, TxKind};
 use ce_container::{exec_in_container, ExecSpec};
 use ce_identity::{verify, Identity, NodeId};
 use ce_mesh::{MeshHandle, RpcRequest, RpcResponse, peer_id_from_node_id};
@@ -1276,6 +1276,162 @@ async fn get_history(State(state): State<ApiState>, Path(id): Path<String>) -> R
     (StatusCode::OK, Json(resp)).into_response()
 }
 
+// ----- Payment channels -----
+//
+// Off-chain micropayment channels (docs/payment-channels.md). The payer opens a channel
+// (locking capacity), streams signed receipts to the host off-chain, and the host redeems the
+// highest receipt on-chain to settle. Only open/close touch the chain. Amounts are base-unit strings.
+
+/// Default channel lifetime if the caller doesn't set one: ~24h at 10s/block.
+const DEFAULT_CHANNEL_BLOCKS: u64 = 8_640;
+
+#[derive(Debug, Deserialize)]
+struct ChannelOpenRequest {
+    /// Host NodeId (64 hex) this channel pays.
+    host: String,
+    #[serde(with = "amount_str")]
+    capacity: u128,
+    /// Block height after which the payer may reclaim via expire. 0 = default lifetime.
+    #[serde(default)]
+    expiry_height: u64,
+}
+
+async fn channel_open(State(state): State<ApiState>, Json(req): Json<ChannelOpenRequest>) -> Response {
+    let host: NodeId = match hex::decode(&req.host).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "`host` must be 64 hex chars"),
+    };
+    let payer = state.identity.node_id();
+    if host == payer {
+        return err(StatusCode::BAD_REQUEST, "cannot open a channel to self");
+    }
+    if req.capacity == 0 {
+        return err(StatusCode::BAD_REQUEST, "capacity must be > 0");
+    }
+    // Free balance must cover the capacity (it will be locked).
+    let free = state.chain.balance(payer).await - state.chain.locked_balance(payer).await as i128;
+    if free < req.capacity as i128 {
+        return err(StatusCode::PAYMENT_REQUIRED, format!("free balance {free} insufficient for capacity {}", req.capacity));
+    }
+    let snap = state.chain.sync_snap().await;
+    let expiry_height = if req.expiry_height == 0 { snap.height + DEFAULT_CHANNEL_BLOCKS } else { req.expiry_height };
+
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let channel_id: [u8; 32] =
+        Sha256::digest(bincode::serialize(&(ts, payer, host)).unwrap_or_default()).into();
+
+    let kind = TxKind::ChannelOpen { channel_id, payer, host, capacity: req.capacity, expiry_height };
+    submit_tx(&state, kind, payer).await;
+    (StatusCode::CREATED, Json(serde_json::json!({ "channel_id": hex::encode(channel_id) }))).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ReceiptRequest {
+    channel_id: String,
+    host: String,
+    #[serde(with = "amount_str")]
+    cumulative: u128,
+}
+
+/// Sign an off-chain receipt as the payer (this node). The caller hands the receipt to the host,
+/// who later redeems the highest one via close. No tx — purely a signature.
+async fn channel_receipt(State(state): State<ApiState>, Json(req): Json<ReceiptRequest>) -> Response {
+    let channel_id: [u8; 32] = match hex::decode(&req.channel_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "channel_id must be 64 hex chars"),
+    };
+    let host: NodeId = match hex::decode(&req.host).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "host must be 64 hex chars"),
+    };
+    let sig = state.identity.sign(&channel_receipt_bytes(&channel_id, &host, req.cumulative));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "channel_id": req.channel_id,
+            "cumulative": req.cumulative.to_string(),
+            "payer_sig": hex::encode(sig),
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelCloseRequest {
+    #[serde(with = "amount_str")]
+    cumulative: u128,
+    /// Payer's receipt signature (128 hex) over channel_receipt_bytes(channel_id, host, cumulative).
+    payer_sig: String,
+}
+
+/// Close a channel by redeeming the payer's highest receipt. Called on the HOST node.
+async fn channel_close(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChannelCloseRequest>,
+) -> Response {
+    let channel_id: [u8; 32] = match hex::decode(&id).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "channel id must be 64 hex chars"),
+    };
+    let payer_sig: [u8; 64] = match hex::decode(&req.payer_sig).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "payer_sig must be 128 hex chars"),
+    };
+    let host = state.identity.node_id();
+    let kind = TxKind::ChannelClose { channel_id, cumulative: req.cumulative, payer_sig };
+    submit_tx(&state, kind, host).await;
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "submitted" }))).into_response()
+}
+
+/// Reclaim a channel after its expiry. Called on the PAYER node.
+async fn channel_expire(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    let channel_id: [u8; 32] = match hex::decode(&id).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return err(StatusCode::BAD_REQUEST, "channel id must be 64 hex chars"),
+    };
+    let payer = state.identity.node_id();
+    let kind = TxKind::ChannelExpire { channel_id, payer };
+    submit_tx(&state, kind, payer).await;
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "submitted" }))).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct ChannelView {
+    channel_id: String,
+    payer: String,
+    host: String,
+    #[serde(with = "amount_str")]
+    capacity: u128,
+    expiry_height: u64,
+}
+
+async fn list_channels(State(state): State<ApiState>) -> Response {
+    let chans: Vec<ChannelView> = state
+        .chain
+        .list_channels()
+        .await
+        .into_iter()
+        .map(|(id, payer, host, capacity, expiry_height)| ChannelView {
+            channel_id: hex::encode(id),
+            payer: hex::encode(payer),
+            host: hex::encode(host),
+            capacity,
+            expiry_height,
+        })
+        .collect();
+    (StatusCode::OK, Json(chans)).into_response()
+}
+
+/// Sign `kind` with the node identity, add to the pool, and broadcast.
+async fn submit_tx(state: &ApiState, kind: TxKind, origin: NodeId) {
+    let data = bincode::serialize(&kind).expect("serialize tx");
+    let sig = state.identity.sign(&data);
+    let tx = Tx::new(kind, origin, sig);
+    state.pool.add(tx.clone()).await;
+    let _ = state.mesh_handle.broadcast_tx(&tx).await;
+}
+
 // ----- Router -----
 
 #[allow(clippy::too_many_arguments)]
@@ -1343,6 +1499,11 @@ pub async fn start(
         .route("/atlas", get(get_atlas))
         .route("/beacon", get(get_beacon))
         .route("/history/:node_id", get(get_history))
+        .route("/channels", get(list_channels))
+        .route("/channels/open", post(channel_open))
+        .route("/channels/receipt", post(channel_receipt))
+        .route("/channels/:id/close", post(channel_close))
+        .route("/channels/:id/expire", post(channel_expire))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))

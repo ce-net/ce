@@ -102,6 +102,11 @@ enum Commands {
         #[command(subcommand)]
         command: FleetCommands,
     },
+    /// Manage off-chain payment channels (stream micropayments, settle on close).
+    Channel {
+        #[command(subcommand)]
+        command: ChannelCommands,
+    },
     /// Issue a scoped capability grant token for another principal.
     ///
     /// You (a trusted admin on the target workspaces) delegate a subset of your authority:
@@ -317,6 +322,59 @@ enum FleetCommands {
         /// Tags to remove.
         #[arg(required = true)]
         tags: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChannelCommands {
+    /// Open a channel paying a host, locking `capacity` credits.
+    ///
+    /// Example: ce channel open <host-node-id> --capacity 1000
+    Open {
+        /// Host NodeId (64 hex) this channel pays.
+        host: String,
+        /// Credits to lock as the channel's capacity (decimal allowed).
+        #[arg(long)]
+        capacity: String,
+        /// Block height after which the payer may reclaim. 0 = node default (~24h).
+        #[arg(long, default_value = "0")]
+        expiry_height: u64,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// List open channels.
+    Ls {
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// Sign an off-chain receipt for `cumulative` total paid; give the output to the host.
+    Receipt {
+        channel_id: String,
+        /// Host NodeId (64 hex) the channel pays.
+        #[arg(long)]
+        host: String,
+        /// Cumulative total paid so far over the channel (decimal credits).
+        #[arg(long)]
+        cumulative: String,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// Close a channel by redeeming a receipt (run on the host).
+    Close {
+        channel_id: String,
+        #[arg(long)]
+        cumulative: String,
+        /// The payer's receipt signature (128 hex).
+        #[arg(long)]
+        sig: String,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// Reclaim a channel after its expiry (run as the payer).
+    Expire {
+        channel_id: String,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
     },
 }
 
@@ -856,6 +914,75 @@ async fn main() -> Result<()> {
                         let cap_str = if caps.is_empty() { "-".into() } else { caps.join(", ") };
                         println!("{name:<16}  {:<16}  {owners:<24}  {cap_str}", &id_hex[..16]);
                     }
+                }
+            }
+        }
+
+        Commands::Channel { command } => {
+            let client = reqwest::Client::new();
+            match command {
+                ChannelCommands::Open { host, capacity, expiry_height, api_port } => {
+                    let cap = parse_credits(&capacity)?.to_string();
+                    let body = serde_json::json!({ "host": host, "capacity": cap, "expiry_height": expiry_height });
+                    let resp = client.post(format!("http://127.0.0.1:{api_port}/channels/open")).json(&body).send().await?;
+                    if !resp.status().is_success() {
+                        let s = resp.status();
+                        return Err(anyhow!("open failed ({s}): {}", resp.text().await.unwrap_or_default()));
+                    }
+                    let v: serde_json::Value = resp.json().await?;
+                    println!("channel_id: {}", v["channel_id"].as_str().unwrap_or("?"));
+                }
+                ChannelCommands::Ls { api_port } => {
+                    let resp = client.get(format!("http://127.0.0.1:{api_port}/channels")).send().await?;
+                    let chans: serde_json::Value = resp.json().await?;
+                    let chans = chans.as_array().map(|v| v.as_slice()).unwrap_or(&[]);
+                    if chans.is_empty() {
+                        println!("No open channels.");
+                    } else {
+                        println!("{:<66}  {:<16}  {:<16}  {:>12}  expiry", "CHANNEL", "PAYER", "HOST", "CAPACITY");
+                        for c in chans {
+                            let cap = c["capacity"].as_str().and_then(|s| s.parse::<u128>().ok()).map(|b| format_credits(b as i128)).unwrap_or_else(|| "?".into());
+                            println!(
+                                "{:<66}  {:<16}  {:<16}  {cap:>12}  {}",
+                                c["channel_id"].as_str().unwrap_or("?"),
+                                &c["payer"].as_str().unwrap_or("?")[..16.min(c["payer"].as_str().unwrap_or("?").len())],
+                                &c["host"].as_str().unwrap_or("?")[..16.min(c["host"].as_str().unwrap_or("?").len())],
+                                c["expiry_height"].as_u64().unwrap_or(0),
+                            );
+                        }
+                    }
+                }
+                ChannelCommands::Receipt { channel_id, host, cumulative, api_port } => {
+                    let cum = parse_credits(&cumulative)?.to_string();
+                    let body = serde_json::json!({ "channel_id": channel_id, "host": host, "cumulative": cum });
+                    let resp = client.post(format!("http://127.0.0.1:{api_port}/channels/receipt")).json(&body).send().await?;
+                    if !resp.status().is_success() {
+                        let s = resp.status();
+                        return Err(anyhow!("receipt failed ({s}): {}", resp.text().await.unwrap_or_default()));
+                    }
+                    let v: serde_json::Value = resp.json().await?;
+                    // Print what the host needs to redeem this receipt.
+                    println!("cumulative: {cumulative}");
+                    println!("sig:        {}", v["payer_sig"].as_str().unwrap_or("?"));
+                    println!("\nGive these to the host: ce channel close {channel_id} --cumulative {cumulative} --sig <sig>");
+                }
+                ChannelCommands::Close { channel_id, cumulative, sig, api_port } => {
+                    let cum = parse_credits(&cumulative)?.to_string();
+                    let body = serde_json::json!({ "cumulative": cum, "payer_sig": sig });
+                    let resp = client.post(format!("http://127.0.0.1:{api_port}/channels/{channel_id}/close")).json(&body).send().await?;
+                    if !resp.status().is_success() {
+                        let s = resp.status();
+                        return Err(anyhow!("close failed ({s}): {}", resp.text().await.unwrap_or_default()));
+                    }
+                    println!("Channel {channel_id} close submitted.");
+                }
+                ChannelCommands::Expire { channel_id, api_port } => {
+                    let resp = client.post(format!("http://127.0.0.1:{api_port}/channels/{channel_id}/expire")).send().await?;
+                    if !resp.status().is_success() {
+                        let s = resp.status();
+                        return Err(anyhow!("expire failed ({s}): {}", resp.text().await.unwrap_or_default()));
+                    }
+                    println!("Channel {channel_id} expire submitted.");
                 }
             }
         }

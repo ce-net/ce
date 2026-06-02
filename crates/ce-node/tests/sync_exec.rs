@@ -654,6 +654,54 @@ async fn mesh_kill_bad_node_id_returns_400() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Payment channels
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channels_empty_on_fresh_node() {
+    let (_node, _dir, api) = start_node("chan-empty").await;
+    let v: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{api}/channels")).await.unwrap().json().await.unwrap();
+    assert_eq!(v.as_array().map(|a| a.len()), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_open_zero_balance_returns_402() {
+    let (_node, _dir, api) = start_node("chan-402").await;
+    let host = make_identity("chan-402-host");
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{api}/channels/open"))
+        .json(&serde_json::json!({ "host": hex::encode(host.node_id()), "capacity": "1000" }))
+        .send()
+        .await
+        .unwrap();
+    // A non-mining test node has no free balance to lock.
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_receipt_signs() {
+    let (_node, _dir, api) = start_node("chan-receipt").await;
+    let host = make_identity("chan-receipt-host");
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{api}/channels/receipt"))
+        .json(&serde_json::json!({
+            "channel_id": hex::encode([1u8; 32]),
+            "host": hex::encode(host.node_id()),
+            "cumulative": "100"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sig = resp["payer_sig"].as_str().unwrap_or("");
+    assert_eq!(sig.len(), 128, "receipt signature is 128 hex chars");
+    assert_eq!(resp["cumulative"].as_str(), Some("100"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Reputation read (GET /history/:node_id)
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -39,8 +39,13 @@ pub struct SyncSnap {
 pub enum ChainCmd {
     // --- reads ---
     Balance { node: NodeId, reply: oneshot::Sender<i128> },
+    /// Credits locked in open bids + channel capacity for a node.
+    LockedBalance { node: NodeId, reply: oneshot::Sender<u128> },
     /// Per-node interaction history (reputation substrate).
     NodeHistory { node: NodeId, reply: oneshot::Sender<NodeStats> },
+    /// List open payment channels: (channel_id, payer, host, capacity, expiry_height).
+    #[allow(clippy::type_complexity)]
+    ListChannels { reply: oneshot::Sender<Vec<([u8; 32], NodeId, NodeId, u128, u64)>> },
     Height { reply: oneshot::Sender<u64> },
     Difficulty { reply: oneshot::Sender<u8> },
     /// Combined height + difficulty + balance — avoids two round-trips in status handlers.
@@ -80,9 +85,22 @@ impl ChainHandle {
         rx.await.unwrap_or(0)
     }
 
+    pub async fn locked_balance(&self, node: NodeId) -> u128 {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.0.send(ChainCmd::LockedBalance { node, reply: tx }).await;
+        rx.await.unwrap_or(0)
+    }
+
     pub async fn node_history(&self, node: NodeId) -> NodeStats {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::NodeHistory { node, reply: tx }).await;
+        rx.await.unwrap_or_default()
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub async fn list_channels(&self) -> Vec<([u8; 32], NodeId, NodeId, u128, u64)> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.0.send(ChainCmd::ListChannels { reply: tx }).await;
         rx.await.unwrap_or_default()
     }
 
@@ -208,8 +226,14 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
             ChainCmd::Balance { node, reply } => {
                 let _ = reply.send(chain.balance(&node));
             }
+            ChainCmd::LockedBalance { node, reply } => {
+                let _ = reply.send(chain.locked_balance(&node));
+            }
             ChainCmd::NodeHistory { node, reply } => {
                 let _ = reply.send(chain.node_history(&node));
+            }
+            ChainCmd::ListChannels { reply } => {
+                let _ = reply.send(chain.list_channels());
             }
             ChainCmd::Height { reply } => {
                 let _ = reply.send(chain.height());

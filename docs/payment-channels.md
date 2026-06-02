@@ -1,10 +1,14 @@
 # Payment channels — design
 
-**Status: chain layer implemented** (`ChannelOpen`/`ChannelClose`/`ChannelExpire` txs, the
-`channel_receipt_bytes` receipt primitive, the `open_channels` lock, validation, and tests).
-**Remaining: API / SDK / CLI wiring** so apps can open channels, stream receipts, and close.
-The highest-leverage item on `docs/frontier.md`: the scale unlock that lets the per-signal
-economy run at planet scale.
+**Status: chain layer + API/SDK/CLI implemented.** Chain: `ChannelOpen`/`ChannelClose`/
+`ChannelExpire` txs, the `channel_receipt_bytes` receipt primitive, the `open_channels` lock,
+validation, tests. API: `POST /channels/open`, `POST /channels/receipt` (payer signs an off-chain
+receipt), `POST /channels/:id/close` (host redeems), `POST /channels/:id/expire`, `GET /channels`.
+`ce-rs`: `channel_open` / `sign_receipt` / `channel_close` / `channel_expire` / `channels`.
+CLI: `ce channel open|ls|receipt|close|expire`.
+**Remaining:** wire `swarm` to bill long jobs via a channel (stream receipts) instead of per-30s
+heartbeats; the dispute-window refinement for bidirectional channels. The highest-leverage item on
+`docs/frontier.md`: the scale unlock that lets the per-signal economy run at planet scale.
 
 **v0 simplification:** only the **host** closes (with the payer's highest receipt — it maximizes
 its own payout, so the payer can't be underpaid), and the **payer** reclaims via `ChannelExpire`

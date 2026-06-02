@@ -283,6 +283,23 @@ use case needs.)
 
 ---
 
+## Payment channels
+
+Off-chain micropayment channels (see `docs/payment-channels.md`). Only open/close touch the
+chain; millions of micropayments flow as off-chain receipts. Amounts are base-unit strings.
+
+- **`POST /channels/open`** — body `{ host, capacity, expiry_height? }`. Locks `capacity` of the
+  caller's (payer's) free balance. Returns `{ channel_id }`. `402` if free balance < capacity.
+- **`POST /channels/receipt`** — body `{ channel_id, host, cumulative }`. The payer signs an
+  off-chain receipt; returns `{ channel_id, cumulative, payer_sig }`. No tx — hand the receipt to
+  the host out of band.
+- **`POST /channels/:id/close`** — body `{ cumulative, payer_sig }`. Called on the **host**;
+  submits a `ChannelClose` redeeming the receipt (`cumulative` → host, remainder unlocked to payer).
+- **`POST /channels/:id/expire`** — called on the **payer**; reclaims the channel after `expiry_height`.
+- **`GET /channels`** — list open channels: `[{ channel_id, payer, host, capacity, expiry_height }]`.
+
+---
+
 ## GET /signals
 
 Returns the last 100 validated CEP-1 signals seen by this node (newest at the end).
