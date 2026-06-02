@@ -9,7 +9,7 @@ fn tmp_identity(tag: &str) -> Identity {
     Identity::load_or_generate(&dir).unwrap()
 }
 
-fn signed_transfer(from: &Identity, to: ce_identity::NodeId, amount: u64) -> Tx {
+fn signed_transfer(from: &Identity, to: ce_identity::NodeId, amount: u128) -> Tx {
     let kind = TxKind::Transfer { from: from.node_id(), to, amount };
     let data = bincode::serialize(&kind).unwrap();
     let sig = from.sign(&data);

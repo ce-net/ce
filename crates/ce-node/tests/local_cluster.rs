@@ -180,7 +180,8 @@ async fn api_status_endpoint() {
     #[derive(serde::Deserialize)]
     struct Status {
         height: u64,
-        balance: i64,
+        // Amounts are decimal strings of base units in the API (precision-safe).
+        balance: String,
         node_id: String,
     }
 
@@ -193,7 +194,7 @@ async fn api_status_endpoint() {
 
     assert_eq!(status.node_id.len(), 64, "node_id should be 64 hex chars");
     assert!(status.height >= 1, "expected height ≥ 1, got {}", status.height);
-    assert!(status.balance >= 0);
+    assert!(status.balance.parse::<i128>().unwrap() >= 0, "balance parses to a non-negative integer");
 }
 
 /// POST /jobs/bid returns 402 when the node's own balance is zero (no mining yet).

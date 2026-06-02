@@ -106,11 +106,11 @@ async fn run_consensus_test(cluster: &Cluster) -> anyhow::Result<()> {
     for node in &cluster.nodes {
         let url = format!("{}/status", node.api_url());
         #[derive(serde::Deserialize)]
-        struct Status { height: u64, balance: i64 }
+        struct Status { height: u64, balance: String }
         let status: Status = client.get(&url).send().await?.json().await?;
         info!("node {} height={} balance={}", node.ip(), status.height, status.balance);
         assert!(status.height >= 5);
-        assert!(status.balance > 0, "node should have mining balance");
+        assert!(status.balance.parse::<i128>().unwrap_or(0) > 0, "node should have mining balance");
     }
 
     Ok(())
@@ -148,14 +148,14 @@ async fn run_propagation_test(cluster: &Cluster) -> anyhow::Result<()> {
         sleep(Duration::from_secs(3)).await;
         waited += 3;
         #[derive(serde::Deserialize)]
-        struct Status { balance: i64 }
+        struct Status { balance: String }
         let s: Status = client
             .get(format!("{}/status", node0.api_url()))
             .send()
             .await?
             .json()
             .await?;
-        if s.balance > 0 {
+        if s.balance.parse::<i128>().unwrap_or(0) > 0 {
             info!("node 0 has balance {}", s.balance);
             break;
         }
