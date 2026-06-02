@@ -110,6 +110,16 @@ enum Commands {
         #[command(subcommand)]
         command: ChannelCommands,
     },
+    /// Claim and resolve human-readable node names (on-chain, first claim wins).
+    Name {
+        #[command(subcommand)]
+        command: NameCommands,
+    },
+    /// Advertise and discover named services across the mesh (DHT).
+    Discover {
+        #[command(subcommand)]
+        command: DiscoverCommands,
+    },
     /// Issue a scoped capability grant token for another principal.
     ///
     /// You (a trusted admin on the target workspaces) delegate a subset of your authority:
@@ -325,6 +335,38 @@ enum FleetCommands {
         /// Tags to remove.
         #[arg(required = true)]
         tags: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NameCommands {
+    /// Claim a unique name for this node (3-32 chars: a-z, 0-9, hyphen). Takes effect once mined.
+    Claim {
+        name: String,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// Resolve a name to its owner's NodeId.
+    Resolve {
+        name: String,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiscoverCommands {
+    /// Advertise that this node provides a named service (re-run periodically; records expire).
+    Advertise {
+        service: String,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// Find the NodeIds advertising a named service.
+    Find {
+        service: String,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
     },
 }
 
@@ -987,6 +1029,64 @@ async fn main() -> Result<()> {
                         return Err(anyhow!("expire failed ({s}): {}", resp.text().await.unwrap_or_default()));
                     }
                     println!("Channel {channel_id} expire submitted.");
+                }
+            }
+        }
+
+        Commands::Name { command } => {
+            let client = reqwest::Client::new();
+            match command {
+                NameCommands::Claim { name, api_port } => {
+                    let body = serde_json::json!({ "name": name });
+                    let resp = client.post(format!("http://127.0.0.1:{api_port}/names/claim")).json(&body).send().await?;
+                    if !resp.status().is_success() {
+                        let s = resp.status();
+                        return Err(anyhow!("claim failed ({s}): {}", resp.text().await.unwrap_or_default()));
+                    }
+                    println!("Name '{name}' claim submitted — resolves once mined.");
+                }
+                NameCommands::Resolve { name, api_port } => {
+                    let resp = client.get(format!("http://127.0.0.1:{api_port}/names/{name}")).send().await?;
+                    if resp.status().as_u16() == 404 {
+                        println!("'{name}' is not claimed.");
+                    } else if resp.status().is_success() {
+                        let v: serde_json::Value = resp.json().await?;
+                        println!("{}", v["node_id"].as_str().unwrap_or("?"));
+                    } else {
+                        let s = resp.status();
+                        return Err(anyhow!("resolve failed ({s}): {}", resp.text().await.unwrap_or_default()));
+                    }
+                }
+            }
+        }
+
+        Commands::Discover { command } => {
+            let client = reqwest::Client::new();
+            match command {
+                DiscoverCommands::Advertise { service, api_port } => {
+                    let body = serde_json::json!({ "service": service });
+                    let resp = client.post(format!("http://127.0.0.1:{api_port}/discovery/advertise")).json(&body).send().await?;
+                    if !resp.status().is_success() {
+                        let s = resp.status();
+                        return Err(anyhow!("advertise failed ({s}): {}", resp.text().await.unwrap_or_default()));
+                    }
+                    println!("Advertising service '{service}'.");
+                }
+                DiscoverCommands::Find { service, api_port } => {
+                    let resp = client.get(format!("http://127.0.0.1:{api_port}/discovery/find/{service}")).send().await?;
+                    if !resp.status().is_success() {
+                        let s = resp.status();
+                        return Err(anyhow!("find failed ({s}): {}", resp.text().await.unwrap_or_default()));
+                    }
+                    let v: serde_json::Value = resp.json().await?;
+                    let providers = v["providers"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+                    if providers.is_empty() {
+                        println!("No providers found for '{service}'.");
+                    } else {
+                        for p in providers {
+                            println!("{}", p.as_str().unwrap_or("?"));
+                        }
+                    }
                 }
             }
         }

@@ -353,9 +353,12 @@ Start relay with:
 CE_EXTERNAL_IP=178.105.145.170 CE_EXTERNAL_HOST=relay.ce-net.com ce start
 ```
 
-### 5e. Human-readable node names (planned)
+### 5e. Human-readable node names (done — see `docs/naming-discovery.md`)
 
-On-chain `NameClaim { name, node_id, expires }` tx type. Lets you address nodes by name instead of 64-char hex IDs.
+On-chain `TxKind::NameClaim { name, node }`: consensus-enforced uniqueness (first claim wins),
+`is_valid_name` charset, `resolve_name`, `POST /names/claim` + `GET /names/:name`, `ce name` CLI,
+`ce-rs` `claim_name`/`resolve_name`. Paired with a DHT service registry (`ce discover`). v0 names
+are permanent; transfer/expiry/anti-squat fee are refinements.
 
 ```bash
 ce name claim mylaptop      # burns 1000 credits, name yours for 1 year

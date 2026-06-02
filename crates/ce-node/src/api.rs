@@ -502,7 +502,8 @@ fn tx_value(tx: &ce_chain::Tx) -> Option<u128> {
         | TxKind::TrustGrant { .. }
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
-        | TxKind::ChannelExpire { .. } => None,
+        | TxKind::ChannelExpire { .. }
+        | TxKind::NameClaim { .. } => None,
     }
 }
 
@@ -1191,6 +1192,7 @@ fn tx_stream_view(tx: &Tx) -> TxStreamView {
         TxKind::ChannelOpen { capacity, .. } => ("ChannelOpen", *capacity),
         TxKind::ChannelClose { cumulative, .. } => ("ChannelClose", *cumulative),
         TxKind::ChannelExpire { .. } => ("ChannelExpire", 0),
+        TxKind::NameClaim { .. } => ("NameClaim", 0),
     };
     TxStreamView { id: hex::encode(tx.id()), origin: hex::encode(tx.origin), kind, amount }
 }
@@ -1474,6 +1476,66 @@ async fn list_channels(State(state): State<ApiState>) -> Response {
         })
         .collect();
     (StatusCode::OK, Json(chans)).into_response()
+}
+
+// ----- Naming (POST /names/claim, GET /names/:name) -----
+
+#[derive(Debug, Deserialize)]
+struct NameClaimRequest {
+    name: String,
+}
+
+/// Claim a unique human-readable name for this node (`POST /names/claim`). Submits a `NameClaim`
+/// tx; it takes effect once mined. First claim wins (consensus-enforced).
+async fn claim_name(State(state): State<ApiState>, Json(req): Json<NameClaimRequest>) -> Response {
+    if !ce_chain::is_valid_name(&req.name) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "name must be 3-32 chars: lowercase a-z, 0-9, hyphen (not leading/trailing)",
+        );
+    }
+    let node = state.host_node_id;
+    submit_tx(&state, TxKind::NameClaim { name: req.name, node }, node).await;
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "submitted" }))).into_response()
+}
+
+/// Resolve a claimed name to its owning NodeId (`GET /names/:name`).
+async fn resolve_name(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
+    match state.chain.resolve_name(&name).await {
+        Some(node) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "name": name, "node_id": hex::encode(node) })),
+        )
+            .into_response(),
+        None => err(StatusCode::NOT_FOUND, "name not claimed"),
+    }
+}
+
+// ----- Service discovery (POST /discovery/advertise, GET /discovery/find/:service) -----
+
+#[derive(Debug, Deserialize)]
+struct AdvertiseRequest {
+    service: String,
+}
+
+/// Advertise that this node provides a named service, discoverable via the DHT (`POST
+/// /discovery/advertise`). Re-call periodically: provider records expire.
+async fn advertise_service(State(state): State<ApiState>, Json(req): Json<AdvertiseRequest>) -> Response {
+    match state.mesh_handle.advertise_service(&req.service).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "advertised" }))).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("advertise failed: {e}")),
+    }
+}
+
+/// Find the NodeIds of nodes advertising a named service (`GET /discovery/find/:service`).
+async fn find_service(State(state): State<ApiState>, Path(service): Path<String>) -> Response {
+    match state.mesh_handle.find_service(&service).await {
+        Ok(nodes) => {
+            let ids: Vec<String> = nodes.iter().map(hex::encode).collect();
+            (StatusCode::OK, Json(serde_json::json!({ "service": service, "providers": ids }))).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("find failed: {e}")),
+    }
 }
 
 /// Sign `kind` with the node identity, add to the pool, and broadcast.
@@ -1871,6 +1933,10 @@ pub async fn start(
         .route("/mesh/publish", post(publish_topic))
         .route("/mesh/request", post(mesh_request))
         .route("/mesh/reply", post(mesh_reply))
+        .route("/names/claim", post(claim_name))
+        .route("/names/:name", get(resolve_name))
+        .route("/discovery/advertise", post(advertise_service))
+        .route("/discovery/find/:service", get(find_service))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         .route("/sync/*path", put(sync_put).get(sync_get))
         .route("/exec", post(exec_command))

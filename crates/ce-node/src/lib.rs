@@ -1870,7 +1870,8 @@ fn tx_burn_amount(tx: &Tx) -> Option<u128> {
         | TxKind::TrustGrant { .. }
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
-        | TxKind::ChannelExpire { .. } => None,
+        | TxKind::ChannelExpire { .. }
+        | TxKind::NameClaim { .. } => None,
     }
 }
 

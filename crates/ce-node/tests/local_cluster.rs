@@ -883,6 +883,121 @@ fn host_node_id(dir: &PathBuf) -> ce_identity::NodeId {
     Identity::load_or_generate(&dir.join("identity")).unwrap().node_id()
 }
 
+/// Naming: a claimed name resolves to the claiming node once the claim tx is mined.
+#[tokio::test(flavor = "multi_thread")]
+async fn name_claim_resolves_after_mining() {
+    let (p2p, api) = alloc_ports();
+    let dir = tmpdir("name-claim");
+    let _node = Node::start(NodeConfig {
+        listen_port: p2p,
+        bootstrap_peers: vec![],
+        data_dir: dir.clone(),
+        api_port: api,
+        mine: true,
+        mining_interval_secs: 1,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let id = host_node_id(&dir);
+
+    let client = reqwest::Client::new();
+    let r = client
+        .post(format!("http://127.0.0.1:{api}/names/claim"))
+        .json(&serde_json::json!({ "name": "my-node" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202, "claim accepted");
+
+    // A malformed name is rejected up front.
+    let bad = client
+        .post(format!("http://127.0.0.1:{api}/names/claim"))
+        .json(&serde_json::json!({ "name": "Bad Name" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    let mut resolved = None;
+    for _ in 0..20 {
+        sleep(Duration::from_millis(700)).await;
+        let r = reqwest::get(format!("http://127.0.0.1:{api}/names/my-node")).await.unwrap();
+        if r.status() == 200 {
+            let v: serde_json::Value = r.json().await.unwrap();
+            resolved = v["node_id"].as_str().map(|s| s.to_string());
+            break;
+        }
+    }
+    assert_eq!(resolved, Some(hex::encode(id)), "name resolves to the claiming node");
+}
+
+/// Discovery: a node advertising a service is found by NodeId by another node via the DHT.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_advertise_and_find() {
+    let (p2p_a, api_a) = alloc_ports();
+    let dir_a = tmpdir("svc-provider");
+    let _node_a = Node::start(NodeConfig {
+        listen_port: p2p_a,
+        bootstrap_peers: vec![],
+        data_dir: dir_a.clone(),
+        api_port: api_a,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let a_id = host_node_id(&dir_a);
+
+    sleep(Duration::from_millis(600)).await;
+
+    let bs = bootstrap_addr(&dir_a, p2p_a);
+    let (p2p_b, api_b) = alloc_ports();
+    let _node_b = Node::start(NodeConfig {
+        listen_port: p2p_b,
+        bootstrap_peers: vec![bs],
+        data_dir: tmpdir("svc-finder"),
+        api_port: api_b,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    sleep(Duration::from_secs(2)).await; // mesh connect + Kademlia populate
+
+    let client = reqwest::Client::new();
+    let r = client
+        .post(format!("http://127.0.0.1:{api_a}/discovery/advertise"))
+        .json(&serde_json::json!({ "service": "gpu-pool" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let mut found = false;
+    for _ in 0..15 {
+        sleep(Duration::from_secs(1)).await;
+        let v: serde_json::Value =
+            reqwest::get(format!("http://127.0.0.1:{api_b}/discovery/find/gpu-pool"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        if let Some(providers) = v["providers"].as_array() {
+            if providers.iter().any(|p| p.as_str() == Some(&hex::encode(a_id))) {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found, "B should discover A as a provider of gpu-pool, by NodeId");
+}
+
 /// App request/reply (Stage 3): A sends a request to B and gets B's app's reply synchronously.
 /// A responder task on B watches its inbox for the request's reply token and answers via
 /// `/mesh/reply`; A's `/mesh/request` returns that reply.

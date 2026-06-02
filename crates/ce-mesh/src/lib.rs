@@ -42,6 +42,24 @@ pub fn peer_id_from_node_id(node_id: &NodeId) -> Result<PeerId> {
     Ok(pk.to_peer_id())
 }
 
+/// Recover a CE NodeId from a libp2p PeerId. Ed25519 PeerIds embed the public key via an identity
+/// multihash (the key is small enough to inline), so the NodeId is recoverable. Returns `None` if
+/// the PeerId doesn't inline an ed25519 key. The inverse of [`peer_id_from_node_id`].
+pub fn node_id_from_peer_id(peer: &PeerId) -> Option<NodeId> {
+    let mh = peer.as_ref(); // &Multihash — identity-coded for inlined keys
+    if mh.code() != 0 {
+        return None;
+    }
+    let pk = libp2p::identity::PublicKey::try_decode_protobuf(mh.digest()).ok()?;
+    pk.try_into_ed25519().ok().map(|k| k.to_bytes())
+}
+
+/// Derive the DHT key for a named service advertisement. Domain-separated from chunk cids
+/// (`sha256(content)`) so the two never collide in the shared provider-record keyspace.
+pub fn service_key(service: &str) -> [u8; 32] {
+    Sha256::digest(format!("ce-svc/{service}").as_bytes()).into()
+}
+
 // ----- Wire types for chain sync -----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +513,22 @@ impl MeshHandle {
     /// Publish pre-signed `AppPubSubMsg` bytes to an app pub/sub topic (`ce-app/<topic>`).
     pub async fn publish_app(&self, topic: &str, data: Vec<u8>) -> Result<()> {
         self.send(MeshCommand::PublishApp { topic: topic.to_string(), data }).await
+    }
+
+    /// Advertise that this node provides a named service, discoverable via the DHT (reuses the
+    /// provider-record machinery with a service-derived key). Re-advertise periodically: provider
+    /// records expire.
+    pub async fn advertise_service(&self, service: &str) -> Result<()> {
+        self.send(MeshCommand::ProvideChunk { key: service_key(service) }).await
+    }
+
+    /// Find the NodeIds of nodes advertising a named service via the DHT. PeerIds that don't
+    /// inline an ed25519 key are skipped.
+    pub async fn find_service(&self, service: &str) -> Result<Vec<NodeId>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send(MeshCommand::FindProviders { key: service_key(service), reply_tx }).await?;
+        let peers = reply_rx.await.map_err(|_| anyhow!("find_service: actor dropped before response"))?;
+        Ok(peers.iter().filter_map(node_id_from_peer_id).collect())
     }
 
     async fn send(&self, cmd: MeshCommand) -> Result<()> {

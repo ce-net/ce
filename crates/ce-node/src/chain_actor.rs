@@ -46,6 +46,8 @@ pub enum ChainCmd {
     /// List open payment channels: (channel_id, payer, host, capacity, expiry_height).
     #[allow(clippy::type_complexity)]
     ListChannels { reply: oneshot::Sender<Vec<([u8; 32], NodeId, NodeId, u128, u64)>> },
+    /// Resolve a claimed name to its owning NodeId.
+    ResolveName { name: String, reply: oneshot::Sender<Option<NodeId>> },
     Height { reply: oneshot::Sender<u64> },
     Difficulty { reply: oneshot::Sender<u8> },
     /// Combined height + difficulty + balance — avoids two round-trips in status handlers.
@@ -102,6 +104,12 @@ impl ChainHandle {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::ListChannels { reply: tx }).await;
         rx.await.unwrap_or_default()
+    }
+
+    pub async fn resolve_name(&self, name: &str) -> Option<NodeId> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.0.send(ChainCmd::ResolveName { name: name.to_string(), reply: tx }).await;
+        rx.await.ok().flatten()
     }
 
     pub async fn height(&self) -> u64 {
@@ -235,6 +243,9 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
             ChainCmd::ListChannels { reply } => {
                 let _ = reply.send(chain.list_channels());
             }
+            ChainCmd::ResolveName { name, reply } => {
+                let _ = reply.send(chain.resolve_name(&name));
+            }
             ChainCmd::Height { reply } => {
                 let _ = reply.send(chain.height());
             }
@@ -360,6 +371,7 @@ fn tx_burn_amount(tx: &Tx) -> Option<u128> {
         | TxKind::TrustGrant { .. }
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
-        | TxKind::ChannelExpire { .. } => None,
+        | TxKind::ChannelExpire { .. }
+        | TxKind::NameClaim { .. } => None,
     }
 }

@@ -196,6 +196,23 @@ pub enum TxKind {
     /// Reclaim a channel's full locked capacity after `expiry_height`. Signed by the payer.
     /// The payer's escape if the host never closes; the host must close before expiry to claim.
     ChannelExpire { channel_id: [u8; 32], payer: NodeId },
+    /// Claim a unique human-readable name for `node`. First claim wins (consensus-enforced
+    /// uniqueness); `node` must equal the tx origin, so you only name yourself. Permanent in v0
+    /// (transfer/release/expiry are refinements). `name` is validated for length and charset.
+    NameClaim { name: String, node: NodeId },
+}
+
+/// Validate a claimable name: 3–32 chars, lowercase ascii letters/digits/hyphen, not starting or
+/// ending with a hyphen. Keeps names readable, case-insensitive-safe, and DNS-label-shaped.
+pub fn is_valid_name(name: &str) -> bool {
+    let n = name.len();
+    if !(3..=32).contains(&n) {
+        return false;
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return false;
+    }
+    name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Canonical bytes the payer signs to authorize a settlement of `cost` for `job_id` by `host`.
@@ -405,6 +422,10 @@ pub struct Chain {
     /// Per-node interaction history (reputation substrate). O(1) lookup, built incrementally.
     #[serde(skip, default)]
     node_stats: std::collections::HashMap<NodeId, NodeStats>,
+
+    /// Claimed names: name → owning NodeId. First claim wins; uniqueness is consensus-enforced.
+    #[serde(skip, default)]
+    names: std::collections::HashMap<String, NodeId>,
 }
 
 impl Chain {
@@ -429,6 +450,7 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             total_supply_cache: 0,
             node_stats: std::collections::HashMap::new(),
+            names: std::collections::HashMap::new(),
         }
     }
 
@@ -447,6 +469,7 @@ impl Chain {
         // only post-checkpoint reputation; full history lives on archive nodes (query one of
         // those for complete reputation). Acceptable for v0.
         self.node_stats.clear();
+        self.names.clear();
 
         // Seed caches from checkpoint if present.
         if let Some(ref cp) = self.checkpoint {
@@ -534,6 +557,11 @@ impl Chain {
                     // Just unlock — capacity returns to the payer's free balance (no balance move).
                     self.open_channels.remove(channel_id);
                 }
+                TxKind::NameClaim { name, node } => {
+                    // First claim wins: only record if unclaimed (append() already rejected
+                    // conflicts, but a checkpoint replay could re-see an earlier claim).
+                    self.names.entry(name.clone()).or_insert(*node);
+                }
             }
             self.tx_index.insert(tx.id(), (block.index, pos));
         }
@@ -561,6 +589,16 @@ impl Chain {
             .iter()
             .map(|(id, (payer, host, capacity, expiry))| (*id, *payer, *host, *capacity, *expiry))
             .collect()
+    }
+
+    /// Resolve a claimed name to its owning NodeId (`None` if unclaimed).
+    pub fn resolve_name(&self, name: &str) -> Option<NodeId> {
+        self.names.get(name).copied()
+    }
+
+    /// All claimed names: (name, owner). For listing/debugging.
+    pub fn list_names(&self) -> Vec<(String, NodeId)> {
+        self.names.iter().map(|(n, owner)| (n.clone(), *owner)).collect()
     }
 
     pub fn tip(&self) -> &Block {
@@ -840,6 +878,7 @@ impl Chain {
             let mut in_block_channel_ids: std::collections::HashSet<[u8; 32]> =
                 std::collections::HashSet::new();
             let mut closing: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+            let mut claimed_names: std::collections::HashSet<String> = std::collections::HashSet::new();
             for tx in &block.transactions {
                 match &tx.kind {
                     TxKind::ChannelOpen { channel_id, payer, host, capacity, .. } => {
@@ -906,6 +945,16 @@ impl Chain {
                             None => return false,
                         };
                         if &tx.origin != payer || chan_payer != payer || block.index <= *expiry {
+                            return false;
+                        }
+                    }
+                    TxKind::NameClaim { name, node } => {
+                        // You name only yourself; the name must be well-formed and unclaimed
+                        // (neither already on-chain nor claimed earlier in this same block).
+                        if &tx.origin != node || !is_valid_name(name) {
+                            return false;
+                        }
+                        if self.names.contains_key(name) || !claimed_names.insert(name.clone()) {
                             return false;
                         }
                     }
@@ -992,6 +1041,7 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             total_supply_cache: 0,
             node_stats: std::collections::HashMap::new(),
+            names: std::collections::HashMap::new(),
         };
         reorg_chain.rebuild_caches();
         for block in new_suffix {
@@ -1029,6 +1079,7 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             total_supply_cache: 0,
             node_stats: std::collections::HashMap::new(),
+            names: std::collections::HashMap::new(),
         };
         snap.rebuild_caches();
 
@@ -1455,6 +1506,49 @@ mod tests {
         assert_eq!(chain.balance(&payer.node_id()), before - 600, "only the redeemed 600 leaves the payer");
         assert_eq!(chain.locked_balance(&payer.node_id()), 0, "the rest unlocks on close");
         assert_eq!(chain.node_history(&host.node_id()).earned, 600);
+    }
+
+    fn signed_name_claim(claimer: &Identity, name: &str, node: NodeId) -> Tx {
+        let kind = TxKind::NameClaim { name: name.to_string(), node };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = claimer.sign(&data);
+        Tx::new(kind, claimer.node_id(), sig)
+    }
+
+    #[test]
+    fn name_claim_is_unique_and_resolvable() {
+        let alice = make_identity("name-alice");
+        let bob = make_identity("name-bob");
+        let mut chain = Chain::genesis();
+
+        assert!(append_with(&mut chain, &alice, signed_name_claim(&alice, "alice", alice.node_id())));
+        assert_eq!(chain.resolve_name("alice"), Some(alice.node_id()));
+
+        // The taken name can't be claimed by someone else.
+        assert!(!append_with(&mut chain, &bob, signed_name_claim(&bob, "alice", bob.node_id())));
+
+        // Bob claims his own free name.
+        assert!(append_with(&mut chain, &bob, signed_name_claim(&bob, "bob", bob.node_id())));
+        assert_eq!(chain.resolve_name("bob"), Some(bob.node_id()));
+
+        // Claiming on behalf of another node is rejected (origin must equal `node`).
+        assert!(!append_with(&mut chain, &alice, signed_name_claim(&alice, "carol", bob.node_id())));
+        assert_eq!(chain.resolve_name("carol"), None);
+
+        // Malformed names are rejected.
+        assert!(!append_with(&mut chain, &alice, signed_name_claim(&alice, "-bad", alice.node_id())));
+    }
+
+    #[test]
+    fn name_validation_rules() {
+        assert!(is_valid_name("alice"));
+        assert!(is_valid_name("node-01"));
+        assert!(!is_valid_name("ab")); // too short
+        assert!(!is_valid_name("UPPER")); // uppercase
+        assert!(!is_valid_name("-lead")); // leading hyphen
+        assert!(!is_valid_name("trail-")); // trailing hyphen
+        assert!(!is_valid_name("has space")); // space
+        assert!(!is_valid_name(&"x".repeat(33))); // too long
     }
 
     #[test]
