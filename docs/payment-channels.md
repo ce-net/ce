@@ -1,7 +1,16 @@
 # Payment channels — design
 
-**Status: design (not yet implemented).** The highest-leverage item on `docs/frontier.md`:
-the scale unlock that lets the per-signal economy run at planet scale.
+**Status: chain layer implemented** (`ChannelOpen`/`ChannelClose`/`ChannelExpire` txs, the
+`channel_receipt_bytes` receipt primitive, the `open_channels` lock, validation, and tests).
+**Remaining: API / SDK / CLI wiring** so apps can open channels, stream receipts, and close.
+The highest-leverage item on `docs/frontier.md`: the scale unlock that lets the per-signal
+economy run at planet scale.
+
+**v0 simplification:** only the **host** closes (with the payer's highest receipt — it maximizes
+its own payout, so the payer can't be underpaid), and the **payer** reclaims via `ChannelExpire`
+after the timeout. This needs **no dispute window** (only one party closes-with-a-receipt). The
+window described below applies once payer-side unilateral close / bidirectional channels are
+added.
 
 ## Why
 

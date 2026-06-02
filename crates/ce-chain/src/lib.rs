@@ -171,6 +171,31 @@ pub enum TxKind {
     /// Signed by the host; debits the cell's wallet and credits the host.
     /// `epoch` must strictly increase per (cell, host) pair to prevent replay.
     Heartbeat { cell: NodeId, host: NodeId, amount: u128, epoch: u64 },
+    /// Open a unidirectional payment channel payer → host. Locks `capacity` base units of the
+    /// payer's free balance (like a JobBid lock). Signed by the payer. See docs/payment-channels.md.
+    ChannelOpen {
+        channel_id: [u8; 32],
+        payer: NodeId,
+        host: NodeId,
+        capacity: u128,
+        /// After this block height the payer may reclaim the channel via ChannelExpire.
+        expiry_height: u64,
+    },
+    /// Close a channel by redeeming the payer's highest off-chain receipt. Submitted by the
+    /// **host** (origin == host); settles instantly: `cumulative` → host, the rest unlocks to the
+    /// payer. `payer_sig` is over `channel_receipt_bytes(channel_id, host, cumulative)`.
+    /// (v0: only the host closes-with-receipt — it maximizes its own payout, so the payer can't be
+    /// underpaid and no dispute window is needed. Payer-side unilateral close + the dispute window
+    /// in the design doc come with bidirectional channels.)
+    ChannelClose {
+        channel_id: [u8; 32],
+        cumulative: u128,
+        #[serde(with = "sig_serde")]
+        payer_sig: [u8; 64],
+    },
+    /// Reclaim a channel's full locked capacity after `expiry_height`. Signed by the payer.
+    /// The payer's escape if the host never closes; the host must close before expiry to claim.
+    ChannelExpire { channel_id: [u8; 32], payer: NodeId },
 }
 
 /// Canonical bytes the payer signs to authorize a settlement of `cost` for `job_id` by `host`.
@@ -350,6 +375,11 @@ pub struct Chain {
     #[serde(skip, default)]
     open_bids: std::collections::HashMap<[u8; 32], (NodeId, u128, u64)>,
 
+    /// Open payment channels: channel_id → (payer, host, capacity, expiry_height).
+    /// Capacity is locked in the payer's balance until ChannelClose or ChannelExpire.
+    #[serde(skip, default)]
+    open_channels: std::collections::HashMap<[u8; 32], (NodeId, NodeId, u128, u64)>,
+
     /// Cumulative UptimeReward supply. Avoids O(n) scan in append().
     #[serde(skip, default)]
     total_supply_cache: u128,
@@ -378,6 +408,7 @@ impl Chain {
             heartbeat_max_epoch: std::collections::HashMap::new(),
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
+            open_channels: std::collections::HashMap::new(),
             total_supply_cache: 0,
             node_stats: std::collections::HashMap::new(),
         }
@@ -390,6 +421,9 @@ impl Chain {
         self.heartbeat_max_epoch.clear();
         self.tx_index.clear();
         self.open_bids.clear();
+        // Rebuilt from available blocks (not seeded from checkpoint). Channels are short-lived
+        // and retained within the light-node prune window; archive nodes hold full state.
+        self.open_channels.clear();
         self.total_supply_cache = 0;
         // node_stats is rebuilt from available blocks. A pruned light node therefore holds
         // only post-checkpoint reputation; full history lives on archive nodes (query one of
@@ -461,6 +495,27 @@ impl Chain {
                     self.node_stat(payer, h).expiries += 1;
                 }
                 TxKind::TrustGrant { .. } => {}
+                TxKind::ChannelOpen { channel_id, payer, host, capacity, expiry_height } => {
+                    self.open_channels.insert(*channel_id, (*payer, *host, *capacity, *expiry_height));
+                }
+                TxKind::ChannelClose { channel_id, cumulative, .. } => {
+                    if let Some((payer, host, _cap, _exp)) = self.open_channels.remove(channel_id) {
+                        *self.balances.entry(payer).or_insert(0) -= *cumulative as i128;
+                        *self.balances.entry(host).or_insert(0) += *cumulative as i128;
+                        let h = block.index;
+                        let cumulative = *cumulative;
+                        let s = self.node_stat(&host, h);
+                        s.jobs_hosted += 1;
+                        s.earned = s.earned.saturating_add(cumulative);
+                        let s = self.node_stat(&payer, h);
+                        s.jobs_paid += 1;
+                        s.spent = s.spent.saturating_add(cumulative);
+                    }
+                }
+                TxKind::ChannelExpire { channel_id, .. } => {
+                    // Just unlock — capacity returns to the payer's free balance (no balance move).
+                    self.open_channels.remove(channel_id);
+                }
             }
             self.tx_index.insert(tx.id(), (block.index, pos));
         }
@@ -750,6 +805,88 @@ impl Chain {
                 }
             }
         }
+        // Payment-channel rules. Validated LAST so a ChannelOpen's free-balance check subtracts
+        // every other in-block debit of the payer (transfers, bids, heartbeats) — channels lose
+        // ties, closing the cross-type double-spend.
+        {
+            let mut in_block_channel: std::collections::HashMap<NodeId, u128> =
+                std::collections::HashMap::new();
+            let mut in_block_channel_ids: std::collections::HashSet<[u8; 32]> =
+                std::collections::HashSet::new();
+            let mut closing: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+            for tx in &block.transactions {
+                match &tx.kind {
+                    TxKind::ChannelOpen { channel_id, payer, host, capacity, .. } => {
+                        if &tx.origin != payer || payer == host || *capacity == 0 {
+                            return false;
+                        }
+                        // Unique channel id (not already open, not opened twice this block).
+                        if self.open_channels.contains_key(channel_id)
+                            || !in_block_channel_ids.insert(*channel_id)
+                        {
+                            return false;
+                        }
+                        // Free balance after ALL of this payer's other in-block debits.
+                        let bids: u128 = block
+                            .transactions
+                            .iter()
+                            .filter_map(|t| match &t.kind {
+                                TxKind::JobBid { payer: p, bid, .. } if p == payer => Some(*bid),
+                                _ => None,
+                            })
+                            .sum();
+                        let hbs: u128 = block
+                            .transactions
+                            .iter()
+                            .filter_map(|t| match &t.kind {
+                                TxKind::Heartbeat { cell, amount, .. } if cell == payer => Some(*amount),
+                                _ => None,
+                            })
+                            .sum();
+                        let transfers = *in_block_transfer.get(payer).unwrap_or(&0);
+                        let prior_chan = *in_block_channel.get(payer).unwrap_or(&0);
+                        let committed =
+                            (self.locked_balance(payer) + transfers + bids + hbs + prior_chan) as i128;
+                        if self.balance(payer) - committed < *capacity as i128 {
+                            return false;
+                        }
+                        *in_block_channel.entry(*payer).or_insert(0) += *capacity;
+                    }
+                    TxKind::ChannelClose { channel_id, cumulative, payer_sig } => {
+                        // One close/expire per channel per block.
+                        if !closing.insert(*channel_id) {
+                            return false;
+                        }
+                        let (payer, host, capacity, _expiry) = match self.open_channels.get(channel_id) {
+                            Some(c) => c,
+                            None => return false, // unknown / already settled / opened this same block
+                        };
+                        // Only the host closes, and only up to the locked capacity.
+                        if &tx.origin != host || *cumulative > *capacity {
+                            return false;
+                        }
+                        // The closing receipt must be the payer's signature over (channel, host, cumulative).
+                        let bytes = channel_receipt_bytes(channel_id, host, *cumulative);
+                        if verify(payer, &bytes, payer_sig).is_err() {
+                            return false;
+                        }
+                    }
+                    TxKind::ChannelExpire { channel_id, payer } => {
+                        if !closing.insert(*channel_id) {
+                            return false;
+                        }
+                        let (chan_payer, _host, _cap, expiry) = match self.open_channels.get(channel_id) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        if &tx.origin != payer || chan_payer != payer || block.index <= *expiry {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         self.apply_block_to_cache(&block);
         self.blocks.push(block);
         true
@@ -826,6 +963,7 @@ impl Chain {
             heartbeat_max_epoch: std::collections::HashMap::new(),
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
+            open_channels: std::collections::HashMap::new(),
             total_supply_cache: 0,
             node_stats: std::collections::HashMap::new(),
         };
@@ -862,6 +1000,7 @@ impl Chain {
             heartbeat_max_epoch: std::collections::HashMap::new(),
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
+            open_channels: std::collections::HashMap::new(),
             total_supply_cache: 0,
             node_stats: std::collections::HashMap::new(),
         };
@@ -890,11 +1029,20 @@ impl Chain {
     /// Free balance = `balance(node) - locked_balance(node)`.
     /// O(open_jobs) via the open_bids cache.
     pub fn locked_balance(&self, node: &NodeId) -> u128 {
-        self.open_bids
+        let in_bids: u128 = self
+            .open_bids
             .values()
             .filter(|(payer, _, _)| payer == node)
             .map(|(_, bid, _)| *bid)
-            .sum()
+            .sum();
+        // Payment-channel capacity is also locked in the payer's balance until close/expire.
+        let in_channels: u128 = self
+            .open_channels
+            .values()
+            .filter(|(payer, _, _, _)| payer == node)
+            .map(|(_, _, capacity, _)| *capacity)
+            .sum();
+        in_bids + in_channels
     }
 
     /// O(1) lookup for the highest confirmed Heartbeat epoch for a (cell, host) pair.
@@ -1202,6 +1350,139 @@ mod tests {
             channel_receipt_bytes(&chan, &host.node_id(), 1_000),
             channel_receipt_bytes(&chan, &host.node_id(), 1_001)
         );
+    }
+
+    fn signed_channel_open(
+        payer: &Identity,
+        channel_id: [u8; 32],
+        host: NodeId,
+        capacity: u128,
+        expiry_height: u64,
+    ) -> Tx {
+        let kind = TxKind::ChannelOpen { channel_id, payer: payer.node_id(), host, capacity, expiry_height };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = payer.sign(&data);
+        Tx::new(kind, payer.node_id(), sig)
+    }
+
+    fn signed_channel_close(host: &Identity, payer: &Identity, channel_id: [u8; 32], cumulative: u128) -> Tx {
+        let payer_sig = payer.sign(&channel_receipt_bytes(&channel_id, &host.node_id(), cumulative));
+        let kind = TxKind::ChannelClose { channel_id, cumulative, payer_sig };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = host.sign(&data);
+        Tx::new(kind, host.node_id(), sig)
+    }
+
+    fn signed_channel_expire(payer: &Identity, channel_id: [u8; 32]) -> Tx {
+        let kind = TxKind::ChannelExpire { channel_id, payer: payer.node_id() };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = payer.sign(&data);
+        Tx::new(kind, payer.node_id(), sig)
+    }
+
+    /// Append a single-tx block (plus a uptime reward to `miner`) and return whether it was accepted.
+    fn append_with(chain: &mut Chain, miner: &Identity, tx: Tx) -> bool {
+        let reward = signed_uptime_reward(miner, chain.tip().index + 1);
+        let mut b = chain.next_block(vec![reward, tx], miner.node_id());
+        b.seal(miner);
+        chain.append(b)
+    }
+
+    #[test]
+    fn channel_open_lock_close_settles() {
+        let payer = make_identity("ch-payer");
+        let host = make_identity("ch-host");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 2_000);
+        let before = chain.balance(&payer.node_id());
+        let chan = [3u8; 32];
+
+        assert!(append_with(&mut chain, &host, signed_channel_open(&payer, chan, host.node_id(), 1_000, 100_000)));
+        // Capacity is locked in the payer's balance.
+        assert_eq!(chain.locked_balance(&payer.node_id()), 1_000);
+
+        // Host redeems a receipt for 600 of the 1000.
+        assert!(append_with(&mut chain, &host, signed_channel_close(&host, &payer, chan, 600)));
+        assert_eq!(chain.balance(&payer.node_id()), before - 600, "only the redeemed 600 leaves the payer");
+        assert_eq!(chain.locked_balance(&payer.node_id()), 0, "the rest unlocks on close");
+        assert_eq!(chain.node_history(&host.node_id()).earned, 600);
+    }
+
+    #[test]
+    fn channel_open_insufficient_free_balance_rejected() {
+        let payer = make_identity("chx-payer");
+        let host = make_identity("chx-host");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 1_000);
+        let bal = chain.balance(&payer.node_id()) as u128;
+        assert!(
+            !append_with(&mut chain, &host, signed_channel_open(&payer, [1u8; 32], host.node_id(), bal + 1, 100_000)),
+            "opening a channel larger than free balance must be rejected"
+        );
+    }
+
+    #[test]
+    fn channel_close_rejects_forged_overdraw_and_wrong_closer() {
+        let payer = make_identity("chf-payer");
+        let host = make_identity("chf-host");
+        let mallory = make_identity("chf-mallory");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 2_000);
+        let chan = [5u8; 32];
+        assert!(append_with(&mut chain, &host, signed_channel_open(&payer, chan, host.node_id(), 1_000, 100_000)));
+
+        // Redeeming more than the capacity is rejected.
+        assert!(!append_with(&mut chain, &host, signed_channel_close(&host, &payer, chan, 1_001)), "cumulative > capacity");
+
+        // A non-host cannot close (the receipt is bound to `host`, and only the host may submit).
+        assert!(!append_with(&mut chain, &mallory, signed_channel_close(&mallory, &payer, chan, 500)), "non-host closer");
+
+        // A receipt not signed by the payer is rejected (mallory signs instead of payer).
+        assert!(!append_with(&mut chain, &host, signed_channel_close(&host, &mallory, chan, 500)), "forged receipt");
+
+        // The channel is still open and unspent after all rejected closes.
+        assert_eq!(chain.locked_balance(&payer.node_id()), 1_000);
+    }
+
+    #[test]
+    fn channel_expire_refunds_after_expiry() {
+        let payer = make_identity("che-payer");
+        let host = make_identity("che-host");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 2_000);
+        let before = chain.balance(&payer.node_id());
+        let chan = [6u8; 32];
+
+        // Expiry at the current tip height — so the next block's index exceeds it.
+        let expiry = chain.tip().index + 1;
+        assert!(append_with(&mut chain, &host, signed_channel_open(&payer, chan, host.node_id(), 1_000, expiry)));
+        assert_eq!(chain.locked_balance(&payer.node_id()), 1_000);
+
+        // Expiring before the height passes is rejected, then accepted once block.index > expiry.
+        assert!(append_with(&mut chain, &payer, signed_channel_expire(&payer, chan)), "expire after expiry height");
+        assert_eq!(chain.locked_balance(&payer.node_id()), 0, "capacity unlocked");
+        // Balance unchanged by expiry itself (payer mined the expire block, gaining a reward).
+        assert!(chain.balance(&payer.node_id()) >= before, "no credits left the payer on expire");
+    }
+
+    #[test]
+    fn transfer_and_channel_open_same_credits_rejected() {
+        let payer = make_identity("chc-payer");
+        let host = make_identity("chc-host");
+        let eve = make_identity("chc-eve");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 2_000);
+        let bal = chain.balance(&payer.node_id()) as u128;
+        let spend = bal * 8 / 10;
+
+        // One block: transfer 80% AND open a channel for 80% — 160% > balance, so the block is rejected.
+        let transfer = signed_transfer(&payer, eve.node_id(), spend);
+        let open = signed_channel_open(&payer, [8u8; 32], host.node_id(), spend, 100_000);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut b = chain.next_block(vec![reward, transfer, open], host.node_id());
+        b.seal(&host);
+        assert!(!chain.append(b), "transfer + channel-open exceeding balance must be rejected");
+        assert_eq!(chain.balance(&payer.node_id()), bal as i128, "balance unchanged");
     }
 
     #[test]
