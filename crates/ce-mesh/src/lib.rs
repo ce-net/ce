@@ -210,8 +210,10 @@ pub enum RpcResponse {
     SyncAck,
     /// Blocks for the requested archive segment.
     SegmentData { segment_id: u64, blocks: Vec<Block> },
-    /// A cell was deployed; `job_id` is the 64-hex id to track/kill it.
-    Deployed { job_id: String },
+    /// A cell was deployed; `job_id` is the 64-hex id to track/kill it. `output` is the output CID
+    /// (hex) when the workload ran to completion and produced a captured artifact (a WASI command's
+    /// stdout); `None` for detached/streaming cells.
+    Deployed { job_id: String, output: Option<String> },
     /// A deployed cell was stopped.
     Killed,
     /// The requested content-addressed chunk's bytes. The caller verifies `sha256(bytes) == cid`.

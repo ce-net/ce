@@ -1013,8 +1013,8 @@ async fn mesh_deploy(State(state): State<ApiState>, Json(req): Json<MeshDeployRe
     };
 
     match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
-        Ok(RpcResponse::Deployed { job_id }) => {
-            (StatusCode::OK, Json(serde_json::json!({ "job_id": job_id }))).into_response()
+        Ok(RpcResponse::Deployed { job_id, output }) => {
+            (StatusCode::OK, Json(serde_json::json!({ "job_id": job_id, "output": output }))).into_response()
         }
         Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
         Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),

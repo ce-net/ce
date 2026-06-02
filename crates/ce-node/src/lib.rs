@@ -1485,7 +1485,7 @@ fn handle_incoming_rpc(
                     }
                 }
                 let resp = match runtime.launch(&workload, &limits, job_id).await {
-                    Ok(handle) => {
+                    Ok((handle, output)) => {
                         // Track it so the heartbeat loop bills it and `ps`/Kill can find it.
                         // Wallet exhaustion will terminate it (existing mechanism).
                         job_store.lock().await.insert(
@@ -1502,7 +1502,7 @@ fn handle_incoming_rpc(
                             },
                         );
                         info!("mesh deploy: launched job {} for {}", hex::encode(&job_id[..4]), hex::encode(&payer[..4]));
-                        RpcResponse::Deployed { job_id: hex::encode(job_id) }
+                        RpcResponse::Deployed { job_id: hex::encode(job_id), output }
                     }
                     Err(e) => RpcResponse::Error(format!("deploy failed: {e}")),
                 };

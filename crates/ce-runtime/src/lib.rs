@@ -100,8 +100,16 @@ pub trait Runtime: Send + Sync {
         workload.required_tag() == self.tag()
     }
 
-    /// Launch the workload (detached). Returns a handle for metering/stopping.
-    async fn launch(&self, workload: &Workload, limits: &Limits, job_id: [u8; 32]) -> Result<Handle>;
+    /// Launch the workload. Returns a handle for metering/stopping, plus an optional **output CID**
+    /// (hex sha256) — set when the workload ran to completion and produced output that the runtime
+    /// published to the data layer (e.g. a WASI command's stdout). `None` for detached/streaming
+    /// workloads (containers, long-running cells) that produce no captured artifact.
+    async fn launch(
+        &self,
+        workload: &Workload,
+        limits: &Limits,
+        job_id: [u8; 32],
+    ) -> Result<(Handle, Option<String>)>;
 
     /// Stop and remove a running workload.
     async fn stop(&self, handle: &Handle) -> Result<()>;
@@ -157,8 +165,8 @@ mod tests {
         fn tag(&self) -> &'static str {
             "noop"
         }
-        async fn launch(&self, _w: &Workload, _l: &Limits, _id: [u8; 32]) -> Result<Handle> {
-            Ok(Handle("noop".into()))
+        async fn launch(&self, _w: &Workload, _l: &Limits, _id: [u8; 32]) -> Result<(Handle, Option<String>)> {
+            Ok((Handle("noop".into()), None))
         }
         async fn stop(&self, _h: &Handle) -> Result<()> {
             Ok(())

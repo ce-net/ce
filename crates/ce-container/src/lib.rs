@@ -375,7 +375,7 @@ impl ce_runtime::Runtime for DockerRuntime {
         workload: &ce_runtime::Workload,
         limits: &ce_runtime::Limits,
         job_id: [u8; 32],
-    ) -> Result<ce_runtime::Handle> {
+    ) -> Result<(ce_runtime::Handle, Option<String>)> {
         let (image, cmd, env) = match workload {
             ce_runtime::Workload::Docker { image, cmd, env, .. } => (image.clone(), cmd.clone(), env.clone()),
             other => {
@@ -393,7 +393,8 @@ impl ce_runtime::Runtime for DockerRuntime {
             mem_mb: limits.mem_mb,
             payer: self.host_node_id,
         };
-        Ok(ce_runtime::Handle(self.manager.launch_job(&spec).await?))
+        // Containers are detached and stream their own I/O — no captured output artifact.
+        Ok((ce_runtime::Handle(self.manager.launch_job(&spec).await?), None))
     }
 
     async fn stop(&self, handle: &ce_runtime::Handle) -> Result<()> {
