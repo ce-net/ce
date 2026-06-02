@@ -9,6 +9,9 @@ ce-chain = { path = "../ce-chain" }
 ce-mesh = { path = "../ce-mesh" }
 ce-container = { path = "../ce-container" }
 ce-protocol = { path = "../ce-protocol" }
+ce-tls = { path = "../ce-tls" }
+tokio-rustls = "0.26"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 tracing = "0.1"
@@ -26,6 +29,9 @@ toml = "0.8"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
+ce-tls = { path = "../ce-tls" }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["full"] }
 ce-mesh = { path = "../ce-mesh" }
 ce-identity = { path = "../ce-identity" }

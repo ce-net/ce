@@ -778,3 +778,44 @@ async fn different_methods_produce_different_signatures() {
         "signature for GET must not satisfy a PUT request"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS-from-identity (ce-tls): the node serves HTTPS with a cert keyed by its identity;
+// a client pinned to the node's NodeId completes the handshake, a wrong pin is rejected.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_handshake_pins_node_identity() {
+    use rustls::pki_types::ServerName;
+    use tokio_rustls::TlsConnector;
+
+    let (p2p, api) = alloc_ports();
+    let dir = tmpdir("tls-node");
+    let node = Node::start(NodeConfig {
+        listen_port: p2p,
+        bootstrap_peers: vec![],
+        data_dir: dir.clone(),
+        api_port: api,
+        mine: false,
+        disable_local_discovery: true,
+        tls: true,
+        ..Default::default()
+    })
+    .await
+    .expect("tls node start");
+    sleep(Duration::from_millis(600)).await;
+
+    let node_id: [u8; 32] = hex::decode(&node.status().await.node_id).unwrap().try_into().unwrap();
+    let other = make_identity("tls-other").node_id();
+    let name = ServerName::try_from("127.0.0.1").unwrap();
+
+    // Pinned to the node's real identity → handshake succeeds (cert key == NodeId).
+    let good = TlsConnector::from(ce_tls::client_config(node_id).unwrap());
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", api)).await.unwrap();
+    assert!(good.connect(name.clone(), tcp).await.is_ok(), "pin to the correct NodeId must succeed");
+
+    // Pinned to a different identity → handshake fails (cert pin mismatch = MITM defense).
+    let bad = TlsConnector::from(ce_tls::client_config(other).unwrap());
+    let tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", api)).await.unwrap();
+    assert!(bad.connect(name, tcp2).await.is_err(), "wrong pin must be rejected");
+}

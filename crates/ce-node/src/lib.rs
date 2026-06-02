@@ -149,6 +149,8 @@ pub struct NodeConfig {
     /// Disable mDNS local peer discovery. Set to true in tests to prevent in-process
     /// nodes from connecting to any live local ce node via multicast.
     pub disable_local_discovery: bool,
+    /// Serve the HTTP API over TLS (cert keyed by the node identity; clients pin the NodeId).
+    pub tls: bool,
 }
 
 impl Default for NodeConfig {
@@ -164,6 +166,7 @@ impl Default for NodeConfig {
             prune_keep: None,
             archive_density: ce_chain::ARCHIVE_DENSITY,
             disable_local_discovery: false,
+            tls: false,
         }
     }
 }
@@ -377,6 +380,7 @@ impl Node {
             let atlas3 = atlas.clone();
             let docker3 = docker.clone();
             let self_tags3 = self_tags.clone();
+            let tls_seed = if node.config.tls { Some(identity.secret_bytes()) } else { None };
             tokio::spawn(async move {
                 if let Err(e) = api::start(
                     chain2,
@@ -396,6 +400,7 @@ impl Node {
                     atlas3,
                     docker3,
                     self_tags3,
+                    tls_seed,
                 )
                 .await
                 {

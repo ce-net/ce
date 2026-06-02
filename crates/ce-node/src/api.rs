@@ -1453,6 +1453,9 @@ pub async fn start(
     atlas: Atlas,
     docker: Option<Docker>,
     self_tags: Vec<String>,
+    // When set, serve the API over TLS with a cert keyed by this Ed25519 seed (the node
+    // identity). Clients pin the cert against the node's NodeId. None = plain HTTP.
+    tls_seed: Option<[u8; 32]>,
 ) -> Result<()> {
     if docker.is_none() {
         tracing::warn!("Docker unavailable — job routes and exec will return 503");
@@ -1516,7 +1519,48 @@ pub async fn start(
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("API listening on {addr}");
-    axum::serve(listener, app).await?;
+
+    match tls_seed {
+        None => {
+            tracing::info!("API listening on http://{addr}");
+            axum::serve(listener, app).await?;
+        }
+        Some(seed) => {
+            // TLS-from-identity: serve over rustls with a cert keyed by the node identity.
+            // Clients pin the cert to this node's NodeId (ce-tls). The mesh is Noise-encrypted
+            // separately; this protects the direct HTTP API.
+            use hyper_util::rt::{TokioExecutor, TokioIo};
+            use hyper_util::server::conn::auto::Builder as ConnBuilder;
+            use hyper_util::service::TowerToHyperService;
+
+            let server_config = ce_tls::server_config(&seed)?;
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            tracing::info!("API listening on https://{addr} (TLS-from-identity, NodeId-pinned)");
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("tls accept (tcp): {e}");
+                        continue;
+                    }
+                };
+                let acceptor = acceptor.clone();
+                let svc = TowerToHyperService::new(app.clone());
+                tokio::spawn(async move {
+                    let tls = match acceptor.accept(stream).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::debug!("tls handshake failed: {e}");
+                            return;
+                        }
+                    };
+                    let io = TokioIo::new(tls);
+                    if let Err(e) = ConnBuilder::new(TokioExecutor::new()).serve_connection(io, svc).await {
+                        tracing::debug!("tls connection: {e}");
+                    }
+                });
+            }
+        }
+    }
     Ok(())
 }

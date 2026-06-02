@@ -79,6 +79,9 @@ enum Commands {
         /// Archive nodes (relay, desktop) should omit this flag.
         #[arg(long)]
         light: bool,
+        /// Serve the HTTP API over TLS (cert keyed by this node's identity; clients pin the NodeId).
+        #[arg(long)]
+        tls: bool,
     },
     /// Show this node's credit balance.
     Balance,
@@ -676,7 +679,7 @@ async fn main() -> Result<()> {
     let data_dir = data_dir(cli.data_dir);
 
     match cli.command {
-        Commands::Start { port, api_port, bootstrap, relay, no_mine, light } => {
+        Commands::Start { port, api_port, bootstrap, relay, no_mine, light, tls } => {
             // CE_BOOTSTRAP_PEERS: colon-separated list of bootstrap multiaddrs.
             // Useful for Docker/systemd deployments where CLI flags are inconvenient.
             let mut bootstrap_peers = bootstrap;
@@ -710,6 +713,7 @@ async fn main() -> Result<()> {
                 api_port,
                 mine: !no_mine,
                 prune_keep: if light { Some(ce_chain::PRUNE_KEEP_BLOCKS) } else { None },
+                tls,
                 ..Default::default()
             };
             let node = Node::start(config).await?;
