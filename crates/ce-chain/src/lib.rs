@@ -200,6 +200,11 @@ pub enum TxKind {
     /// uniqueness); `node` must equal the tx origin, so you only name yourself. Permanent in v0
     /// (transfer/release/expiry are refinements). `name` is validated for length and charset.
     NameClaim { name: String, node: NodeId },
+    /// Revoke a capability by naming it `(issuer, nonce)`. Must be signed by `issuer` (origin ==
+    /// issuer). Adds the pair to the chain's revocation set; revoking any link in a capability
+    /// chain invalidates that link and its whole subtree. See `ce-node`'s `capability` module and
+    /// `docs/capabilities.md`.
+    RevokeCapability { issuer: NodeId, nonce: u64 },
 }
 
 /// Validate a claimable name: 3–32 chars, lowercase ascii letters/digits/hyphen, not starting or
@@ -426,6 +431,13 @@ pub struct Chain {
     /// Claimed names: name → owning NodeId. First claim wins; uniqueness is consensus-enforced.
     #[serde(skip, default)]
     names: std::collections::HashMap<String, NodeId>,
+
+    /// Revoked capabilities: the set of `(issuer, nonce)` pairs named by confirmed
+    /// `RevokeCapability` txs. Like `names`/`node_stats`, this is rebuilt from available blocks; a
+    /// pruned light node holds only post-checkpoint revocations, so archive nodes are authoritative
+    /// for full revocation history. Capability expiry bounds the residual risk. (v0.)
+    #[serde(skip, default)]
+    revoked: std::collections::HashSet<(NodeId, u64)>,
 }
 
 impl Chain {
@@ -451,6 +463,7 @@ impl Chain {
             total_supply_cache: 0,
             node_stats: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
+            revoked: std::collections::HashSet::new(),
         }
     }
 
@@ -470,6 +483,8 @@ impl Chain {
         // those for complete reputation). Acceptable for v0.
         self.node_stats.clear();
         self.names.clear();
+        // Rebuilt from available blocks (same prune caveat as names/node_stats).
+        self.revoked.clear();
 
         // Seed caches from checkpoint if present.
         if let Some(ref cp) = self.checkpoint {
@@ -483,6 +498,13 @@ impl Chain {
         for block in &blocks {
             self.apply_block_to_cache(block);
         }
+    }
+
+    /// Has the capability named `(issuer, nonce)` been revoked on-chain? Consulted by capability
+    /// authorization. Archive nodes are authoritative; a pruned light node sees only
+    /// post-checkpoint revocations.
+    pub fn is_revoked(&self, issuer: &NodeId, nonce: u64) -> bool {
+        self.revoked.contains(&(*issuer, nonce))
     }
 
     /// Apply one block's transactions to the incremental caches.
@@ -561,6 +583,9 @@ impl Chain {
                     // First claim wins: only record if unclaimed (append() already rejected
                     // conflicts, but a checkpoint replay could re-see an earlier claim).
                     self.names.entry(name.clone()).or_insert(*node);
+                }
+                TxKind::RevokeCapability { issuer, nonce } => {
+                    self.revoked.insert((*issuer, *nonce));
                 }
             }
             self.tx_index.insert(tx.id(), (block.index, pos));
@@ -827,6 +852,14 @@ impl Chain {
                 }
             }
         }
+        // RevokeCapability rules: only the capability's issuer may revoke it (origin == issuer).
+        for tx in &block.transactions {
+            if let TxKind::RevokeCapability { issuer, .. } = &tx.kind {
+                if &tx.origin != issuer {
+                    return false;
+                }
+            }
+        }
         // Heartbeat rules.
         {
             let mut in_block_epochs: std::collections::HashMap<(NodeId, NodeId), u64> =
@@ -1042,6 +1075,7 @@ impl Chain {
             total_supply_cache: 0,
             node_stats: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
+            revoked: std::collections::HashSet::new(),
         };
         reorg_chain.rebuild_caches();
         for block in new_suffix {
@@ -1080,6 +1114,7 @@ impl Chain {
             total_supply_cache: 0,
             node_stats: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
+            revoked: std::collections::HashSet::new(),
         };
         snap.rebuild_caches();
 
@@ -2269,6 +2304,47 @@ mod tests {
         let mut block = chain.next_block(vec![reward, bad_tg], attacker.node_id());
         block.seal(&attacker);
         assert!(!chain.append(block), "TrustGrant with wrong signer must be rejected");
+    }
+
+    fn signed_revoke_cap(issuer: &Identity, nonce: u64) -> Tx {
+        let kind = TxKind::RevokeCapability { issuer: issuer.node_id(), nonce };
+        let data = bincode::serialize(&kind).unwrap();
+        let sig = issuer.sign(&data);
+        Tx::new(kind, issuer.node_id(), sig)
+    }
+
+    #[test]
+    fn revoke_capability_records_and_queries() {
+        let issuer = make_identity("rc-issuer");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &issuer, 100);
+        assert!(!chain.is_revoked(&issuer.node_id(), 7));
+
+        let rev = signed_revoke_cap(&issuer, 7);
+        let reward = signed_uptime_reward(&issuer, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, rev], issuer.node_id());
+        block.seal(&issuer);
+        assert!(chain.append(block), "issuer-signed revoke must be accepted");
+        assert!(chain.is_revoked(&issuer.node_id(), 7));
+        assert!(!chain.is_revoked(&issuer.node_id(), 8), "unrelated nonce not revoked");
+    }
+
+    #[test]
+    fn revoke_capability_rejects_wrong_signer() {
+        let issuer = make_identity("rc-issuer2");
+        let attacker = make_identity("rc-attacker");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &attacker, 100);
+
+        // attacker tries to revoke a capability issued by someone else.
+        let kind = TxKind::RevokeCapability { issuer: issuer.node_id(), nonce: 9 };
+        let data = bincode::serialize(&kind).unwrap();
+        let bad = Tx::new(kind, attacker.node_id(), attacker.sign(&data));
+        let reward = signed_uptime_reward(&attacker, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, bad], attacker.node_id());
+        block.seal(&attacker);
+        assert!(!chain.append(block), "revoke not signed by the issuer must be rejected");
+        assert!(!chain.is_revoked(&issuer.node_id(), 9));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod api;
 pub mod auth;
+pub mod capability;
 pub mod chain_actor;
 pub mod devices;
 pub mod grants;
