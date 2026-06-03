@@ -558,7 +558,7 @@ async fn job_lifecycle() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn mesh_deploy_and_kill_roundtrip() {
-    use ce_node::devices::Devices;
+    use ce_node::capability::{Ability, Caveats, Resource, SignedCapability, encode_chain};
 
     // Host A — runs the container.
     let (p2p_a, api_a) = alloc_ports();
@@ -595,13 +595,20 @@ async fn mesh_deploy_and_kill_roundtrip() {
     .unwrap();
     let b_id = Identity::load_or_generate(&dir_b.join("identity")).unwrap().node_id();
 
-    // A trusts B as an admin, so B may deploy without presenting a grant.
-    {
-        let path = dir_a.join("machines.toml");
-        let mut devices = Devices::load_or_empty(&path);
-        devices.add("deployer", b_id, "127.0.0.1:0");
-        devices.save(&path).unwrap();
-    }
+    // A self-issues a capability authorizing B to deploy on A; B presents it with the deploy.
+    let deploy_cap = {
+        let a_identity = Identity::load_or_generate(&dir_a.join("identity")).unwrap();
+        let cap = SignedCapability::issue(
+            &a_identity,
+            b_id,
+            vec![Ability::Deploy],
+            Resource::Node(a_id),
+            Caveats::default(),
+            1,
+            None,
+        );
+        encode_chain(&[cap])
+    };
 
     sleep(Duration::from_secs(2)).await; // let the mesh connect
 
@@ -617,7 +624,8 @@ async fn mesh_deploy_and_kill_roundtrip() {
             "cpu_cores": 1,
             "mem_mb": 128,
             "duration_secs": 60,
-            "bid": "1000000000000000000"
+            "bid": "1000000000000000000",
+            "grant": deploy_cap
         }))
         .send()
         .await
@@ -789,7 +797,7 @@ async fn paid_provider_refuses_free_fetch() {
 /// launching. Without Stage 4 staging this deploy fails ("module not in blob store").
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_deploy_stages_module_from_mesh() {
-    use ce_node::devices::Devices;
+    use ce_node::capability::{Ability, Caveats, Resource, SignedCapability, encode_chain};
 
     // Deployer + provider A.
     let (p2p_a, api_a) = alloc_ports();
@@ -824,12 +832,20 @@ async fn wasm_deploy_stages_module_from_mesh() {
     })
     .await
     .unwrap();
-    {
-        let path = dir_b.join("machines.toml");
-        let mut devices = Devices::load_or_empty(&path);
-        devices.add("deployer", a_id, "127.0.0.1:0");
-        devices.save(&path).unwrap();
-    }
+    // B self-issues a capability authorizing A to deploy on B; A presents it with the deploy.
+    let deploy_cap = {
+        let b_identity = Identity::load_or_generate(&dir_b.join("identity")).unwrap();
+        let cap = SignedCapability::issue(
+            &b_identity,
+            a_id,
+            vec![Ability::Deploy],
+            Resource::Node(b_identity.node_id()),
+            Caveats::default(),
+            1,
+            None,
+        );
+        encode_chain(&[cap])
+    };
 
     sleep(Duration::from_secs(2)).await; // mesh connect + Kademlia populate
 
@@ -868,7 +884,8 @@ async fn wasm_deploy_stages_module_from_mesh() {
             "cpu_cores": 1,
             "mem_mb": 64,
             "duration_secs": 60,
-            "bid": "1000000000000000000"
+            "bid": "1000000000000000000",
+            "grant": deploy_cap
         }))
         .send()
         .await

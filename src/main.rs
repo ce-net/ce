@@ -2,10 +2,10 @@ use anyhow::{anyhow, Result};
 use ce_chain::{Chain, CREDIT};
 use ce_identity::Identity;
 use ce_node::{
-    devices::Devices,
-    grants::{Constraints, Permission, Selector, SignedGrant},
+    capability::{self, Ability, Caveats, Resource, SignedCapability},
     Node, NodeConfig,
 };
+use serde::{Deserialize, Serialize};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use std::net::IpAddr;
@@ -93,21 +93,12 @@ enum Commands {
     Status,
     /// Print this node's ID.
     Id,
-    /// Manage trusted devices (personal mesh OS).
+    /// Manage the local capability wallet (alias -> node id + held capability token).
     ///
-    /// Quick add: ce devices add desktop <node-id>
-    Devices {
+    /// Hold capabilities others issued you, so `ce exec`/`ce sync <alias>` auto-attach them.
+    Wallet {
         #[command(subcommand)]
-        command: DevicesCommands,
-    },
-    /// View and organize your device fleet by tag.
-    ///
-    /// Combines owner tags (from machines.toml) with capability self-tags a node
-    /// advertises on the mesh (gpu, docker, linux, ...), read from the local node's atlas.
-    /// Example: ce fleet ls --select gpu
-    Fleet {
-        #[command(subcommand)]
-        command: FleetCommands,
+        command: WalletCommands,
     },
     /// Manage off-chain payment channels (stream micropayments, settle on close).
     Channel {
@@ -124,35 +115,47 @@ enum Commands {
         #[command(subcommand)]
         command: DiscoverCommands,
     },
-    /// Issue a scoped capability grant token for another principal.
+    /// Issue a capability token authorizing another principal (a node) on your resources.
     ///
-    /// You (a trusted admin on the target workspaces) delegate a subset of your authority:
-    /// the token lets <subject> perform the given permissions on workspaces matching
-    /// --select, until --expires. Hand the printed token to the subject; they pass it via
-    /// `ce exec --grant <token>` or `ce sync --grant <token>`.
+    /// Self-issued: signed by THIS node's identity, so any node that accepts this node as a root
+    /// (its own resources by default) honors it. Hand the printed token to the audience; they store
+    /// it with `ce wallet add` and `ce exec`/`ce sync` attach it automatically. See docs/capabilities.md.
     ///
-    /// Example: ce grant <node-id> --perm exec --select tag=gpu --expires 7d
+    /// Example: ce grant <node-id> --can exec,sync,tunnel --port 22 --expires 90d
     Grant {
-        /// Subject node ID (64 hex chars) — the principal being authorized. Get it via `ce id`.
+        /// Audience node ID (64 hex chars) — the principal being authorized. Get it via `ce id`.
         subject: String,
-        /// Permission to grant (repeatable): exec | sync | deploy | kill | status
-        #[arg(long = "perm", required = true)]
-        perms: Vec<String>,
-        /// Workspace selector matched against capability self-tags: `*`, `tag=gpu`, `tag=gpu,linux`.
-        #[arg(long, default_value = "*")]
-        select: String,
+        /// Abilities (comma-separated or repeatable): exec,sync,delete,tunnel,deploy,kill,status.
+        #[arg(long = "can", required = true, value_delimiter = ',')]
+        can: Vec<String>,
+        /// Resource: `self` (this node, default), `any`/`*`, `tag=gpu`, `tag=gpu,linux`, or `node=<hex>`.
+        #[arg(long, default_value = "self")]
+        resource: String,
         /// Expiry as a duration from now (e.g. 7d, 24h, 30m, 3600s). Omit for no expiry.
         #[arg(long)]
         expires: Option<String>,
-        /// Max CPU cores a deploy under this grant may request.
+        /// Tunnel: allowed remote port (repeatable). Omit for any port.
+        #[arg(long = "port")]
+        ports: Vec<u16>,
+        /// Sync/delete: confine writes to this path prefix (relative to the target's home).
+        #[arg(long)]
+        path: Option<String>,
+        /// Max CPU cores a deploy under this capability may request.
         #[arg(long)]
         max_cpu: Option<u32>,
-        /// Max memory (MB) a deploy under this grant may request.
+        /// Max memory (MB) a deploy under this capability may request.
         #[arg(long)]
         max_mem_mb: Option<u32>,
-        /// Max credits the subject may spend under this grant.
+        /// Max credits the audience may spend under this capability.
         #[arg(long)]
         max_credits: Option<u64>,
+    },
+    /// Revoke a capability you issued, by its nonce (submits an on-chain RevokeCapability tx).
+    Revoke {
+        /// The nonce of a capability this node issued.
+        nonce: u64,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
     },
     /// Sync files to a remote device.
     ///
@@ -288,61 +291,25 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum DevicesCommands {
-    /// Add a trusted device.
+enum WalletCommands {
+    /// Store (or replace) a capability you were issued, under a friendly alias.
     ///
-    /// Quick usage: ce devices add desktop <node-id>
-    /// Get the node ID on the target machine with: ce id
-    ///
-    /// Trust is by node ID only. Device-to-device traffic (exec, sync, deploy) routes through the
-    /// CE mesh over libp2p, so no IP:port is needed — NAT-traversal is handled by the relay.
+    /// Example: ce wallet add desktop <desktop-node-id> --cap <token-from-ce-grant>
     Add {
-        /// Friendly name for the device (e.g. "desktop", "laptop").
-        name: String,
-        /// Node ID (64 hex chars). Run `ce id` on the target machine to get it.
-        /// If omitted, you will be prompted interactively.
-        node_id: Option<String>,
-        /// Owner tag to attach (repeatable): --tag build --tag home
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-    },
-    /// List all registered devices.
-    Ls,
-    /// Revoke trust for a device.
-    Revoke {
-        /// Device name to remove.
-        name: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum FleetCommands {
-    /// List devices with their owner tags and live capability self-tags.
-    Ls {
-        /// Only show devices carrying this tag (matches owner tags or mesh self-tags).
+        /// Friendly alias (e.g. "desktop", "laptop").
+        alias: String,
+        /// The target node's ID (64 hex chars) this capability applies to.
+        node_id: String,
+        /// The capability token printed by `ce grant` on the target.
         #[arg(long)]
-        select: Option<String>,
-        /// Local node API port to read the atlas from.
-        #[arg(long, default_value = "8844")]
-        api_port: u16,
+        cap: String,
     },
-    /// Attach one or more owner tags to a device.
-    ///
-    /// Example: ce fleet tag desktop build gpu
-    Tag {
-        /// Device name.
-        name: String,
-        /// Tags to add.
-        #[arg(required = true)]
-        tags: Vec<String>,
-    },
-    /// Remove one or more owner tags from a device.
-    Untag {
-        /// Device name.
-        name: String,
-        /// Tags to remove.
-        #[arg(required = true)]
-        tags: Vec<String>,
+    /// List wallet entries.
+    Ls,
+    /// Remove a wallet entry.
+    Rm {
+        /// Alias to remove.
+        alias: String,
     },
 }
 
@@ -492,8 +459,55 @@ fn data_dir(override_path: Option<PathBuf>) -> PathBuf {
     })
 }
 
-fn devices_path(data_dir: &PathBuf) -> PathBuf {
-    data_dir.join("machines.toml")
+// ----- Capability wallet -----
+//
+// The wallet is a local, client-side keychain of capabilities this node has been issued, keyed by a
+// friendly alias. It is NOT a trust store — holding a capability grants nothing on its own; the
+// issuing node decides what it authorizes. `ce exec`/`ce sync <alias>` auto-attach the held token.
+
+#[derive(Default, Serialize, Deserialize)]
+struct Wallet {
+    #[serde(default)]
+    entries: std::collections::BTreeMap<String, WalletEntry>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WalletEntry {
+    /// Target node id (64 hex) this capability applies to.
+    node_id: String,
+    /// The capability token (hex), as printed by `ce grant`.
+    cap: String,
+}
+
+fn wallet_path(data_dir: &PathBuf) -> PathBuf {
+    data_dir.join("wallet.toml")
+}
+
+fn load_wallet(data_dir: &PathBuf) -> Wallet {
+    match std::fs::read_to_string(wallet_path(data_dir)) {
+        Ok(s) => toml::from_str(&s).unwrap_or_default(),
+        Err(_) => Wallet::default(),
+    }
+}
+
+fn save_wallet(data_dir: &PathBuf, w: &Wallet) -> Result<()> {
+    std::fs::write(wallet_path(data_dir), toml::to_string_pretty(w)?)?;
+    Ok(())
+}
+
+/// Resolve a target (a 64-hex node id, or a wallet alias) to (node_id_hex, capability token).
+/// A raw node id resolves with no token (you must pass `--cap` or hold it some other way).
+fn resolve_target(data_dir: &PathBuf, target: &str) -> Result<(String, Option<String>)> {
+    if target.len() == 64 && target.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok((target.to_string(), None));
+    }
+    let wallet = load_wallet(data_dir);
+    match wallet.entries.get(target) {
+        Some(e) => Ok((e.node_id.clone(), Some(e.cap.clone()))),
+        None => Err(anyhow!(
+            "unknown target '{target}': not a 64-hex node id and not a wallet alias (see `ce wallet ls`)"
+        )),
+    }
 }
 
 
@@ -838,138 +852,37 @@ async fn main() -> Result<()> {
             println!("libp2p id  : {peer_id}");
         }
 
-        Commands::Devices { command } => {
-            let path = devices_path(&data_dir);
-            match command {
-                DevicesCommands::Add { name, node_id, tags } => {
-                    use std::io::{BufRead, Write};
-
-                    let node_id_hex = match node_id {
-                        Some(id) => id,
-                        None => {
-                            print!("Node ID (64 hex chars): ");
-                            std::io::stdout().flush()?;
-                            let mut s = String::new();
-                            std::io::stdin().lock().read_line(&mut s)?;
-                            s.trim().to_string()
-                        }
-                    };
-
-                    let bytes = hex::decode(&node_id_hex)
-                        .map_err(|_| anyhow!("node ID must be 64 hex chars"))?;
-                    let node_id: [u8; 32] = bytes
-                        .try_into()
-                        .map_err(|_| anyhow!("node ID must be exactly 32 bytes"))?;
-
-                    let mut devices = Devices::load_or_empty(&path);
-                    // Address is unused for mesh-routed traffic (trust is by node ID); kept empty
-                    // in the registry for the legacy direct-HTTP path only.
-                    devices.add(&name, node_id, "");
-                    if !tags.is_empty() {
-                        devices.add_tags(&name, &tags)?;
-                    }
-                    devices.save(&path)?;
-                    println!("Added device '{name}'.");
+        Commands::Wallet { command } => match command {
+            WalletCommands::Add { alias, node_id, cap } => {
+                if node_id.len() != 64 || !node_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(anyhow!("node_id must be 64 hex chars"));
                 }
-                DevicesCommands::Ls => {
-                    let devices = Devices::load_or_empty(&path);
-                    let list = devices.entries();
-                    if list.is_empty() {
-                        println!("No devices registered. Use `ce devices add <name>`.");
-                    } else {
-                        for (name, node_id, addr, tags) in &list {
-                            let tag_str =
-                                if tags.is_empty() { String::new() } else { format!("  [{}]", tags.join(", ")) };
-                            println!("{name:<16}  {}  {addr}{tag_str}", hex::encode(node_id));
-                        }
-                    }
-                }
-                DevicesCommands::Revoke { name } => {
-                    let mut devices = Devices::load_or_empty(&path);
-                    if devices.remove(&name) {
-                        devices.save(&path)?;
-                        println!("Revoked device '{name}'.");
-                    } else {
-                        println!("Device '{name}' not found.");
+                capability::decode_chain(&cap).map_err(|_| anyhow!("invalid capability token"))?;
+                let mut w = load_wallet(&data_dir);
+                w.entries.insert(alias.clone(), WalletEntry { node_id, cap });
+                save_wallet(&data_dir, &w)?;
+                println!("Added wallet entry '{alias}'.");
+            }
+            WalletCommands::Ls => {
+                let w = load_wallet(&data_dir);
+                if w.entries.is_empty() {
+                    println!("Wallet is empty. Add one with `ce wallet add <alias> <node-id> --cap <token>`.");
+                } else {
+                    for (alias, e) in &w.entries {
+                        println!("{alias:<16}  {}", &e.node_id[..e.node_id.len().min(16)]);
                     }
                 }
             }
-        }
-
-        Commands::Fleet { command } => {
-            let path = devices_path(&data_dir);
-            match command {
-                FleetCommands::Tag { name, tags } => {
-                    let mut devices = Devices::load_or_empty(&path);
-                    devices.add_tags(&name, &tags)?;
-                    devices.save(&path)?;
-                    println!("Tagged '{name}' with [{}].", tags.join(", "));
-                }
-                FleetCommands::Untag { name, tags } => {
-                    let mut devices = Devices::load_or_empty(&path);
-                    devices.remove_tags(&name, &tags)?;
-                    devices.save(&path)?;
-                    println!("Removed [{}] from '{name}'.", tags.join(", "));
-                }
-                FleetCommands::Ls { select, api_port } => {
-                    let devices = Devices::load_or_empty(&path);
-                    let entries = devices.entries();
-                    if entries.is_empty() {
-                        println!("No devices registered. Use `ce devices add <name>`.");
-                        return Ok(());
-                    }
-
-                    // Best-effort: read live capability self-tags from the local node's atlas.
-                    // node_id (hex) -> self-tags. Empty if the node is not running.
-                    let mut self_tags: std::collections::HashMap<String, Vec<String>> =
-                        std::collections::HashMap::new();
-                    let url = format!("http://127.0.0.1:{api_port}/atlas");
-                    match reqwest::Client::new().get(&url).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            if let Ok(atlas) = resp.json::<serde_json::Value>().await {
-                                for e in atlas.as_array().map(|v| v.as_slice()).unwrap_or(&[]) {
-                                    if let Some(id) = e["node_id"].as_str() {
-                                        let tags = e["tags"]
-                                            .as_array()
-                                            .map(|a| {
-                                                a.iter()
-                                                    .filter_map(|t| t.as_str().map(String::from))
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default();
-                                        self_tags.insert(id.to_string(), tags);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            eprintln!(
-                                "note: local node not reachable on :{api_port} — showing owner tags only \
-                                 (capability self-tags need a running `ce start`)."
-                            );
-                        }
-                    }
-
-                    println!("{:<16}  {:<16}  {:<24}  capabilities", "NAME", "NODE", "OWNER TAGS");
-                    for (name, node_id, _addr, owner_tags) in &entries {
-                        let id_hex = hex::encode(node_id);
-                        let caps = self_tags.get(&id_hex).cloned().unwrap_or_default();
-
-                        // --select matches either an owner tag or a capability self-tag.
-                        if let Some(sel) = &select {
-                            let hit = owner_tags.iter().any(|t| t == sel) || caps.iter().any(|t| t == sel);
-                            if !hit {
-                                continue;
-                            }
-                        }
-
-                        let owners = if owner_tags.is_empty() { "-".into() } else { owner_tags.join(", ") };
-                        let cap_str = if caps.is_empty() { "-".into() } else { caps.join(", ") };
-                        println!("{name:<16}  {:<16}  {owners:<24}  {cap_str}", &id_hex[..16]);
-                    }
+            WalletCommands::Rm { alias } => {
+                let mut w = load_wallet(&data_dir);
+                if w.entries.remove(&alias).is_some() {
+                    save_wallet(&data_dir, &w)?;
+                    println!("Removed '{alias}'.");
+                } else {
+                    println!("No such wallet entry '{alias}'.");
                 }
             }
-        }
+        },
 
         Commands::Channel { command } => {
             let client = reqwest::Client::new();
@@ -1098,59 +1011,91 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Grant { subject, perms, select, expires, max_cpu, max_mem_mb, max_credits } => {
+        Commands::Grant { subject, can, resource, expires, ports, path, max_cpu, max_mem_mb, max_credits } => {
             let bytes = hex::decode(&subject).map_err(|_| anyhow!("subject must be 64 hex chars"))?;
-            let subject_id: [u8; 32] = bytes
+            let audience: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| anyhow!("subject must be exactly 32 bytes (64 hex chars)"))?;
 
-            let permissions: Vec<Permission> =
-                perms.iter().map(|p| Permission::parse(p)).collect::<Result<_>>()?;
-            let selector = Selector::parse(&select);
+            let abilities: Vec<Ability> = can.iter().map(|a| Ability::parse(a)).collect::<Result<_>>()?;
+            let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-            let not_after = match &expires {
-                Some(d) => now + parse_duration_secs(d)?,
-                None => {
-                    eprintln!("warning: grant has no --expires; it is valid until you un-trust the issuer");
-                    0
+            // Resolve the resource matcher: `self` = this node, `any`/`*` = Any, `node=<hex>`, else tags.
+            let res = match resource.as_str() {
+                "self" => Resource::Node(identity.node_id()),
+                "*" | "any" => Resource::Any,
+                s if s.starts_with("node=") => {
+                    let b = hex::decode(&s[5..]).map_err(|_| anyhow!("node= must be 64 hex chars"))?;
+                    let id: [u8; 32] = b.try_into().map_err(|_| anyhow!("node= must be 32 bytes"))?;
+                    Resource::Node(id)
+                }
+                s => {
+                    let body = s.strip_prefix("tag=").unwrap_or(s);
+                    let parts: Vec<String> =
+                        body.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+                    match parts.len() {
+                        0 => Resource::Any,
+                        1 => Resource::Tag(parts.into_iter().next().unwrap()),
+                        _ => Resource::AllOf(parts),
+                    }
                 }
             };
 
-            let constraints = Constraints { not_after, max_cpu, max_mem_mb, max_credits };
-            let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
-            // Nonce names this grant (for future revocation); current time is unique enough per issuer.
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            let not_after = match &expires {
+                Some(d) => now + parse_duration_secs(d)?,
+                None => {
+                    eprintln!("warning: capability has no --expires; it never expires (revoke with `ce revoke <nonce>`)");
+                    0
+                }
+            };
+            let caveats = Caveats {
+                not_before: 0,
+                not_after,
+                max_cpu,
+                max_mem_mb,
+                max_credits,
+                allowed_ports: if ports.is_empty() { None } else { Some(ports) },
+                path_prefix: path,
+            };
+            // Nonce names this capability for revocation; current time is unique enough per issuer.
             let nonce = now;
-            let sg = SignedGrant::issue(&identity, subject_id, permissions, selector, constraints, nonce);
+            let cap = SignedCapability::issue(&identity, audience, abilities, res, caveats, nonce, None);
+            let token = capability::encode_chain(&[cap]);
 
-            eprintln!("Grant issued by {}", identity.node_id_hex());
-            eprintln!("  subject:     {subject}");
-            eprintln!("  permissions: {}", perms.join(", "));
-            eprintln!("  selector:    {select}");
+            eprintln!("Capability issued by {}", identity.node_id_hex());
+            eprintln!("  audience: {subject}");
+            eprintln!("  can:      {}", can.join(", "));
+            eprintln!("  resource: {resource}");
+            eprintln!("  nonce:    {nonce}  (revoke with: ce revoke {nonce})");
             eprintln!(
-                "  expires:     {}",
+                "  expires:  {}",
                 if not_after == 0 { "never".to_string() } else { format!("{not_after} (unix seconds)") }
             );
-            eprintln!("\nToken (give to subject; use with `ce exec --grant` / `ce sync --grant`):");
-            println!("{}", sg.encode());
+            eprintln!("\nToken (give to the audience; they run: ce wallet add <alias> {subject} --cap <token>):");
+            println!("{token}");
+        }
+        Commands::Revoke { nonce, api_port } => {
+            let url = format!("http://127.0.0.1:{api_port}/capabilities/revoke");
+            let client = reqwest::Client::new();
+            let resp = client.post(&url).json(&serde_json::json!({ "nonce": nonce })).send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("revoke failed ({status}): {text}"));
+            }
+            let v: serde_json::Value = resp.json().await?;
+            println!("revoked nonce {nonce} (tx {})", v["tx_id"].as_str().unwrap_or("?"));
         }
 
         Commands::Sync { src, dst, grant, api_port } => {
-            // Parse destination: "device:path"
-            let (device_name, remote_path) = dst
+            // Parse destination: "target:path" (target = wallet alias or 64-hex node id).
+            let (target, remote_path) = dst
                 .split_once(':')
-                .ok_or_else(|| anyhow!("dst must be in <device>:<path> format, e.g. desktop:~/code/ce"))?;
+                .ok_or_else(|| anyhow!("dst must be in <target>:<path> format, e.g. desktop:~/code/ce"))?;
 
-            if grant.is_some() {
-                eprintln!("note: --grant is not yet forwarded through the mesh proxy; ignoring it");
-            }
-
-            let dev_path = devices_path(&data_dir);
-            let devices = Devices::load_or_empty(&dev_path);
-            let (node_id, _addr) = devices.get(device_name)?;
-            let node_id_hex = hex::encode(node_id);
+            let (node_id_hex, wallet_cap) = resolve_target(&data_dir, target)?;
+            let cap = grant.clone().or(wallet_cap);
 
             // Remote root is relative to the target's home (the mesh-sync endpoint joins it under ~/).
             let remote_root = remote_path
@@ -1186,9 +1131,13 @@ async fn main() -> Result<()> {
                 } else {
                     format!("{remote_root}/{rel_str}")
                 };
-                // Route through the LOCAL node's mesh proxy (libp2p, NAT-traversing). The local node
-                // signs the write with its own identity, so no per-request auth header is needed.
-                let url = format!("http://127.0.0.1:{api_port}/mesh-sync/{node_id_hex}/{remote_file}");
+                // Route through the LOCAL node's mesh proxy (libp2p, NAT-traversing); the capability
+                // chain authorizing the write rides as the `caps` query param.
+                let mut url = format!("http://127.0.0.1:{api_port}/mesh-sync/{node_id_hex}/{remote_file}");
+                if let Some(c) = &cap {
+                    url.push_str("?caps=");
+                    url.push_str(c);
+                }
 
                 let file_bytes = std::fs::read(entry.path())?;
                 let resp = client.put(&url).body(file_bytes).send().await?;
@@ -1201,28 +1150,26 @@ async fn main() -> Result<()> {
                 }
             }
 
-            println!("Synced {synced} files to {device_name}:{remote_path} ({skipped} ignored).");
+            println!("Synced {synced} files to {target}:{remote_path} ({skipped} ignored).");
         }
 
         Commands::Exec { machine, image, cwd, grant, command, api_port } => {
             if command.is_empty() {
                 return Err(anyhow!("specify a command to run, e.g. ce exec desktop --image rust:latest cargo build"));
             }
-            if grant.is_some() {
-                eprintln!("note: --grant is not yet forwarded through the mesh proxy; ignoring it");
-            }
 
-            let dev_path = devices_path(&data_dir);
-            let devices = Devices::load_or_empty(&dev_path);
-            let (node_id, _addr) = devices.get(&machine)?;
+            let (node_id_hex, wallet_cap) = resolve_target(&data_dir, &machine)?;
+            let cap = grant.clone().or(wallet_cap);
 
-            // Route through the LOCAL node's mesh proxy (libp2p) to the target host.
+            // Route through the LOCAL node's mesh proxy (libp2p) to the target host; the capability
+            // chain authorizing the exec rides in the `grant` field.
             let url = format!("http://127.0.0.1:{api_port}/mesh-exec");
             let body = serde_json::json!({
-                "node_id": hex::encode(node_id),
+                "node_id": node_id_hex,
                 "image": image,
                 "cmd": command,
                 "cwd": cwd,
+                "grant": cap,
             });
             let client = reqwest::Client::new();
             let resp = client.post(&url).json(&body).send().await?;
@@ -1256,20 +1203,19 @@ async fn main() -> Result<()> {
             let (url, body) = match &on {
                 // Directed placement: route through the local node's mesh proxy to a specific host.
                 Some(device) => {
-                    let dev_path = devices_path(&data_dir);
-                    let devices = Devices::load_or_empty(&dev_path);
-                    let (node_id, _addr) = devices.get(device)?;
+                    let (node_id_hex, wallet_cap) = resolve_target(&data_dir, device)?;
+                    let cap = grant.clone().or(wallet_cap);
                     (
                         format!("http://127.0.0.1:{api_port}/mesh-deploy"),
                         serde_json::json!({
-                            "node_id": hex::encode(node_id),
+                            "node_id": node_id_hex,
                             "image": image,
                             "cmd": cmd,
                             "cpu_cores": cpu,
                             "mem_mb": mem,
                             "duration_secs": duration,
                             "bid": bid_base,
-                            "grant": grant,
+                            "grant": cap,
                         }),
                     )
                 }
@@ -1336,13 +1282,12 @@ async fn main() -> Result<()> {
             let resp = match &on {
                 // Directed: route through the local mesh proxy to a specific host.
                 Some(device) => {
-                    let dev_path = devices_path(&data_dir);
-                    let devices = Devices::load_or_empty(&dev_path);
-                    let (node_id, _addr) = devices.get(device)?;
+                    let (node_id_hex, wallet_cap) = resolve_target(&data_dir, device)?;
+                    let cap = grant.clone().or(wallet_cap);
                     let body = serde_json::json!({
-                        "node_id": hex::encode(node_id),
+                        "node_id": node_id_hex,
                         "job_id": job_id,
-                        "grant": grant,
+                        "grant": cap,
                     });
                     client.post(format!("http://127.0.0.1:{api_port}/mesh-kill")).json(&body).send().await?
                 }

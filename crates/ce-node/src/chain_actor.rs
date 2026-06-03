@@ -48,6 +48,7 @@ pub enum ChainCmd {
     ListChannels { reply: oneshot::Sender<Vec<([u8; 32], NodeId, NodeId, u128, u64)>> },
     /// Resolve a claimed name to its owning NodeId.
     ResolveName { name: String, reply: oneshot::Sender<Option<NodeId>> },
+    IsRevoked { issuer: NodeId, nonce: u64, reply: oneshot::Sender<bool> },
     Height { reply: oneshot::Sender<u64> },
     Difficulty { reply: oneshot::Sender<u8> },
     /// Combined height + difficulty + balance — avoids two round-trips in status handlers.
@@ -110,6 +111,13 @@ impl ChainHandle {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::ResolveName { name: name.to_string(), reply: tx }).await;
         rx.await.ok().flatten()
+    }
+
+    /// Has the capability `(issuer, nonce)` been revoked on-chain? Used by capability authorization.
+    pub async fn is_revoked(&self, issuer: NodeId, nonce: u64) -> bool {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.0.send(ChainCmd::IsRevoked { issuer, nonce, reply: tx }).await;
+        rx.await.unwrap_or(false)
     }
 
     pub async fn height(&self) -> u64 {
@@ -246,6 +254,9 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
             ChainCmd::ResolveName { name, reply } => {
                 let _ = reply.send(chain.resolve_name(&name));
             }
+            ChainCmd::IsRevoked { issuer, nonce, reply } => {
+                let _ = reply.send(chain.is_revoked(&issuer, nonce));
+            }
             ChainCmd::Height { reply } => {
                 let _ = reply.send(chain.height());
             }
@@ -372,6 +383,7 @@ fn tx_burn_amount(tx: &Tx) -> Option<u128> {
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
         | TxKind::ChannelExpire { .. }
-        | TxKind::NameClaim { .. } => None,
+        | TxKind::NameClaim { .. }
+        | TxKind::RevokeCapability { .. } => None,
     }
 }

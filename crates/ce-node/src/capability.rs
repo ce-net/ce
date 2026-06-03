@@ -341,16 +341,26 @@ impl SignedCapability {
     }
 }
 
-/// Encode a capability chain (root-first) to a portable token (hex of bincode) for CLI flags,
-/// wallets, and the mesh proxy.
+/// Encode a capability chain (root-first) to bincode bytes — the form carried on the wire (the mesh
+/// `grant` field) and inside a token.
+pub fn encode_chain_bytes(chain: &[SignedCapability]) -> Vec<u8> {
+    bincode::serialize(chain).unwrap_or_default()
+}
+
+/// Decode a chain from bincode bytes (the wire form).
+pub fn decode_chain_bytes(b: &[u8]) -> Result<Vec<SignedCapability>> {
+    bincode::deserialize(b).map_err(|e| anyhow!("malformed capability chain: {e}"))
+}
+
+/// Encode a capability chain (root-first) to a portable hex token for CLI flags and wallets.
 pub fn encode_chain(chain: &[SignedCapability]) -> String {
-    hex::encode(bincode::serialize(chain).unwrap_or_default())
+    hex::encode(encode_chain_bytes(chain))
 }
 
 /// Decode a token produced by [`encode_chain`].
 pub fn decode_chain(s: &str) -> Result<Vec<SignedCapability>> {
     let bytes = hex::decode(s.trim()).map_err(|_| anyhow!("capability token is not valid hex"))?;
-    bincode::deserialize(&bytes).map_err(|e| anyhow!("malformed capability token: {e}"))
+    decode_chain_bytes(&bytes)
 }
 
 /// Decide whether `requester` may perform `action` on the node identified by (`self_id`,

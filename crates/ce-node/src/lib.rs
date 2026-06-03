@@ -2,8 +2,6 @@ mod api;
 pub mod auth;
 pub mod capability;
 pub mod chain_actor;
-pub mod devices;
-pub mod grants;
 
 pub use chain_actor::{ChainHandle, ChainStatusSnap, SyncSnap, spawn_chain_actor};
 
@@ -397,6 +395,7 @@ impl Node {
             let archive_dir2 = node.config.data_dir.join("archive");
             let disable_local_discovery = node.config.disable_local_discovery;
             let self_tags2 = self_tags.clone();
+            let accepted_roots2 = load_accepted_roots(&node.config.data_dir);
             let job_store_m = job_store.clone();
             let runtimes_m = runtimes.clone();
             let data_price = node.config.data_price_per_byte;
@@ -426,6 +425,7 @@ impl Node {
                     archive_dir2,
                     disable_local_discovery,
                     self_tags2,
+                    accepted_roots2,
                     job_store_m,
                     runtimes_m,
                     data_price,
@@ -621,6 +621,22 @@ async fn mining_loop(
 // ----- Mesh event loop -----
 
 #[allow(clippy::too_many_arguments)]
+/// Load the node's accepted capability **root keys** from `<data_dir>/roots` — one 64-hex node id
+/// per line (`#` comments allowed). These are the org/CA anchors a node honors in addition to its
+/// own identity (which is always implicitly accepted). Missing file → empty, so self-issued
+/// capabilities still work with zero config. See `docs/capabilities.md`.
+pub fn load_accepted_roots(data_dir: &Path) -> Vec<NodeId> {
+    let path = data_dir.join("roots");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .filter_map(|h| hex::decode(h).ok().and_then(|b| b.try_into().ok()))
+        .collect()
+}
+
 async fn mesh_event_loop(
     chain: ChainHandle,
     mut rx: mpsc::Receiver<MeshEvent>,
@@ -641,6 +657,7 @@ async fn mesh_event_loop(
     archive_dir: PathBuf,
     disable_local_discovery: bool,
     self_tags: Vec<String>,
+    accepted_roots: Vec<NodeId>,
     job_store: JobStore,
     runtimes: Vec<Arc<dyn Runtime>>,
     data_price_per_byte: u128,
@@ -1083,7 +1100,10 @@ async fn mesh_event_loop(
                         &runtimes,
                         job_store.clone(),
                         our_node_id,
-                    );
+                        chain.clone(),
+                        &accepted_roots,
+                    )
+                    .await;
                 }
             }
             MeshEvent::CellSignal(signal) => {
@@ -1099,11 +1119,8 @@ async fn mesh_event_loop(
                     }
                 }
 
-                let sender_is_trusted = {
-                    let path = data_dir.join("machines.toml");
-                    crate::devices::Devices::load_or_empty(&path).is_trusted(&signal.from)
-                };
-                if signal.requires_burn() && !sender_is_trusted {
+                // Anti-spam: payload-bearing signals require a burn proof, except the node's own.
+                if signal.requires_burn() && signal.from != our_node_id {
                     warn!(
                         "dropping ce-protocol-1 signal from {}: payload without burn_proof",
                         hex::encode(&signal.from[..4]),
@@ -1312,7 +1329,7 @@ async fn stage_blob(
 // ----- Incoming mesh RPC handler -----
 
 #[allow(clippy::too_many_arguments)]
-fn handle_incoming_rpc(
+async fn handle_incoming_rpc(
     from_peer: ce_mesh::CePeerId,
     correlation_id: u64,
     request: RpcRequest,
@@ -1323,8 +1340,10 @@ fn handle_incoming_rpc(
     runtimes: &[Arc<dyn Runtime>],
     job_store: JobStore,
     host_node_id: NodeId,
+    chain: ChainHandle,
+    accepted_roots: &[NodeId],
 ) {
-    use crate::grants::{authorize, Permission, SignedGrant};
+    use crate::capability::{self, Ability};
 
     // Reject helper: send an Error response and stop.
     let reject = |msg: String| {
@@ -1351,29 +1370,45 @@ fn handle_incoming_rpc(
         }
     }
 
-    // 2. Scoped authorization: the action this RPC performs, and any grant it carries.
-    let (action, grant_bytes): (Permission, Option<Vec<u8>>) = match &request {
-        RpcRequest::Exec { grant, .. } => (Permission::Exec, grant.clone()),
-        RpcRequest::SyncFile { grant, .. } => (Permission::Sync, grant.clone()),
-        RpcRequest::Deploy { grant, .. } => (Permission::Deploy, grant.clone()),
-        RpcRequest::Kill { grant, .. } => (Permission::Kill, grant.clone()),
-        RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
-        RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
-        RpcRequest::AppMessage { .. } => unreachable!("AppMessage handled in event loop"),
-        RpcRequest::AppRequest { .. } => unreachable!("AppRequest handled in event loop"),
-        RpcRequest::RelayReceipt { .. } => unreachable!("RelayReceipt handled in event loop"),
+    // 2. Capability authorization. The action this RPC performs and the capability chain it carries
+    //    (the `grant` field now transports bincode(Vec<SignedCapability>), root-first).
+    let (action, chain_bytes): (Ability, Option<Vec<u8>>) = match &request {
+        RpcRequest::Exec { grant, .. } => (Ability::Exec, grant.clone()),
+        RpcRequest::SyncFile { grant, .. } => (Ability::Sync, grant.clone()),
+        RpcRequest::Deploy { grant, .. } => (Ability::Deploy, grant.clone()),
+        RpcRequest::Kill { grant, .. } => (Ability::Kill, grant.clone()),
+        _ => unreachable!("non-action RPCs are handled in the event loop"),
     };
-    let grant = match grant_bytes.as_deref().map(bincode::deserialize::<SignedGrant>) {
-        Some(Ok(g)) => Some(g),
+    let caps = match chain_bytes.as_deref().map(capability::decode_chain_bytes) {
+        Some(Ok(c)) => c,
         Some(Err(_)) => {
-            reject("malformed grant".into());
+            reject("malformed capability".into());
             return;
         }
-        None => None,
+        None => {
+            reject("no capability presented".into());
+            return;
+        }
     };
-    let devices = crate::devices::Devices::load_or_empty(&data_dir.join("machines.toml"));
+    // The chain actor is async, so pre-resolve on-chain revocation for each link.
+    let mut revoked: std::collections::HashSet<(NodeId, u64)> = std::collections::HashSet::new();
+    for link in &caps {
+        if chain.is_revoked(link.cap.issuer, link.cap.nonce).await {
+            revoked.insert((link.cap.issuer, link.cap.nonce));
+        }
+    }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    if let Err(reason) = authorize(&devices, self_tags, now, &from_node, action, grant.as_ref()) {
+    let is_revoked = |issuer: &NodeId, nonce: u64| revoked.contains(&(*issuer, nonce));
+    if let Err(reason) = capability::authorize(
+        &host_node_id,
+        accepted_roots,
+        self_tags,
+        now,
+        &from_node,
+        action,
+        &caps,
+        &is_revoked,
+    ) {
         warn!("rpc: denied {} from {}: {reason}", action.as_str(), hex::encode(&from_node[..4]));
         reject(reason);
         return;
@@ -1998,7 +2033,8 @@ fn tx_burn_amount(tx: &Tx) -> Option<u128> {
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
         | TxKind::ChannelExpire { .. }
-        | TxKind::NameClaim { .. } => None,
+        | TxKind::NameClaim { .. }
+        | TxKind::RevokeCapability { .. } => None,
     }
 }
 

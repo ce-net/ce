@@ -69,8 +69,10 @@ struct ApiState {
     atlas: Atlas,
     /// libp2p listen port — used by GET /bootstrap to build multiaddrs.
     listen_port: u16,
-    /// This node's capability self-tags — what grant selectors are matched against.
+    /// This node's capability self-tags — what capability resource selectors are matched against.
     self_tags: Arc<Vec<String>>,
+    /// Capability root keys this node honors (in addition to its own identity). See docs/capabilities.md.
+    accepted_roots: Arc<Vec<NodeId>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -503,7 +505,8 @@ fn tx_value(tx: &ce_chain::Tx) -> Option<u128> {
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
         | TxKind::ChannelExpire { .. }
-        | TxKind::NameClaim { .. } => None,
+        | TxKind::NameClaim { .. }
+        | TxKind::RevokeCapability { .. } => None,
     }
 }
 
@@ -519,10 +522,11 @@ fn verify_device_auth(
     headers: &HeaderMap,
     method: &str,
     path: &str,
-    data_dir: &std::path::Path,
+    host_node_id: &NodeId,
+    accepted_roots: &[NodeId],
     body: &[u8],
     nonce_cache: &NonceCache,
-    required: crate::grants::Permission,
+    required: crate::capability::Ability,
     self_tags: &[String],
 ) -> Result<NodeId, Response> {
     let from_hex = headers
@@ -584,20 +588,26 @@ fn verify_device_auth(
         return Err(err(StatusCode::UNAUTHORIZED, "invalid CE signature"));
     }
 
-    // Authorization: a trusted admin has full scope; otherwise the request must carry a
-    // scoped grant (X-CE-Grant header) covering this action on this workspace.
-    let devices = crate::devices::Devices::load_or_empty(&data_dir.join("machines.toml"));
-    let grant = match headers.get("x-ce-grant").and_then(|v| v.to_str().ok()) {
-        Some(token) => match crate::grants::SignedGrant::decode(token) {
-            Ok(g) => Some(g),
-            Err(_) => return Err(err(StatusCode::BAD_REQUEST, "malformed X-CE-Grant")),
-        },
-        None => None,
+    // Capability authorization. The chain is presented in X-CE-Caps (a hex token, root-first).
+    // The direct HTTP path verifies signature/expiry/attenuation/root but not on-chain revocation
+    // (the mesh path does that); rely on short expiries here.
+    let caps = match headers.get("x-ce-caps").and_then(|v| v.to_str().ok()) {
+        Some(token) => crate::capability::decode_chain(token)
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "malformed X-CE-Caps"))?,
+        None => return Err(err(StatusCode::UNAUTHORIZED, "missing X-CE-Caps capability")),
     };
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    if let Err(reason) =
-        crate::grants::authorize(&devices, self_tags, now, &from, required, grant.as_ref())
-    {
+    let never_revoked = |_: &NodeId, _: u64| false;
+    if let Err(reason) = crate::capability::authorize(
+        host_node_id,
+        accepted_roots,
+        self_tags,
+        now,
+        &from,
+        required,
+        &caps,
+        &never_revoked,
+    ) {
         return Err(err(StatusCode::FORBIDDEN, reason));
     }
 
@@ -620,7 +630,7 @@ async fn sync_put(
     };
 
     if let Err(resp) =
-        verify_device_auth(&headers, "PUT", &path, &state.data_dir, &body_bytes, &state.nonce_cache, crate::grants::Permission::Sync, &state.self_tags)
+        verify_device_auth(&headers, "PUT", &path, &state.host_node_id, &state.accepted_roots, &body_bytes, &state.nonce_cache, crate::capability::Ability::Sync, &state.self_tags)
     {
         return resp;
     }
@@ -670,7 +680,7 @@ async fn sync_get(
     let path = req.uri().path().to_string();
     // GET has no body; sign against empty bytes.
     if let Err(resp) =
-        verify_device_auth(&headers, "GET", &path, &state.data_dir, b"", &state.nonce_cache, crate::grants::Permission::Sync, &state.self_tags)
+        verify_device_auth(&headers, "GET", &path, &state.host_node_id, &state.accepted_roots, b"", &state.nonce_cache, crate::capability::Ability::Sync, &state.self_tags)
     {
         return resp;
     }
@@ -721,7 +731,7 @@ async fn exec_command(State(state): State<ApiState>, headers: HeaderMap, req: Re
     };
 
     if let Err(resp) =
-        verify_device_auth(&headers, "POST", "/exec", &state.data_dir, &body_bytes, &state.nonce_cache, crate::grants::Permission::Exec, &state.self_tags)
+        verify_device_auth(&headers, "POST", "/exec", &state.host_node_id, &state.accepted_roots, &body_bytes, &state.nonce_cache, crate::capability::Ability::Exec, &state.self_tags)
     {
         return resp;
     }
@@ -834,6 +844,29 @@ async fn transfer(State(state): State<ApiState>, Json(req): Json<TransferRequest
     (StatusCode::CREATED, Json(TransferResponse { tx_id })).into_response()
 }
 
+// ----- POST /capabilities/revoke -----
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeRequest {
+    /// The nonce of a capability this node issued (issuer == this node).
+    pub nonce: u64,
+}
+
+/// Revoke a capability this node issued by submitting an on-chain `RevokeCapability { issuer, nonce }`
+/// signed by this node. Revoking any link invalidates that link and its whole subtree once the tx
+/// is mined. See docs/capabilities.md.
+async fn revoke_capability(State(state): State<ApiState>, Json(req): Json<RevokeRequest>) -> Response {
+    let issuer = state.identity.node_id();
+    let kind = ce_chain::TxKind::RevokeCapability { issuer, nonce: req.nonce };
+    let data = bincode::serialize(&kind).expect("serialize RevokeCapability");
+    let sig = state.identity.sign(&data);
+    let tx = ce_chain::Tx::new(kind, issuer, sig);
+    let tx_id = hex::encode(tx.id());
+    state.pool.add(tx.clone()).await;
+    let _ = state.mesh_handle.broadcast_tx(&tx).await;
+    (StatusCode::CREATED, Json(serde_json::json!({ "tx_id": tx_id }))).into_response()
+}
+
 // ----- POST /mesh-exec -----
 //
 // Routes an exec request to a remote trusted device through the CE mesh (/ce/rpc/1).
@@ -853,6 +886,9 @@ struct MeshExecRequest {
     cmd: Vec<String>,
     #[serde(default)]
     cwd: Option<String>,
+    /// Capability chain token (hex) authorizing this exec on the target. Forwarded to the host.
+    #[serde(default)]
+    grant: Option<String>,
 }
 
 async fn mesh_exec(State(state): State<ApiState>, Json(req): Json<MeshExecRequest>) -> Response {
@@ -874,14 +910,16 @@ async fn mesh_exec(State(state): State<ApiState>, Json(req): Json<MeshExecReques
         let _ = state.mesh_handle.dial(req.hint_multiaddr).await;
     }
 
+    let grant = match caps_to_bytes(&req.grant) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
     let rpc_req = RpcRequest::Exec {
         from_node: state.host_node_id,
         image: req.image,
         cmd: req.cmd,
         cwd: req.cwd,
-        // The proxy node is itself a trusted admin of the target in the personal-fleet case.
-        // Forwarding a caller-supplied grant through the proxy is a future enhancement.
-        grant: None,
+        grant,
     };
 
     match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
@@ -970,12 +1008,12 @@ fn parse_cids(hexes: &[String]) -> Result<Vec<[u8; 32]>, Response> {
         .collect()
 }
 
-/// Decode an optional grant token to RPC-ready bincode bytes; validates the token.
-fn grant_to_bytes(token: &Option<String>) -> Result<Option<Vec<u8>>, Response> {
+/// Decode an optional capability-chain token (hex) to RPC-ready bincode bytes; validates the token.
+fn caps_to_bytes(token: &Option<String>) -> Result<Option<Vec<u8>>, Response> {
     match token {
-        Some(t) => match crate::grants::SignedGrant::decode(t) {
-            Ok(g) => Ok(Some(bincode::serialize(&g).unwrap_or_default())),
-            Err(_) => Err(err(StatusCode::BAD_REQUEST, "malformed grant token")),
+        Some(t) => match crate::capability::decode_chain(t) {
+            Ok(chain) => Ok(Some(crate::capability::encode_chain_bytes(&chain))),
+            Err(_) => Err(err(StatusCode::BAD_REQUEST, "malformed capability token")),
         },
         None => Ok(None),
     }
@@ -994,7 +1032,7 @@ async fn mesh_deploy(State(state): State<ApiState>, Json(req): Json<MeshDeployRe
         Ok(w) => w,
         Err(resp) => return resp,
     };
-    let grant = match grant_to_bytes(&req.grant) {
+    let grant = match caps_to_bytes(&req.grant) {
         Ok(g) => g,
         Err(resp) => return resp,
     };
@@ -1044,7 +1082,7 @@ async fn mesh_kill(State(state): State<ApiState>, Json(req): Json<MeshKillReques
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
     };
-    let grant = match grant_to_bytes(&req.grant) {
+    let grant = match caps_to_bytes(&req.grant) {
         Ok(g) => g,
         Err(resp) => return resp,
     };
@@ -1088,11 +1126,16 @@ async fn mesh_sync_put(
         }
     }
 
+    // Capability chain authorizing this write, presented as a hex `caps` query param.
+    let grant = match caps_to_bytes(&params.get("caps").cloned()) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
     let rpc_req = RpcRequest::SyncFile {
         from_node: state.host_node_id,
         path: file_path,
         data: body.to_vec(),
-        grant: None,
+        grant,
     };
 
     match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
@@ -1193,6 +1236,7 @@ fn tx_stream_view(tx: &Tx) -> TxStreamView {
         TxKind::ChannelClose { cumulative, .. } => ("ChannelClose", *cumulative),
         TxKind::ChannelExpire { .. } => ("ChannelExpire", 0),
         TxKind::NameClaim { .. } => ("NameClaim", 0),
+        TxKind::RevokeCapability { .. } => ("RevokeCapability", 0),
     };
     TxStreamView { id: hex::encode(tx.id()), origin: hex::encode(tx.origin), kind, amount }
 }
@@ -1923,6 +1967,7 @@ pub async fn start(
         tracing::warn!("Docker unavailable — job routes and exec will return 503");
     }
     let host_node_id = identity.node_id();
+    let accepted_roots = Arc::new(crate::load_accepted_roots(&data_dir));
     let nonce_cache: NonceCache = Arc::new(StdMutex::new(HashMap::new()));
     let state = ApiState {
         docker,
@@ -1945,6 +1990,7 @@ pub async fn start(
         atlas,
         listen_port,
         self_tags: Arc::new(self_tags),
+        accepted_roots,
     };
 
     let app = Router::new()
@@ -1954,6 +2000,7 @@ pub async fn start(
         .route("/jobs/:id/settle", post(settle_job))
         .route("/jobs/:id", delete(stop_job))
         .route("/transfer", post(transfer))
+        .route("/capabilities/revoke", post(revoke_capability))
         .route("/status", get(node_status))
         .route("/signals", get(list_signals))
         .route("/signals/send", post(send_signal))
