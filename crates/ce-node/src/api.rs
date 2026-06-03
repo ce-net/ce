@@ -1148,6 +1148,43 @@ async fn mesh_sync_put(
     }
 }
 
+// ----- DELETE /mesh-sync/:node_id/*path -----
+//
+// Delete a file on a remote trusted device through the mesh (true-mirror delete propagation).
+// Same `caps` query param as the PUT; authorized by a `delete` capability on the receiver.
+
+async fn mesh_sync_delete(
+    State(state): State<ApiState>,
+    Path((node_id_hex, file_path)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let node_id: NodeId = match hex::decode(&node_id_hex).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "node_id must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&node_id) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
+    };
+    if let Some(hint) = params.get("hint") {
+        if !hint.is_empty() {
+            let _ = state.mesh_handle.dial(hint.clone()).await;
+        }
+    }
+    let grant = match caps_to_bytes(&params.get("caps").cloned()) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let rpc_req = RpcRequest::SyncDelete { from_node: state.host_node_id, path: file_path, grant };
+
+    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
+        Ok(RpcResponse::SyncAck) => StatusCode::NO_CONTENT.into_response(),
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
+        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
+    }
+}
+
 // ----- POST /tunnel -----
 //
 // Forward a local TCP port to a remote port on a target node over the mesh (TCP-over-libp2p).
@@ -2152,7 +2189,7 @@ pub async fn start(
         .route("/mesh-exec", post(mesh_exec))
         .route("/mesh-deploy", post(mesh_deploy))
         .route("/mesh-kill", post(mesh_kill))
-        .route("/mesh-sync/:node_id/*path", put(mesh_sync_put))
+        .route("/mesh-sync/:node_id/*path", put(mesh_sync_put).delete(mesh_sync_delete))
         .route("/tunnel", post(open_tunnel))
         .with_state(state);
 

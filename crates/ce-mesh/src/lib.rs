@@ -119,6 +119,14 @@ pub enum RpcRequest {
         /// Optional scoped capability grant (bincode of `SignedGrant`). See `Exec`.
         grant: Option<Vec<u8>>,
     },
+    /// Delete a single file on the remote node's home directory. `path` is relative to `~/` — the
+    /// receiver rejects any `..` components. Replies with `SyncAck`. Used by mirror to keep a true
+    /// 1:1 copy when a local file is removed or renamed.
+    SyncDelete {
+        from_node: NodeId,
+        path: String,
+        grant: Option<Vec<u8>>,
+    },
     /// Fetch a historical archive segment from a peer's local archive.
     /// The peer replies with SegmentData if it holds the segment, or Error otherwise.
     SegmentFetch {
@@ -192,6 +200,7 @@ impl RpcRequest {
         match self {
             Self::Exec { from_node, .. }
             | Self::SyncFile { from_node, .. }
+            | Self::SyncDelete { from_node, .. }
             | Self::SegmentFetch { from_node, .. }
             | Self::Deploy { from_node, .. }
             | Self::Kill { from_node, .. }

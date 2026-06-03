@@ -1488,6 +1488,7 @@ async fn handle_incoming_rpc(
     let (action, chain_bytes): (Ability, Option<Vec<u8>>) = match &request {
         RpcRequest::Exec { grant, .. } => (Ability::Exec, grant.clone()),
         RpcRequest::SyncFile { grant, .. } => (Ability::Sync, grant.clone()),
+        RpcRequest::SyncDelete { grant, .. } => (Ability::Delete, grant.clone()),
         RpcRequest::Deploy { grant, .. } => (Ability::Deploy, grant.clone()),
         RpcRequest::Kill { grant, .. } => (Ability::Kill, grant.clone()),
         _ => unreachable!("non-action RPCs are handled in the event loop"),
@@ -1591,6 +1592,41 @@ async fn handle_incoming_rpc(
                         RpcResponse::SyncAck
                     }
                     Err(e) => RpcResponse::Error(format!("write failed: {e}")),
+                }
+            })();
+
+            tokio::spawn(async move {
+                let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
+            });
+        }
+        RpcRequest::SyncDelete { path, .. } => {
+            let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+            let home_canon = home.canonicalize().unwrap_or(home.clone());
+
+            let resp = (|| -> RpcResponse {
+                if path.contains("..") {
+                    return RpcResponse::Error("path traversal not allowed".into());
+                }
+                let target = home.join(&path);
+                // Resolve via the parent so a non-existent file still canonicalizes safely.
+                let canonical = match target.parent() {
+                    Some(p) => match p.canonicalize().ok().map(|cp| cp.join(target.file_name().unwrap_or_default())) {
+                        Some(c) => c,
+                        None => return RpcResponse::SyncAck, // parent gone → nothing to delete
+                    },
+                    None => return RpcResponse::Error("invalid path".into()),
+                };
+                if !canonical.starts_with(&home_canon) {
+                    return RpcResponse::Error("path traversal not allowed".into());
+                }
+                match std::fs::remove_file(&canonical) {
+                    Ok(()) => {
+                        info!("mesh sync: deleted {}", canonical.display());
+                        RpcResponse::SyncAck
+                    }
+                    // Already absent is success — a mirror delete is idempotent.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => RpcResponse::SyncAck,
+                    Err(e) => RpcResponse::Error(format!("delete failed: {e}")),
                 }
             })();
 
