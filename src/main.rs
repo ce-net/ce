@@ -61,6 +61,10 @@ enum Commands {
         port: u16,
         #[arg(long, default_value = "8844")]
         api_port: u16,
+        /// Address the HTTP API binds to. Default 127.0.0.1 (loopback only). Use 0.0.0.0 to expose
+        /// on all interfaces — only safe behind a firewall; the api.token still gates write ops.
+        #[arg(long, default_value = "127.0.0.1")]
+        api_bind: String,
         /// Bootstrap peer multiaddrs: /ip4/1.2.3.4/tcp/4001/p2p/<peer-id>
         #[arg(short, long)]
         bootstrap: Vec<String>,
@@ -444,6 +448,27 @@ fn data_dir(override_path: Option<PathBuf>) -> PathBuf {
     })
 }
 
+/// Read the node's API token from `<data_dir>/api.token` (written by the running node). Empty if
+/// absent — read-only commands don't need it; write commands then get a 401 with guidance.
+fn read_api_token(data_dir: &std::path::Path) -> String {
+    std::fs::read_to_string(data_dir.join("api.token"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// A reqwest client that sends `Authorization: Bearer <token>` on every request, so mutating API
+/// calls are accepted by the node's auth middleware. Read-only calls work with an empty token too.
+fn api_client(token: &str) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+        headers.insert(reqwest::header::AUTHORIZATION, v);
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 // ----- Capability wallet -----
 //
 // The wallet is a local, client-side keychain of capabilities this node has been issued, keyed by a
@@ -699,9 +724,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let data_dir = data_dir(cli.data_dir);
+    // API token the running node wrote to <data_dir>/api.token; attached to every API call so
+    // mutating requests pass the node's auth middleware. Empty if the node hasn't run yet.
+    let api_token = read_api_token(&data_dir);
 
     match cli.command {
-        Commands::Start { port, api_port, bootstrap, relay, no_mine, light, tls, relay_price_per_min } => {
+        Commands::Start { port, api_port, api_bind, bootstrap, relay, no_mine, light, tls, relay_price_per_min } => {
             // CE_BOOTSTRAP_PEERS: colon-separated list of bootstrap multiaddrs.
             // Useful for Docker/systemd deployments where CLI flags are inconvenient.
             let mut bootstrap_peers = bootstrap;
@@ -740,6 +768,7 @@ async fn main() -> Result<()> {
                 relay_peers,
                 data_dir,
                 api_port,
+                api_bind,
                 mine: !no_mine,
                 prune_keep: if light { Some(ce_chain::PRUNE_KEEP_BLOCKS) } else { None },
                 tls,
@@ -843,7 +872,7 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { command } => {
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
             match command {
                 ChannelCommands::Open { host, capacity, expiry_height, api_port } => {
                     let cap = parse_credits(&capacity)?.to_string();
@@ -912,7 +941,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Name { command } => {
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
             match command {
                 NameCommands::Claim { name, api_port } => {
                     let body = serde_json::json!({ "name": name });
@@ -939,7 +968,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Discover { command } => {
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
             match command {
                 DiscoverCommands::Advertise { service, api_port } => {
                     let body = serde_json::json!({ "service": service });
@@ -1035,7 +1064,7 @@ async fn main() -> Result<()> {
         }
         Commands::Revoke { nonce, api_port } => {
             let url = format!("http://127.0.0.1:{api_port}/capabilities/revoke");
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
             let resp = client.post(&url).json(&serde_json::json!({ "nonce": nonce })).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1064,7 +1093,7 @@ async fn main() -> Result<()> {
                 "caps": cap,
                 "hint": hint,
             });
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
             let resp = client.post(&url).json(&body).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1080,7 +1109,7 @@ async fn main() -> Result<()> {
         Commands::Deploy { image, on, fund, cpu, mem, duration, cmd, grant, api_port } => {
             // Amounts cross JSON as decimal strings of base units (precision-safe).
             let bid_base = parse_credits(&fund)?.to_string();
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
 
             let (url, body) = match &on {
                 // Directed placement: route through the local node's mesh proxy to a specific host.
@@ -1131,7 +1160,7 @@ async fn main() -> Result<()> {
 
         Commands::Ps { api_port } => {
             let url = format!("http://127.0.0.1:{api_port}/jobs");
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
             let resp = client.get(&url).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1160,7 +1189,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Kill { job_id, on, grant, api_port } => {
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
             let resp = match &on {
                 // Directed: route through the local mesh proxy to a specific host.
                 Some(device) => {
@@ -1191,7 +1220,7 @@ async fn main() -> Result<()> {
             let url = format!("http://127.0.0.1:{api_port}/transfer");
             let amount_base = parse_credits(&amount)?.to_string();
             let body = serde_json::json!({ "to": to, "amount": amount_base });
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
             let resp = client.post(&url).json(&body).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1212,7 +1241,7 @@ async fn main() -> Result<()> {
             if let Some(burn) = burn_tx {
                 body["burn_tx_id_hex"] = serde_json::Value::String(burn);
             }
-            let client = reqwest::Client::new();
+            let client = api_client(&api_token);
             let resp = client.post(&url).json(&body).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();

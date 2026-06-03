@@ -101,6 +101,7 @@ async fn live_node_syncs_from_relay() {
     let config = NodeConfig {
         listen_port: 0,
         api_port: 0,
+        api_bind: "127.0.0.1".to_string(),
         bootstrap_peers: vec![
             "/ip4/178.105.145.170/tcp/4001/p2p/12D3KooWC6vyMMrtmdWEdpcMx7JZ4Ze5scUhA6BbMdYqnUDC7nr7"
                 .to_string(),
@@ -151,6 +152,7 @@ async fn live_light_node_prunes_and_archives() {
     let config = NodeConfig {
         listen_port: 0,
         api_port: 0,
+        api_bind: "127.0.0.1".to_string(),
         bootstrap_peers: vec![
             "/ip4/178.105.145.170/tcp/4001/p2p/12D3KooWC6vyMMrtmdWEdpcMx7JZ4Ze5scUhA6BbMdYqnUDC7nr7"
                 .to_string(),

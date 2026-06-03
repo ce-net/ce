@@ -46,6 +46,7 @@ fn mine_block(chain: &mut Chain, identity: &Identity) -> Block {
         txs.push(Tx::new(kind, identity.node_id(), sig));
     }
     let mut block = chain.next_block(txs, identity.node_id());
+    block.mine(&std::sync::atomic::AtomicBool::new(false));
     block.seal(identity);
     block
 }
@@ -56,6 +57,7 @@ fn forge_bad_block(chain: &mut Chain, identity: &Identity) -> Block {
     let mut block = chain.next_block(vec![], identity.node_id());
     block.index = next;
     block.prev_hash = [0xDE; 32]; // wrong
+    block.mine(&std::sync::atomic::AtomicBool::new(false));
     block.seal(identity);
     block
 }
@@ -286,6 +288,7 @@ async fn actor_heartbeat_epochs_scan() {
     let reward_tx = Tx::new(reward_kind, host.node_id(), rs);
 
     let mut block = raw.next_block(vec![reward_tx, hb_tx], host.node_id());
+    block.mine(&std::sync::atomic::AtomicBool::new(false));
     block.seal(&host);
 
     let handle = spawn_chain_actor(Chain::genesis());
@@ -452,6 +455,7 @@ async fn adversarial_wrong_index_flood_rejected() {
     for _ in 0..500 {
         let mut block = Chain::genesis().next_block(vec![], id.node_id());
         block.index = 9999; // impossible index on genesis chain
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&id);
         let h = handle.clone();
         tasks.push(tokio::spawn(async move { h.append(block).await }));
@@ -606,6 +610,7 @@ async fn adversarial_emission_overflow_rejected() {
     let bad_tx = Tx::new(bad_kind, id.node_id(), sig);
 
     let mut block = raw.next_block(vec![bad_tx], id.node_id());
+    block.mine(&std::sync::atomic::AtomicBool::new(false));
     block.seal(&id);
 
     let handle = spawn_chain_actor(Chain::genesis());
@@ -645,6 +650,7 @@ async fn actor_sequential_mining_grows_chain() {
         let block = handle.next_block(vec![], id.node_id()).await;
         // Seal locally (same as mining_loop does between next_block and append).
         let mut b = block;
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
         b.seal(&id);
         // Also add UptimeReward so the block is valid.
         let next = raw.height() + 1;
@@ -659,6 +665,7 @@ async fn actor_sequential_mining_grows_chain() {
             let sig = id.sign(&data);
             b.transactions.insert(0, Tx::new(kind, id.node_id(), sig));
             // Reseal after adding tx.
+            b.mine(&std::sync::atomic::AtomicBool::new(false));
             b.seal(&id);
         }
         let ok = handle.append(b.clone()).await;
@@ -685,6 +692,7 @@ async fn actor_peer_block_races_with_miner_correctly() {
 
     // We ask for a template (next block at index 1).
     let mut our_block = handle.next_block(vec![], our_id.node_id()).await;
+    our_block.mine(&std::sync::atomic::AtomicBool::new(false));
     our_block.seal(&our_id);
 
     // Peer races us and appends their own block 1 first.
@@ -787,6 +795,7 @@ async fn actor_settled_on_chain_finds_settle_tx() {
         let rs = payer.sign(&rd);
         let reward_tx = Tx::new(rk, payer.node_id(), rs);
         let mut block = raw.next_block(vec![reward_tx], payer.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&payer);
         raw.append(block.clone());
         assert!(handle.append(block).await, "block 1 should append");
@@ -814,6 +823,7 @@ async fn actor_settled_on_chain_finds_settle_tx() {
         let rs = payer.sign(&rd);
         let reward_tx = Tx::new(rk, payer.node_id(), rs);
         let mut block = raw.next_block(vec![reward_tx, bid_tx], payer.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&payer);
         raw.append(block.clone());
         assert!(handle.append(block).await, "block 2 (bid) should append");
@@ -841,6 +851,7 @@ async fn actor_settled_on_chain_finds_settle_tx() {
         let rs = host.sign(&rd);
         let reward_tx = Tx::new(rk, host.node_id(), rs);
         let mut block = raw.next_block(vec![reward_tx, settle_tx], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         raw.append(block.clone());
         assert!(handle.append(block).await, "block 3 (settle) should append");

@@ -177,6 +177,9 @@ pub struct NodeConfig {
     pub relay_peers: Vec<String>,
     pub data_dir: PathBuf,
     pub api_port: u16,
+    /// Address the HTTP API binds to. Defaults to `127.0.0.1` (loopback only). `0.0.0.0` exposes
+    /// it on all interfaces and is only safe behind a firewall (the api.token still gates writes).
+    pub api_bind: String,
     /// Disable the mining loop. Tests that need a non-mining observer set this to `false`.
     pub mine: bool,
     /// Mining loop interval in seconds. Default 10; set lower in tests for speed.
@@ -211,6 +214,7 @@ impl Default for NodeConfig {
             relay_peers: vec![],
             data_dir: Self::default_data_dir(),
             api_port: 0,
+            api_bind: "127.0.0.1".to_string(),
             mine: true,
             mining_interval_secs: 10,
             prune_keep: None,
@@ -365,6 +369,15 @@ impl Node {
             });
         }
 
+        // Shared "caught up with the network" flag: set by the mesh loop, read by the mining loop
+        // so a fresh node syncs the canonical chain before mining instead of forking its own.
+        // A node with NO bootstrap peers is solo — nothing to sync from — so it may mine at once.
+        // A node WITH bootstrap peers waits until it has caught up (or the grace elapses if those
+        // peers turn out to be unreachable / not ahead).
+        let synced = Arc::new(std::sync::atomic::AtomicBool::new(
+            node.config.bootstrap_peers.is_empty(),
+        ));
+
         if node.config.mine {
             let chain2 = chain.clone();
             let identity2 = identity.clone();
@@ -373,8 +386,9 @@ impl Node {
             let pool2 = pool.clone();
             let interval = node.config.mining_interval_secs;
             let block_tx2 = block_tx.clone();
+            let synced2 = synced.clone();
             tokio::spawn(async move {
-                mining_loop(chain2, identity2, handle2, chain_path2, pool2, interval, block_tx2)
+                mining_loop(chain2, identity2, handle2, chain_path2, pool2, interval, block_tx2, synced2)
                     .await;
             });
         }
@@ -436,6 +450,7 @@ impl Node {
                     app_msg_tx2,
                     relay_price,
                     relay_meter,
+                    synced.clone(),
                 )
                 .await;
             });
@@ -494,6 +509,7 @@ impl Node {
             let mesh_handle2 = mesh_handle.clone();
             let signals2 = signals.clone();
             let api_port = node.config.api_port;
+            let api_bind = node.config.api_bind.clone();
             let p2p_port = node.config.listen_port;
             let send_nonce2 = send_nonce.clone();
             let js = job_store.clone();
@@ -514,6 +530,7 @@ impl Node {
                     tx_tx,
                     send_nonce2,
                     api_port,
+                    api_bind,
                     p2p_port,
                     js,
                     pool2,
@@ -588,13 +605,25 @@ async fn mining_loop(
     mesh_handle: MeshHandle,
     chain_path: PathBuf,
     pool: TxPool,
-    interval_secs: u64,
+    poll_secs: u64,
     block_tx: broadcast::Sender<Block>,
+    synced: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let mut ticker =
-        tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let poll = std::time::Duration::from_secs(poll_secs.clamp(1, 5));
+    // Pacing floor: at most one block attempt per interval. PoW dominates timing at real network
+    // difficulty; this just stops a node from storming blocks while difficulty is still trivially
+    // low (bootstrap / tests). The first tick fires immediately so a solo node mines right away.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(1)));
     loop {
         ticker.tick().await;
+
+        // Sync-before-mine: don't build on a stale tip while peers are ahead, or we'd fork our own
+        // chain. The mesh loop flips `synced` once no known peer is higher (with a startup grace).
+        if !synced.load(Ordering::Relaxed) {
+            tokio::time::sleep(poll).await;
+            continue;
+        }
 
         let mut pending = pool.drain(100).await;
 
@@ -613,9 +642,42 @@ async fn mining_loop(
             pending.insert(0, Tx::new(kind, identity.node_id(), sig));
         }
 
-        let mut block = chain.next_block(pending, identity.node_id()).await;
-        block.seal(&identity);
-        info!("sealed block {}", block.index);
+        let block = chain.next_block(pending, identity.node_id()).await;
+
+        // Proof-of-work search runs on a blocking thread (CPU-bound — never block the executor).
+        // A watcher aborts the search if the chain tip advances (a peer's block arrived), so we
+        // don't waste work mining a now-stale block.
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_w = abort.clone();
+        let chain_w = chain.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if chain_w.height().await != current_height {
+                    abort_w.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
+        let id2 = identity.clone();
+        let mined = tokio::task::spawn_blocking(move || {
+            let mut b = block;
+            if b.mine(&abort) {
+                b.seal(&id2);
+                Some(b)
+            } else {
+                None
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        watcher.abort();
+
+        let Some(block) = mined else {
+            continue; // tip advanced mid-search; rebuild on the new tip next round
+        };
+        info!("mined block {} (difficulty {} bits)", block.index, block.difficulty);
 
         if chain.append(block.clone()).await {
             pool.remove_included(&block).await;
@@ -623,13 +685,15 @@ async fn mining_loop(
                 warn!("save chain: {e}");
             }
             let _ = block_tx.send(block.clone());
+            let _ = mesh_handle.broadcast_block(&block).await;
+            let snap = chain.sync_snap().await;
+            let _ = mesh_handle
+                .announce_height(identity.node_id(), snap.height, snap.tip_hash, snap.oldest)
+                .await;
+        } else {
+            // Lost the race (tip moved between search and append). Brief backoff, then retry.
+            tokio::time::sleep(poll).await;
         }
-
-        let _ = mesh_handle.broadcast_block(&block).await;
-        let snap = chain.sync_snap().await;
-        let _ = mesh_handle
-            .announce_height(identity.node_id(), snap.height, snap.tip_hash, snap.oldest)
-            .await;
     }
 }
 
@@ -779,7 +843,10 @@ async fn mesh_event_loop(
     app_msg_tx: broadcast::Sender<AppMessage>,
     relay_price_per_min: Option<u128>,
     relay_meter: RelayMeter,
+    synced: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    use std::sync::atomic::Ordering as SyncedOrdering;
+    let mut sync_ticks: u32 = 0;
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_oldest: HashMap<NodeId, u64> = HashMap::new();
@@ -799,8 +866,11 @@ async fn mesh_event_loop(
 
     let mut segment_announce_ticker =
         tokio::time::interval(std::time::Duration::from_secs(300));
+    // Drives both sync-request retries (when behind) and the "caught up → may mine" signal.
+    // Kept short so a solo node starts mining within a couple of seconds while a joining node
+    // still has time to learn it is behind (via PeerHeight) before the grace elapses.
     let mut sync_retry_ticker =
-        tokio::time::interval(std::time::Duration::from_secs(15));
+        tokio::time::interval(std::time::Duration::from_secs(2));
 
     loop {
         let event = tokio::select! {
@@ -813,11 +883,17 @@ async fn mesh_event_loop(
                 continue;
             }
             _ = sync_retry_ticker.tick() => {
+                sync_ticks += 1;
                 let our_height = chain.height().await;
                 let best = peer_heights.values().copied().max().unwrap_or(0);
                 if best > our_height {
                     debug!("sync retry: we={our_height}, best peer={best}");
                     let _ = mesh_handle.send_sync_request(our_node_id, our_height).await;
+                    synced.store(false, SyncedOrdering::Relaxed);
+                } else if sync_ticks >= 2 || !peer_heights.is_empty() {
+                    // Caught up with a known peer, or the startup grace (~15s) elapsed with no peer
+                    // ahead — safe to mine on our tip without forking the network chain.
+                    synced.store(true, SyncedOrdering::Relaxed);
                 }
                 continue;
             }
@@ -874,6 +950,11 @@ async fn mesh_event_loop(
                 }
                 peer_heights.insert(node_id, height);
                 peer_oldest.insert(node_id, oldest_block);
+                // If no known peer is ahead of us, we're caught up — allow mining immediately
+                // (don't wait for the 15s grace tick).
+                if peer_heights.values().copied().max().unwrap_or(0) <= snap.height {
+                    synced.store(true, SyncedOrdering::Relaxed);
+                }
                 if height > snap.height {
                     let from = if tip_hash != snap.tip_hash && snap.height > 0 {
                         0

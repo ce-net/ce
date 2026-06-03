@@ -9,6 +9,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const DIFFICULTY_WINDOW: u64 = 2016;
 /// Target inter-block time in seconds.
 pub const TARGET_BLOCK_SECS: u64 = 600;
+/// Minimum PoW difficulty (leading-zero bits). Mainnet floor; tests may mine at this level cheaply.
+pub const MIN_DIFFICULTY: u8 = 8;
+/// Difficulty genesis starts at. Equal to the floor.
+pub const GENESIS_DIFFICULTY: u8 = MIN_DIFFICULTY;
+/// Max per-window difficulty swing, as bits (±2 bits = the 4× clamp Bitcoin uses, on a log scale).
+pub const MAX_DIFFICULTY_STEP: u8 = 2;
+/// Number of recent blocks whose median timestamp forms the lower bound for a new block's time.
+pub const MEDIAN_TIME_SPAN: usize = 11;
+/// A block's timestamp may be at most this far in the future (seconds) — bounds timewarp attacks.
+pub const MAX_FUTURE_DRIFT_SECS: u64 = 2 * 3600;
+/// On-disk chain format version. Bumped to 2 for per-block PoW difficulty (a clean break — old
+/// chains are not migrated; nodes wipe `<data_dir>/chain` and re-sync). The byte prefixes the file.
+pub const CHAIN_FORMAT_VERSION: u8 = 2;
 /// Minimum blocks to retain after a prune. Covers EXPIRY_BLOCKS + difficulty window.
 pub const PRUNE_KEEP_BLOCKS: u64 = 2880;
 
@@ -41,26 +54,34 @@ pub fn should_hold_segment(node_id: &NodeId, segment_id: u64, density: f64) -> b
     (val as f64 / u32::MAX as f64) < density
 }
 
-/// Persist a segment's blocks to the archive directory (bincode + zstd level 3).
+/// Persist a segment's blocks to the archive directory: `[CHAIN_FORMAT_VERSION] ++ zstd(bincode)`.
 pub fn save_segment(archive_dir: &Path, segment_id: u64, blocks: &[Block]) -> Result<()> {
     std::fs::create_dir_all(archive_dir)?;
     let path = archive_dir.join(format!("segment_{segment_id}.bin"));
     let raw = bincode::serialize(blocks).map_err(|e| anyhow!("bincode: {e}"))?;
-    let compressed = zstd::encode_all(raw.as_slice(), 3).map_err(|e| anyhow!("zstd: {e}"))?;
-    std::fs::write(path, compressed)?;
+    let mut out = vec![CHAIN_FORMAT_VERSION];
+    out.extend_from_slice(&zstd::encode_all(raw.as_slice(), 3).map_err(|e| anyhow!("zstd: {e}"))?);
+    std::fs::write(path, out)?;
     Ok(())
 }
 
-/// Load a segment from the archive directory. Returns None if the file doesn't exist.
+/// Load a segment from the archive directory. Returns None if the file doesn't exist or was
+/// written in an incompatible (pre-PoW) format — the node then re-fetches it from the network.
 pub fn load_segment(archive_dir: &Path, segment_id: u64) -> Result<Option<Vec<Block>>> {
     let path = archive_dir.join(format!("segment_{segment_id}.bin"));
     if !path.exists() {
         return Ok(None);
     }
-    let compressed = std::fs::read(&path)?;
-    let raw = zstd::decode_all(compressed.as_slice()).map_err(|e| anyhow!("zstd: {e}"))?;
-    let blocks: Vec<Block> = bincode::deserialize(&raw).map_err(|e| anyhow!("bincode: {e}"))?;
-    Ok(Some(blocks))
+    let data = std::fs::read(&path)?;
+    match data.split_first() {
+        Some((&v, body)) if v == CHAIN_FORMAT_VERSION => {
+            let raw = zstd::decode_all(body).map_err(|e| anyhow!("zstd: {e}"))?;
+            let blocks: Vec<Block> =
+                bincode::deserialize(&raw).map_err(|e| anyhow!("bincode: {e}"))?;
+            Ok(Some(blocks))
+        }
+        _ => Ok(None), // stale/incompatible segment — treat as absent
+    }
 }
 
 /// Return all segment IDs present in the archive directory (sorted).
@@ -101,6 +122,38 @@ pub fn has_leading_zeros(hash: &[u8; 32], bits: u8) -> bool {
         }
     }
     true
+}
+
+/// The PoW difficulty (leading-zero bits) the block extending `blocks` must declare. Pure: depends
+/// only on the existing chain. Difficulty holds steady within a window and retargets on
+/// `DIFFICULTY_WINDOW` boundaries toward `TARGET_BLOCK_SECS`, clamped to ±`MAX_DIFFICULTY_STEP`
+/// bits (the log-scale equivalent of Bitcoin's 4× clamp) and floored at `MIN_DIFFICULTY`.
+pub fn expected_difficulty(blocks: &[Block]) -> u8 {
+    let Some(tip) = blocks.last() else {
+        return GENESIS_DIFFICULTY;
+    };
+    let next_height = tip.index + 1;
+    let window = DIFFICULTY_WINDOW as usize;
+    // Retarget only on window boundaries, and only with a full window of retained history.
+    if next_height % DIFFICULTY_WINDOW != 0 || blocks.len() < window {
+        return tip.difficulty.max(MIN_DIFFICULTY);
+    }
+    let first = &blocks[blocks.len() - window];
+    let actual = tip.timestamp.saturating_sub(first.timestamp).max(1);
+    let target = DIFFICULTY_WINDOW * TARGET_BLOCK_SECS;
+    let cur = tip.difficulty;
+    let next = if actual < target / 4 {
+        cur.saturating_add(MAX_DIFFICULTY_STEP) // far too fast → much harder
+    } else if actual < target {
+        cur.saturating_add(1) // a bit fast → slightly harder
+    } else if actual > target.saturating_mul(4) {
+        cur.saturating_sub(MAX_DIFFICULTY_STEP) // far too slow → much easier
+    } else if actual > target {
+        cur.saturating_sub(1) // a bit slow → slightly easier
+    } else {
+        cur
+    };
+    next.max(MIN_DIFFICULTY)
 }
 
 mod sig_serde {
@@ -284,31 +337,69 @@ pub struct Block {
     pub timestamp: u64,
     pub transactions: Vec<Tx>,
     pub nonce: u64,
+    /// Proof-of-work target for THIS block: the number of leading zero bits its `hash()` must
+    /// have. Deterministically fixed by the difficulty retarget (`expected_difficulty`); a miner
+    /// cannot lower it (validators recompute the expected value and reject mismatches).
+    pub difficulty: u8,
     pub miner: NodeId,
     #[serde(with = "sig_serde")]
     pub sig: [u8; 64],
 }
 
 impl Block {
+    /// The proof-of-work hash: SHA256 of the header (everything except the signature). PoW is
+    /// searched over `nonce` against this hash, independently of signing — so sealing the block
+    /// after a solve doesn't invalidate the work (Bitcoin-style header PoW).
     pub fn hash(&self) -> [u8; 32] {
-        let data = bincode::serialize(self).unwrap_or_default();
-        Sha256::digest(data).into()
+        Sha256::digest(self.header_bytes()).into()
     }
 
     fn header_bytes(&self) -> Vec<u8> {
-        // Sign all fields except sig itself to avoid a circular dependency.
+        // Sign/hash all fields except sig itself to avoid a circular dependency. `difficulty` is
+        // included so it is both covered by PoW and bound by the signature (a relayer can't flip it).
         bincode::serialize(&(
             self.index,
             &self.prev_hash,
             self.timestamp,
             &self.transactions,
             self.nonce,
+            self.difficulty,
             &self.miner,
         ))
         .unwrap_or_default()
     }
 
-    /// Sign the block header. Must be called before Chain::append.
+    /// Cumulative-work contribution of this block: `2^difficulty` (saturating). Used for
+    /// work-based fork choice — a chain's weight is the sum of its blocks' work.
+    pub fn work(&self) -> u128 {
+        if self.difficulty >= 127 {
+            u128::MAX
+        } else {
+            1u128 << self.difficulty
+        }
+    }
+
+    /// True if the block's PoW hash satisfies its declared difficulty.
+    pub fn meets_difficulty(&self) -> bool {
+        has_leading_zeros(&self.hash(), self.difficulty)
+    }
+
+    /// Search `nonce` until the hash meets `self.difficulty`, or `abort` is set (tip advanced).
+    /// CPU-bound — callers must run this in `tokio::task::spawn_blocking`. Returns true if solved.
+    pub fn mine(&mut self, abort: &std::sync::atomic::AtomicBool) -> bool {
+        use std::sync::atomic::Ordering;
+        loop {
+            if abort.load(Ordering::Relaxed) {
+                return false;
+            }
+            if has_leading_zeros(&self.hash(), self.difficulty) {
+                return true;
+            }
+            self.nonce = self.nonce.wrapping_add(1);
+        }
+    }
+
+    /// Sign the block header. Must be called before Chain::append (after mining fixes the nonce).
     pub fn seal(&mut self, identity: &Identity) {
         self.sig = identity.sign(&self.header_bytes());
     }
@@ -352,8 +443,6 @@ const EMISSION_BASE: u128 = 1_000 * CREDIT;
 /// Hard cap on total emitted supply: 21 billion credits, in base units (2.1 × 10^28).
 pub const SUPPLY_CAP: u128 = 21_000_000_000 * CREDIT;
 
-/// zstd magic bytes (little-endian frame magic).
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Per-node interaction history derived from the chain — the **reputation substrate**.
 /// CE does not score trust; it guarantees these immutable facts, and apps compute their own
@@ -435,6 +524,11 @@ pub struct Chain {
     /// for full revocation history. Capability expiry bounds the residual risk. (v0.)
     #[serde(skip, default)]
     revoked: std::collections::HashSet<(NodeId, u64)>,
+
+    /// Total proof-of-work in `blocks` (sum of `2^difficulty`). Drives work-based fork choice —
+    /// the heaviest valid chain wins, not the longest. Rebuilt from blocks (not persisted).
+    #[serde(skip, default)]
+    cumulative_work: u128,
 }
 
 impl Chain {
@@ -445,12 +539,14 @@ impl Chain {
             timestamp: 0,
             transactions: vec![],
             nonce: 0,
+            difficulty: GENESIS_DIFFICULTY,
             miner: [0u8; 32],
             sig: [0u8; 64],
         };
+        let genesis_work = genesis.work();
         Self {
             blocks: vec![genesis],
-            difficulty: 0,
+            difficulty: GENESIS_DIFFICULTY,
             checkpoint: None,
             balances: std::collections::HashMap::new(),
             heartbeat_max_epoch: std::collections::HashMap::new(),
@@ -461,6 +557,7 @@ impl Chain {
             node_stats: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
             revoked: std::collections::HashSet::new(),
+            cumulative_work: genesis_work,
         }
     }
 
@@ -482,6 +579,7 @@ impl Chain {
         self.names.clear();
         // Rebuilt from available blocks (same prune caveat as names/node_stats).
         self.revoked.clear();
+        self.cumulative_work = 0;
 
         // Seed caches from checkpoint if present.
         if let Some(ref cp) = self.checkpoint {
@@ -504,8 +602,15 @@ impl Chain {
         self.revoked.contains(&(*issuer, nonce))
     }
 
+    /// All revoked `(issuer, nonce)` pairs. Exposed so apps (e.g. rdev) can consult on-chain
+    /// revocation when authorizing capability chains.
+    pub fn revoked_pairs(&self) -> Vec<(NodeId, u64)> {
+        self.revoked.iter().copied().collect()
+    }
+
     /// Apply one block's transactions to the incremental caches.
     fn apply_block_to_cache(&mut self, block: &Block) {
+        self.cumulative_work = self.cumulative_work.saturating_add(block.work());
         for (pos, tx) in block.transactions.iter().enumerate() {
             match &tx.kind {
                 TxKind::Transfer { from, to, amount } => {
@@ -657,6 +762,21 @@ impl Chain {
             return false;
         }
         if !block.verify_seal() {
+            return false;
+        }
+        // Proof-of-work consensus. The block must declare exactly the difficulty the retarget
+        // schedule requires (a miner can't self-lower it) AND its hash must satisfy that difficulty
+        // (real work was burned). Without this, blocks are free to mint — and forgeable credits buy
+        // compute on the whole fleet. This is the single chokepoint; try_reorg routes through here.
+        if block.difficulty != expected_difficulty(&self.blocks) {
+            return false;
+        }
+        if !block.meets_difficulty() {
+            return false;
+        }
+        // Timestamp must exceed the median of recent blocks and not be far in the future — bounds
+        // timewarp attacks against the difficulty retarget.
+        if !self.timestamp_ok(&block) {
             return false;
         }
         // Reject oversized blocks before paying signature-verification cost.
@@ -983,9 +1103,38 @@ impl Chain {
                 }
             }
         }
+        // Track the tip's difficulty so `/status` and the chain actor report the live target.
+        self.difficulty = block.difficulty;
         self.apply_block_to_cache(&block);
         self.blocks.push(block);
         true
+    }
+
+    /// Median timestamp of the most recent `MEDIAN_TIME_SPAN` blocks — the lower bound a new
+    /// block's timestamp must exceed (Bitcoin's median-time-past rule).
+    fn median_time_past(&self) -> u64 {
+        let mut times: Vec<u64> = self
+            .blocks
+            .iter()
+            .rev()
+            .take(MEDIAN_TIME_SPAN)
+            .map(|b| b.timestamp)
+            .collect();
+        times.sort_unstable();
+        times.get(times.len() / 2).copied().unwrap_or(0)
+    }
+
+    /// A block's timestamp must be strictly greater than the median-time-past and no more than
+    /// `MAX_FUTURE_DRIFT_SECS` ahead of now.
+    fn timestamp_ok(&self, block: &Block) -> bool {
+        if block.timestamp <= self.median_time_past() {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        block.timestamp <= now.saturating_add(MAX_FUTURE_DRIFT_SECS)
     }
 
     /// Attempt a chain reorganisation using a batch of candidate blocks.
@@ -1043,9 +1192,18 @@ impl Chain {
             }
         }
 
-        // Only reorg if the candidate suffix is strictly longer.
-        let our_suffix_len = self.blocks.len().saturating_sub(fork_pos + 1);
-        if new_suffix.len() <= our_suffix_len {
+        // Work-based fork choice: adopt the candidate only if its suffix carries strictly more
+        // proof-of-work than ours from the shared fork point (prefix work cancels). This is the
+        // real Nakamoto rule — the heaviest chain wins, NOT the one with the most blocks. A long
+        // low-difficulty fork therefore loses to a shorter higher-difficulty chain, and a tie keeps
+        // what we already have (first-seen), so honest miners converge instead of flapping.
+        let our_suffix_work: u128 = self.blocks[fork_pos + 1..]
+            .iter()
+            .fold(0u128, |acc, b| acc.saturating_add(b.work()));
+        let cand_suffix_work: u128 = new_suffix
+            .iter()
+            .fold(0u128, |acc, b| acc.saturating_add(b.work()));
+        if cand_suffix_work <= our_suffix_work {
             return false;
         }
 
@@ -1064,6 +1222,7 @@ impl Chain {
             node_stats: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
             revoked: std::collections::HashSet::new(),
+            cumulative_work: 0,
         };
         reorg_chain.rebuild_caches();
         for block in new_suffix {
@@ -1103,6 +1262,7 @@ impl Chain {
             node_stats: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
             revoked: std::collections::HashSet::new(),
+            cumulative_work: 0,
         };
         snap.rebuild_caches();
 
@@ -1164,15 +1324,21 @@ impl Chain {
     }
 
     pub fn next_block(&self, transactions: Vec<Tx>, miner: NodeId) -> Block {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Strictly advance past the tip so timestamps are monotonic and always clear the
+        // median-time-past lower bound — even when blocks are produced faster than 1/sec (low
+        // difficulty / tests). In normal operation (~10 min/block) `now` dominates.
+        let timestamp = now.max(self.tip().timestamp + 1);
         Block {
             index: self.tip().index + 1,
             prev_hash: self.tip_hash(),
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp,
             transactions,
             nonce: 0,
+            difficulty: expected_difficulty(&self.blocks),
             miner,
             sig: [0u8; 64],
         }
@@ -1207,17 +1373,24 @@ impl Chain {
         if current_seg == 0 { None } else { Some(current_seg - 1) }
     }
 
-    /// Load chain from disk. Supports bincode+zstd (current) and plain JSON (legacy migration).
+    /// Load chain from disk. Files are `[CHAIN_FORMAT_VERSION] ++ zstd(bincode(Chain))`. Any other
+    /// leading byte is an incompatible (pre-PoW) format: we reject it, and `load_or_genesis` then
+    /// starts a fresh chain. This is the clean break for the per-block-difficulty format — old
+    /// chains are not migrated; operators wipe `<data_dir>/chain` and re-sync from the network.
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)?;
-        let mut chain: Chain = if data.starts_with(&ZSTD_MAGIC) {
-            let decompressed =
-                zstd::decode_all(&data[..]).map_err(|e| anyhow!("zstd decompress: {e}"))?;
-            bincode::deserialize(&decompressed).map_err(|e| anyhow!("bincode deserialize: {e}"))?
-        } else {
-            // Legacy JSON — migrate transparently on next save.
-            serde_json::from_slice(&data).map_err(|e| anyhow!("json deserialize: {e}"))?
+        let Some((&version, body)) = data.split_first() else {
+            return Err(anyhow!("chain file is empty"));
         };
+        if version != CHAIN_FORMAT_VERSION {
+            return Err(anyhow!(
+                "incompatible chain format (found 0x{version:02x}, need v{CHAIN_FORMAT_VERSION}); \
+                 wipe the chain dir and re-sync"
+            ));
+        }
+        let decompressed = zstd::decode_all(body).map_err(|e| anyhow!("zstd decompress: {e}"))?;
+        let mut chain: Chain =
+            bincode::deserialize(&decompressed).map_err(|e| anyhow!("bincode deserialize: {e}"))?;
         if chain.blocks.is_empty() && chain.checkpoint.is_none() {
             return Err(anyhow!("chain file is empty"));
         }
@@ -1225,15 +1398,18 @@ impl Chain {
         Ok(chain)
     }
 
-    /// Save chain to disk as bincode + zstd (level 3). ~8x smaller than JSON.
+    /// Save chain to disk as `[CHAIN_FORMAT_VERSION] ++ zstd(bincode)` (level 3).
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let bin = bincode::serialize(self).map_err(|e| anyhow!("bincode serialize: {e}"))?;
+        let mut out = Vec::with_capacity(bin.len() / 2 + 1);
+        out.push(CHAIN_FORMAT_VERSION);
         let compressed =
             zstd::encode_all(&bin[..], 3).map_err(|e| anyhow!("zstd compress: {e}"))?;
-        std::fs::write(path, compressed)?;
+        out.extend_from_slice(&compressed);
+        std::fs::write(path, out)?;
         Ok(())
     }
 
@@ -1277,6 +1453,7 @@ mod tests {
         let next_index = chain.tip().index + 1;
         let reward = signed_uptime_reward(identity, next_index);
         let mut block = chain.next_block(vec![reward], identity.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(identity);
         chain.append(block)
     }
@@ -1306,6 +1483,7 @@ mod tests {
         let chain = Chain::genesis();
         let mut block = chain.next_block(vec![], id.node_id());
         assert!(!block.verify_seal(), "unsigned block should not verify");
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&id);
         assert!(block.verify_seal());
     }
@@ -1319,7 +1497,7 @@ mod tests {
         assert_eq!(chain.blocks.len(), 1);
         assert_eq!(chain.tip().prev_hash, [0u8; 32]);
         assert_eq!(chain.tip().index, 0);
-        assert_eq!(chain.difficulty, 0);
+        assert_eq!(chain.difficulty, GENESIS_DIFFICULTY);
     }
 
     #[test]
@@ -1336,6 +1514,7 @@ mod tests {
         let id = make_identity("idx");
         let mut block = chain.next_block(vec![], id.node_id());
         block.index = 99;
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&id);
         assert!(!chain.append(block));
         assert_eq!(chain.height(), 0);
@@ -1347,6 +1526,7 @@ mod tests {
         let id = make_identity("prev");
         let reward = signed_uptime_reward(&id, 1);
         let mut block = chain.next_block(vec![reward], id.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&id);
         block.prev_hash = [0xff; 32]; // corrupt after sealing
         assert!(!chain.append(block));
@@ -1358,6 +1538,7 @@ mod tests {
         let id = make_identity("badseal");
         let other_id = make_identity("other");
         let mut block = chain.next_block(vec![], id.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&other_id); // wrong identity seals the block
         assert!(!chain.append(block));
     }
@@ -1369,6 +1550,7 @@ mod tests {
         let mut tx = signed_transfer(&id, [0u8; 32], 100);
         tx.sig = [0xff; 64]; // corrupt tx sig
         let mut block = chain.next_block(vec![tx], id.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&id);
         assert!(!chain.append(block));
     }
@@ -1413,6 +1595,7 @@ mod tests {
         let tx = signed_transfer(&alice, bob.node_id(), 10);
         let reward = signed_uptime_reward(&alice, 3);
         let mut block = chain.next_block(vec![reward, tx], alice.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&alice);
         chain.append(block);
 
@@ -1507,6 +1690,7 @@ mod tests {
     fn append_with(chain: &mut Chain, miner: &Identity, tx: Tx) -> bool {
         let reward = signed_uptime_reward(miner, chain.tip().index + 1);
         let mut b = chain.next_block(vec![reward, tx], miner.node_id());
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
         b.seal(miner);
         chain.append(b)
     }
@@ -1646,6 +1830,7 @@ mod tests {
         let open = signed_channel_open(&payer, [8u8; 32], host.node_id(), spend, 100_000);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut b = chain.next_block(vec![reward, transfer, open], host.node_id());
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
         b.seal(&host);
         assert!(!chain.append(b), "transfer + channel-open exceeding balance must be rejected");
         assert_eq!(chain.balance(&payer.node_id()), bal as i128, "balance unchanged");
@@ -1663,12 +1848,14 @@ mod tests {
         let bid = signed_job_bid(&payer, job_id, 1_000);
         let r1 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut b = chain.next_block(vec![r1, bid], host.node_id());
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
         b.seal(&host);
         assert!(chain.append(b));
 
         let settle = signed_job_settle(&host, &payer, job_id, 600);
         let r2 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut b = chain.next_block(vec![r2, settle], host.node_id());
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
         b.seal(&host);
         assert!(chain.append(b));
 
@@ -1689,6 +1876,7 @@ mod tests {
         let hb = signed_heartbeat(&host, cell.node_id(), 50, 1);
         let r3 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut b = chain.next_block(vec![r3, hb], host.node_id());
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
         b.seal(&host);
         assert!(chain.append(b));
 
@@ -1738,6 +1926,7 @@ mod tests {
         let sig = id.sign(&data);
         let tx = Tx::new(kind, id.node_id(), sig);
         let mut block = chain.next_block(vec![tx], id.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&id);
         assert!(!chain.append(block), "block with wrong UptimeReward amount must be rejected");
     }
@@ -1913,6 +2102,7 @@ mod tests {
         let bid = signed_job_bid(&payer, job_id, 1_000);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
 
@@ -1922,6 +2112,7 @@ mod tests {
         let settle = signed_job_settle(&host, &payer, job_id, cost);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, settle], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block), "settle should be accepted");
 
@@ -1945,6 +2136,7 @@ mod tests {
         let job_id = [1u8; 32];
         let bid = signed_job_bid(&payer, job_id, 500);
         let mut block = chain.next_block(vec![bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
 
@@ -1956,6 +2148,7 @@ mod tests {
         settle.sig = host.sign(&data);
 
         let mut block = chain.next_block(vec![settle], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "settle with bad payer_sig must be rejected");
     }
@@ -1969,6 +2162,7 @@ mod tests {
 
         let settle = signed_job_settle(&host, &payer, [9u8; 32], 50);
         let mut block = chain.next_block(vec![settle], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "settle without a prior bid must be rejected");
     }
@@ -1984,6 +2178,7 @@ mod tests {
         let bid = signed_job_bid(&payer, job_id, 1_000);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "bid with insufficient free balance must be rejected");
     }
@@ -1999,12 +2194,14 @@ mod tests {
         let bid = signed_job_bid(&payer, job_id, 100);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
 
         let settle = signed_job_settle(&host, &payer, job_id, 200);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, settle], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "settle cost exceeding bid must be rejected");
     }
@@ -2018,6 +2215,7 @@ mod tests {
         let job_id = [4u8; 32];
         let bid = signed_job_bid(&id, job_id, 500);
         let mut block = chain.next_block(vec![bid], id.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&id);
         assert!(chain.append(block));
 
@@ -2036,6 +2234,7 @@ mod tests {
         let settle = Tx::new(kind, id.node_id(), sig);
 
         let mut block = chain.next_block(vec![settle], id.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&id);
         assert!(!chain.append(block));
     }
@@ -2050,16 +2249,19 @@ mod tests {
         let job_id = [5u8; 32];
         let bid = signed_job_bid(&payer, job_id, 1_000);
         let mut block = chain.next_block(vec![bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
 
         let settle = signed_job_settle(&host, &payer, job_id, 100);
         let mut block = chain.next_block(vec![settle], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
 
         let dup = signed_job_settle(&host, &payer, job_id, 100);
         let mut block = chain.next_block(vec![dup], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block));
     }
@@ -2083,6 +2285,7 @@ mod tests {
         let bid = signed_job_bid(&payer, job_id, 500);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         let bid_block = chain.tip().index + 1;
         assert!(chain.append(block));
@@ -2092,6 +2295,7 @@ mod tests {
         let expire2 = signed_job_expire(&payer, job_id);
         let reward2 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut early_block = chain.next_block(vec![reward2, expire2], host.node_id());
+        early_block.mine(&std::sync::atomic::AtomicBool::new(false));
         early_block.seal(&host);
         assert!(!chain.append(early_block), "expire before EXPIRY_BLOCKS must be rejected");
         assert_eq!(chain.locked_balance(&payer.node_id()), 500, "lock not released on failed expire");
@@ -2108,6 +2312,7 @@ mod tests {
         let expire = signed_job_expire(&payer, [99u8; 32]);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, expire], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "expire without a prior bid must be rejected");
     }
@@ -2123,6 +2328,7 @@ mod tests {
         let bid = signed_job_bid(&payer, job_id, 500);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
         assert_eq!(chain.locked_balance(&payer.node_id()), 500);
@@ -2130,6 +2336,7 @@ mod tests {
         let settle = signed_job_settle(&host, &payer, job_id, 300);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, settle], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
         assert_eq!(chain.locked_balance(&payer.node_id()), 0, "locked balance must clear after settle");
@@ -2154,6 +2361,7 @@ mod tests {
         let hb = signed_heartbeat(&host, cell.node_id(), 100, 0);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, hb], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block), "valid heartbeat must be accepted");
         assert_eq!(chain.balance(&cell.node_id()), before - 100);
@@ -2170,24 +2378,28 @@ mod tests {
         let hb = signed_heartbeat(&host, cell.node_id(), 100, 5);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, hb], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
 
         let hb2 = signed_heartbeat(&host, cell.node_id(), 100, 5);
         let reward2 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block2 = chain.next_block(vec![reward2, hb2], host.node_id());
+        block2.mine(&std::sync::atomic::AtomicBool::new(false));
         block2.seal(&host);
         assert!(!chain.append(block2), "replayed heartbeat epoch must be rejected");
 
         let hb3 = signed_heartbeat(&host, cell.node_id(), 100, 3);
         let reward3 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block3 = chain.next_block(vec![reward3, hb3], host.node_id());
+        block3.mine(&std::sync::atomic::AtomicBool::new(false));
         block3.seal(&host);
         assert!(!chain.append(block3), "earlier epoch must be rejected");
 
         let hb4 = signed_heartbeat(&host, cell.node_id(), 100, 6);
         let reward4 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block4 = chain.next_block(vec![reward4, hb4], host.node_id());
+        block4.mine(&std::sync::atomic::AtomicBool::new(false));
         block4.seal(&host);
         assert!(chain.append(block4), "higher epoch must be accepted");
     }
@@ -2201,6 +2413,7 @@ mod tests {
         let hb = signed_heartbeat(&host, cell.node_id(), 100, 0);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, hb], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "heartbeat with insufficient cell balance must be rejected");
     }
@@ -2222,6 +2435,7 @@ mod tests {
         let bad_hb = Tx::new(kind, host.node_id(), sig);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bad_hb], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "heartbeat self-pay must be rejected");
     }
@@ -2245,6 +2459,7 @@ mod tests {
         let bad_hb = Tx::new(kind, attacker.node_id(), bad_sig);
         let reward = signed_uptime_reward(&attacker, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bad_hb], attacker.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&attacker);
         assert!(!chain.append(block), "heartbeat with wrong signer must be rejected");
     }
@@ -2267,6 +2482,7 @@ mod tests {
         let rev = signed_revoke_cap(&issuer, 7);
         let reward = signed_uptime_reward(&issuer, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, rev], issuer.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&issuer);
         assert!(chain.append(block), "issuer-signed revoke must be accepted");
         assert!(chain.is_revoked(&issuer.node_id(), 7));
@@ -2286,6 +2502,7 @@ mod tests {
         let bad = Tx::new(kind, attacker.node_id(), attacker.sign(&data));
         let reward = signed_uptime_reward(&attacker, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bad], attacker.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&attacker);
         assert!(!chain.append(block), "revoke not signed by the issuer must be rejected");
         assert!(!chain.is_revoked(&issuer.node_id(), 9));
@@ -2314,6 +2531,7 @@ mod tests {
         let bad_bid = Tx::new(kind, host.node_id(), bad_sig);
 
         let mut block = chain.next_block(vec![bad_bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "bid signed by non-payer must be rejected");
     }
@@ -2327,6 +2545,7 @@ mod tests {
             let next_idx = fork.tip().index + 1;
             let reward = signed_uptime_reward(miner, next_idx);
             let mut block = fork.next_block(vec![reward], miner.node_id());
+            block.mine(&std::sync::atomic::AtomicBool::new(false));
             block.seal(miner);
             assert!(fork.append(block.clone()), "fork block must be valid");
             new_blocks.push(block);
@@ -2395,9 +2614,11 @@ mod tests {
             timestamp: 0,
             transactions: vec![],
             nonce: 0,
+            difficulty: GENESIS_DIFFICULTY,
             miner: b.node_id(),
             sig: [0u8; 64],
         };
+        ghost.mine(&std::sync::atomic::AtomicBool::new(false));
         ghost.seal(&b);
         assert!(!chain.try_reorg(vec![ghost]));
     }
@@ -2417,6 +2638,7 @@ mod tests {
         let r1 = signed_uptime_reward(&miner, 1);
         let r2 = signed_uptime_reward(&second, 1);
         let mut block = chain.next_block(vec![r1, r2], miner.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&miner);
         assert!(!chain.append(block), "block with two UptimeRewards must be rejected");
         assert_eq!(chain.height(), 0);
@@ -2443,6 +2665,7 @@ mod tests {
         let transfer = signed_transfer(&miner, victim.node_id(), spend_amount);
         let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, transfer.clone()], miner.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&miner);
         assert!(chain.append(block), "first transfer must succeed");
 
@@ -2452,6 +2675,7 @@ mod tests {
         // Replay: include the exact same Transfer tx in block 5.
         let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, transfer], miner.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&miner);
         assert!(!chain.append(block), "replayed tx must be rejected even with sufficient balance");
     }
@@ -2471,6 +2695,7 @@ mod tests {
             vec![reward, transfer.clone(), transfer],
             miner.node_id(),
         );
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&miner);
         assert!(!chain.append(block), "block with duplicate tx must be rejected");
     }
@@ -2496,6 +2721,7 @@ mod tests {
         let bad_hb = Tx::new(kind, host.node_id(), sig);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bad_hb], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "epoch=u64::MAX heartbeat must be rejected");
     }
@@ -2516,6 +2742,7 @@ mod tests {
         let bid1 = signed_job_bid(&payer, job_id, 500);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bid1], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
         assert_eq!(chain.locked_balance(&payer.node_id()), 500);
@@ -2524,6 +2751,7 @@ mod tests {
         let bid2 = signed_job_bid(&payer, job_id, 100);
         let reward2 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block2 = chain.next_block(vec![reward2, bid2], host.node_id());
+        block2.mine(&std::sync::atomic::AtomicBool::new(false));
         block2.seal(&host);
         assert!(!chain.append(block2), "rebid for open job_id must be rejected");
         // Locked balance must be unchanged.
@@ -2547,6 +2775,7 @@ mod tests {
         let bid = signed_job_bid(&payer, job_id, 500);
         let reward = signed_uptime_reward(&real_host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, bid], real_host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&real_host);
         assert!(chain.append(block));
 
@@ -2569,6 +2798,7 @@ mod tests {
 
         let reward2 = signed_uptime_reward(&mallory, chain.tip().index + 1);
         let mut block2 = chain.next_block(vec![reward2, bad_settle], mallory.node_id());
+        block2.mine(&std::sync::atomic::AtomicBool::new(false));
         block2.seal(&mallory);
         assert!(!chain.append(block2), "settle hijack with stolen payer sig must be rejected");
         // Payer's credits must remain locked.
@@ -2599,6 +2829,7 @@ mod tests {
             let r1 = signed_uptime_reward(&attacker, next_idx);
             let r2 = signed_uptime_reward(&colluder, next_idx);
             let mut block = shadow.next_block(vec![r1, r2], attacker.node_id());
+            block.mine(&std::sync::atomic::AtomicBool::new(false));
             block.seal(&attacker);
             // Don't push through shadow.append — just collect the blocks.
             shadow_blocks.push(block);
@@ -2631,6 +2862,7 @@ mod tests {
         let bid = signed_job_bid(&alice, [42u8; 32], spend);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, transfer, bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "transfer + bid exceeding free balance must be rejected");
         assert_eq!(chain.balance(&alice.node_id()), bal as i128, "alice's balance must be unchanged");
@@ -2657,6 +2889,7 @@ mod tests {
         let hb = signed_heartbeat(&host, bob.node_id(), spend, 1);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, transfer, hb], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(!chain.append(block), "transfer + heartbeat exceeding cell balance must be rejected");
         assert_eq!(chain.balance(&bob.node_id()), bal as i128, "bob's balance must be unchanged");
@@ -2684,6 +2917,7 @@ mod tests {
         }
         // txs.len() == MAX_TXS_PER_BLOCK + 1 (one over the limit).
         let mut block = chain.next_block(txs, miner.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&miner);
         assert!(!chain.append(block), "block with more than MAX_TXS_PER_BLOCK txs must be rejected");
         assert_eq!(chain.height(), height_before, "chain height must be unchanged after bomb rejection");
@@ -2706,6 +2940,7 @@ mod tests {
         let reward = Tx::new(kind, miner.node_id(), sig);
 
         let mut block = chain.next_block(vec![reward], miner.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&miner);
         assert!(chain.append(block), "reward directed to a third party must be accepted");
         assert_eq!(chain.balance(&miner.node_id()), 0, "miner gets nothing");
@@ -2733,6 +2968,7 @@ mod tests {
         let hb = signed_heartbeat(&mallory, bob.node_id(), 500, 1);
         let reward = signed_uptime_reward(&mallory, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, hb], mallory.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&mallory);
         // KNOWN LIMITATION: succeeds without a prior bid; bob is drained without consent.
         assert!(chain.append(block), "rogue heartbeat accepted — known design limitation");
@@ -2757,6 +2993,7 @@ mod tests {
 
         let reward = signed_uptime_reward(&miner, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, zero_tx], miner.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&miner);
         assert!(!chain.append(block), "zero-amount transfer must be rejected");
     }
@@ -2785,6 +3022,7 @@ mod tests {
         let pay_bob = signed_transfer(&alice, bob.node_id(), 500);
         let reward = signed_uptime_reward(&alice, chain.tip().index + 1);
         let mut b = chain.next_block(vec![reward, pay_bob], alice.node_id());
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
         b.seal(&alice);
         assert!(chain.append(b));
         assert_eq!(chain.balance(&bob.node_id()), 500);
@@ -2798,6 +3036,7 @@ mod tests {
         let pay_mallory = signed_transfer(&alice, mallory.node_id(), 500);
         let reward = signed_uptime_reward(&alice, shadow.tip().index + 1);
         let mut b1 = shadow.next_block(vec![reward, pay_mallory], alice.node_id());
+        b1.mine(&std::sync::atomic::AtomicBool::new(false));
         b1.seal(&alice);
         assert!(shadow.append(b1.clone()));
         shadow_blocks.push(b1);
@@ -2807,6 +3046,7 @@ mod tests {
             let next_idx = shadow.tip().index + 1;
             let r = signed_uptime_reward(&mallory, next_idx);
             let mut blk = shadow.next_block(vec![r], mallory.node_id());
+            blk.mine(&std::sync::atomic::AtomicBool::new(false));
             blk.seal(&mallory);
             assert!(shadow.append(blk.clone()));
             shadow_blocks.push(blk);
@@ -2820,5 +3060,143 @@ mod tests {
             + Chain::emission_rate(3) as i128
             + Chain::emission_rate(4) as i128;
         assert_eq!(chain.balance(&mallory.node_id()), mallory_expected, "Mallory receives transfer + mining rewards after reorg");
+    }
+
+    // ----- Proof-of-work consensus -----
+
+    #[test]
+    fn pow_rejected_when_hash_below_difficulty() {
+        let mut chain = Chain::genesis();
+        let id = make_identity("pow-reject");
+        let reward = signed_uptime_reward(&id, 1);
+        let mut block = chain.next_block(vec![reward], id.node_id());
+        assert_eq!(block.difficulty, GENESIS_DIFFICULTY);
+        // Pick a nonce that does NOT satisfy the difficulty (the overwhelming majority do not),
+        // i.e. the block carries no real work.
+        while block.meets_difficulty() {
+            block.nonce = block.nonce.wrapping_add(1);
+        }
+        block.seal(&id);
+        assert!(!chain.append(block), "a block without valid PoW must be rejected");
+    }
+
+    #[test]
+    fn append_rejects_understated_difficulty() {
+        let mut chain = Chain::genesis();
+        let id = make_identity("pow-diff");
+        let reward = signed_uptime_reward(&id, 1);
+        let mut block = chain.next_block(vec![reward], id.node_id());
+        // Claim an easier target than the schedule requires, and satisfy THAT easier target.
+        block.difficulty = GENESIS_DIFFICULTY - 1;
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
+        block.seal(&id);
+        assert!(!chain.append(block), "a block declaring less-than-expected difficulty must be rejected");
+    }
+
+    #[test]
+    fn append_rejects_bad_timestamp() {
+        let mut chain = Chain::genesis();
+        let id = make_identity("pow-ts");
+        for _ in 0..3 {
+            assert!(seal_and_append(&mut chain, &id));
+        }
+        // Timestamp at/below the median-time-past is rejected (set it before mining so PoW is valid).
+        let reward = signed_uptime_reward(&id, chain.tip().index + 1);
+        let mut past = chain.next_block(vec![reward], id.node_id());
+        past.timestamp = 0;
+        past.mine(&std::sync::atomic::AtomicBool::new(false));
+        past.seal(&id);
+        assert!(!chain.append(past), "timestamp <= median-time-past must be rejected");
+        // Far-future timestamp is rejected too.
+        let reward = signed_uptime_reward(&id, chain.tip().index + 1);
+        let mut future = chain.next_block(vec![reward], id.node_id());
+        future.timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+            + MAX_FUTURE_DRIFT_SECS
+            + 3600;
+        future.mine(&std::sync::atomic::AtomicBool::new(false));
+        future.seal(&id);
+        assert!(!chain.append(future), "far-future timestamp must be rejected");
+    }
+
+    #[test]
+    fn block_work_is_two_to_the_difficulty() {
+        let mut b = Chain::genesis().next_block(vec![], [0u8; 32]);
+        b.difficulty = 10;
+        assert_eq!(b.work(), 1u128 << 10);
+        b.difficulty = 0;
+        assert_eq!(b.work(), 1);
+        b.difficulty = 200; // saturates, never overflows
+        assert_eq!(b.work(), u128::MAX);
+    }
+
+    // Build a synthetic window of blocks (no mining/append) to exercise the pure retarget fn.
+    fn fake_window(difficulty: u8, span_secs: u64) -> Vec<Block> {
+        let n = DIFFICULTY_WINDOW as usize;
+        (0..n)
+            .map(|i| {
+                let timestamp = if n > 1 { span_secs * i as u64 / (n as u64 - 1) } else { 0 };
+                Block {
+                    index: i as u64,
+                    prev_hash: [0u8; 32],
+                    timestamp,
+                    transactions: vec![],
+                    nonce: 0,
+                    difficulty,
+                    miner: [0u8; 32],
+                    sig: [0u8; 64],
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retarget_raises_difficulty_when_blocks_are_too_fast() {
+        let target = DIFFICULTY_WINDOW * TARGET_BLOCK_SECS;
+        // Window mined far faster than target (< target/4) → +2 bits.
+        let fast = fake_window(20, target / 8);
+        assert_eq!(expected_difficulty(&fast), 22);
+        // Slightly fast (between target/4 and target) → +1 bit.
+        let bit_fast = fake_window(20, target / 2);
+        assert_eq!(expected_difficulty(&bit_fast), 21);
+    }
+
+    #[test]
+    fn retarget_lowers_difficulty_when_blocks_are_too_slow_but_floors_at_min() {
+        let target = DIFFICULTY_WINDOW * TARGET_BLOCK_SECS;
+        // Far slower than target (> target*4) → -2 bits.
+        let slow = fake_window(20, target * 8);
+        assert_eq!(expected_difficulty(&slow), 18);
+        // Cannot fall below MIN_DIFFICULTY.
+        let slow_at_floor = fake_window(MIN_DIFFICULTY, target * 8);
+        assert_eq!(expected_difficulty(&slow_at_floor), MIN_DIFFICULTY);
+    }
+
+    #[test]
+    fn difficulty_holds_steady_within_a_window() {
+        // Not a window boundary (next height not a multiple of DIFFICULTY_WINDOW) → inherit tip.
+        let mut chain = Chain::genesis();
+        let id = make_identity("steady");
+        for _ in 0..5 {
+            assert!(seal_and_append(&mut chain, &id));
+        }
+        assert_eq!(expected_difficulty(&chain.blocks), GENESIS_DIFFICULTY);
+    }
+
+    #[test]
+    fn chain_format_version_guard_rejects_incompatible_files() {
+        let dir = tmpdir("fmt-guard");
+        let path = dir.join("chain.bin");
+        let mut chain = Chain::genesis();
+        let id = make_identity("fmt");
+        assert!(seal_and_append(&mut chain, &id));
+        chain.save(&path).unwrap();
+        // A correctly-versioned file loads.
+        assert!(Chain::load(&path).is_ok());
+        // Corrupt the leading version byte → load refuses; load_or_genesis falls back to genesis.
+        let mut data = std::fs::read(&path).unwrap();
+        data[0] = 0xFF;
+        std::fs::write(&path, &data).unwrap();
+        assert!(Chain::load(&path).is_err(), "incompatible format must be rejected");
+        assert_eq!(Chain::load_or_genesis(&path).height(), 0, "falls back to genesis");
     }
 }

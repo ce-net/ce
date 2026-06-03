@@ -21,7 +21,11 @@ fn alloc_ports() -> (u16, u16, u16) {
     (p, p + 1, p + 2) // (p2p, api, spare)
 }
 
+/// Shared API token for tests: nodes read it from `CE_API_TOKEN`, clients send it as a Bearer.
+const TEST_API_TOKEN: &str = "ce-integration-test-token";
+
 fn tmpdir(label: &str) -> PathBuf {
+    unsafe { std::env::set_var("CE_API_TOKEN", TEST_API_TOKEN) };
     let dir = std::env::temp_dir()
         .join(format!("ce-adv-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -80,6 +84,7 @@ async fn attack_invalid_tx_signature_in_block() {
         id.sign(&bincode::serialize(&reward_kind).unwrap()),
     );
     let mut b1 = chain.next_block(vec![reward_tx], id.node_id());
+    b1.mine(&std::sync::atomic::AtomicBool::new(false));
     b1.seal(&id);
     assert!(chain.append(b1), "legitimate block must be accepted");
 
@@ -100,6 +105,7 @@ async fn attack_invalid_tx_signature_in_block() {
     let tampered_tx = Tx::new(tampered_kind, id.node_id(), sig);
 
     let mut bad_block = chain.next_block(vec![tampered_tx], id.node_id());
+    bad_block.mine(&std::sync::atomic::AtomicBool::new(false));
     bad_block.seal(&id);
 
     assert!(
@@ -134,6 +140,7 @@ async fn attack_double_spend_single_block() {
         attacker.sign(&bincode::serialize(&reward_kind).unwrap()),
     );
     let mut b1 = chain.next_block(vec![reward_tx], attacker.node_id());
+    b1.mine(&std::sync::atomic::AtomicBool::new(false));
     b1.seal(&attacker);
     assert!(chain.append(b1));
     assert_eq!(chain.balance(&attacker.node_id()), reward_amount as i128);
@@ -151,6 +158,7 @@ async fn attack_double_spend_single_block() {
     // Both transfers for the full balance — total would be 2× balance.
     let mut bad_block =
         chain.next_block(vec![make_transfer(reward_amount), make_transfer(reward_amount)], attacker.node_id());
+    bad_block.mine(&std::sync::atomic::AtomicBool::new(false));
     bad_block.seal(&attacker);
 
     assert!(!chain.append(bad_block), "chain accepted a double-spend block");
@@ -227,7 +235,7 @@ async fn attack_burn_proof_theft() {
         "burn_tx_id_hex": hex::encode(burn_tx_id),
     });
     let _resp = client
-        .post(format!("http://127.0.0.1:{api_b}/signals/send"))
+        .post(format!("http://127.0.0.1:{api_b}/signals/send")).bearer_auth(TEST_API_TOKEN)
         .json(&body)
         .send()
         .await
@@ -337,6 +345,7 @@ async fn attack_inflated_uptime_reward() {
         attacker.sign(&bincode::serialize(&bad_kind).unwrap()),
     );
     let mut bad_block = chain.next_block(vec![bad_tx], attacker.node_id());
+    bad_block.mine(&std::sync::atomic::AtomicBool::new(false));
     bad_block.seal(&attacker);
 
     assert!(
@@ -371,7 +380,7 @@ async fn attack_job_bid_zero_balance() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://127.0.0.1:{api}/jobs/bid"))
+        .post(format!("http://127.0.0.1:{api}/jobs/bid")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({
             "image": "alpine:latest",
             "cpu_cores": 1,

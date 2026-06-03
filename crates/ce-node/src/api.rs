@@ -1,7 +1,8 @@
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Request, State},
+    http::{header::AUTHORIZATION, Method, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -74,6 +75,79 @@ struct ErrorBody {
 
 fn err(code: StatusCode, msg: impl Into<String>) -> Response {
     (code, Json(ErrorBody { error: msg.into() })).into_response()
+}
+
+/// Constant-time byte comparison (avoids timing oracles on the token check).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Derive the API bearer token from the node identity and persist it to `<data_dir>/api.token`
+/// (chmod 600) so same-host clients can read it. Deterministic in the identity secret — no RNG
+/// and no rotation-vs-storage problem; rotating it means rotating the node key. If the file
+/// already holds a non-empty token we keep it (lets an operator override with a custom secret).
+fn load_or_create_api_token(data_dir: &std::path::Path, identity_seed: &[u8; 32]) -> String {
+    // Operator/CI override: a fixed token via the environment takes precedence over the file.
+    if let Ok(env_tok) = std::env::var("CE_API_TOKEN") {
+        let t = env_tok.trim().to_string();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    let path = data_dir.join("api.token");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let t = existing.trim().to_string();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    let mut h = Sha256::new();
+    h.update(b"ce-api-token-v1");
+    h.update(identity_seed);
+    let token = hex::encode(h.finalize());
+    let _ = std::fs::create_dir_all(data_dir);
+    if std::fs::write(&path, &token).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    token
+}
+
+/// Axum middleware: require `Authorization: Bearer <api.token>` on every mutating (non-GET/HEAD)
+/// request. Read-only requests pass through untouched.
+async fn require_api_token(
+    State(token): State<Arc<String>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let read_only = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if !read_only {
+        let presented = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+        let ok = presented
+            .map(|t| ct_eq(t.trim().as_bytes(), token.as_bytes()))
+            .unwrap_or(false);
+        if !ok {
+            return err(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid API token (send Authorization: Bearer <data_dir>/api.token)",
+            );
+        }
+    }
+    next.run(req).await
 }
 
 /// Serde helpers: 128-bit credit amounts (base units) are carried in JSON as decimal
@@ -583,6 +657,17 @@ pub struct RevokeRequest {
 /// Revoke a capability this node issued by submitting an on-chain `RevokeCapability { issuer, nonce }`
 /// signed by this node. Revoking any link invalidates that link and its whole subtree once the tx
 /// is mined. See docs/capabilities.md.
+/// Read-only: the on-chain revoked `(issuer, nonce)` set, so apps (e.g. rdev) can deny revoked
+/// capability chains. Issuer is hex-encoded.
+async fn get_revoked(State(state): State<ApiState>) -> Response {
+    let pairs = state.chain.revoked_pairs().await;
+    let out: Vec<serde_json::Value> = pairs
+        .iter()
+        .map(|(issuer, nonce)| serde_json::json!({ "issuer": hex::encode(issuer), "nonce": nonce }))
+        .collect();
+    Json(out).into_response()
+}
+
 async fn revoke_capability(State(state): State<ApiState>, Json(req): Json<RevokeRequest>) -> Response {
     let issuer = state.identity.node_id();
     let kind = ce_chain::TxKind::RevokeCapability { issuer, nonce: req.nonce };
@@ -1670,6 +1755,9 @@ pub async fn start(
     tx_tx: broadcast::Sender<Tx>,
     send_nonce: Arc<AtomicU64>,
     port: u16,
+    // Address the HTTP API binds to. Defaults to `127.0.0.1` (loopback only). Setting this to
+    // `0.0.0.0` exposes the API on all interfaces and is only safe behind a firewall + the token.
+    api_bind: String,
     listen_port: u16,
     job_store: JobStore,
     pool: TxPool,
@@ -1688,6 +1776,8 @@ pub async fn start(
         tracing::warn!("Docker unavailable — job routes return 503");
     }
     let host_node_id = identity.node_id();
+    // Derive + persist the API token before `identity`/`data_dir` are moved into the state.
+    let api_token = Arc::new(load_or_create_api_token(&data_dir, &identity.secret_bytes()));
     let state = ApiState {
         docker,
         chain,
@@ -1718,6 +1808,7 @@ pub async fn start(
         .route("/jobs/:id", delete(stop_job))
         .route("/transfer", post(transfer))
         .route("/capabilities/revoke", post(revoke_capability))
+        .route("/capabilities/revoked", get(get_revoked))
         .route("/status", get(node_status))
         .route("/signals", get(list_signals))
         .route("/signals/send", post(send_signal))
@@ -1757,8 +1848,21 @@ pub async fn start(
         .route("/tunnel", post(open_tunnel))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{port}");
+    // Token-gate every mutating (non-GET) request. The token is derived from the node identity
+    // and written to <data_dir>/api.token (chmod 600) so same-host clients (the `ce` CLI, ce-rs
+    // apps) can read it. Read-only GETs stay open. This defends against same-host attackers,
+    // CSRF/SSRF, and (with the localhost bind) the network. Mesh-originated value ops are
+    // unaffected — they arrive over the Noise-authenticated libp2p RPC path, not this HTTP API.
+    let app = app.layer(middleware::from_fn_with_state(api_token.clone(), require_api_token));
+
+    let addr = format!("{api_bind}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    if !api_bind.starts_with("127.") && api_bind != "localhost" && api_bind != "::1" {
+        tracing::warn!(
+            "API bound to {api_bind} (non-loopback) — the API is reachable beyond this host; \
+             ensure a firewall and rely on the api.token for auth"
+        );
+    }
 
     match tls_seed {
         None => {

@@ -49,6 +49,7 @@ pub enum ChainCmd {
     /// Resolve a claimed name to its owning NodeId.
     ResolveName { name: String, reply: oneshot::Sender<Option<NodeId>> },
     IsRevoked { issuer: NodeId, nonce: u64, reply: oneshot::Sender<bool> },
+    RevokedPairs { reply: oneshot::Sender<Vec<(NodeId, u64)>> },
     Height { reply: oneshot::Sender<u64> },
     Difficulty { reply: oneshot::Sender<u8> },
     /// Combined height + difficulty + balance — avoids two round-trips in status handlers.
@@ -118,6 +119,13 @@ impl ChainHandle {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::IsRevoked { issuer, nonce, reply: tx }).await;
         rx.await.unwrap_or(false)
+    }
+
+    /// All revoked `(issuer, nonce)` pairs — for apps that authorize capability chains (e.g. rdev).
+    pub async fn revoked_pairs(&self) -> Vec<(NodeId, u64)> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.0.send(ChainCmd::RevokedPairs { reply: tx }).await;
+        rx.await.unwrap_or_default()
     }
 
     pub async fn height(&self) -> u64 {
@@ -253,6 +261,9 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
             }
             ChainCmd::ResolveName { name, reply } => {
                 let _ = reply.send(chain.resolve_name(&name));
+            }
+            ChainCmd::RevokedPairs { reply } => {
+                let _ = reply.send(chain.revoked_pairs());
             }
             ChainCmd::IsRevoked { issuer, nonce, reply } => {
                 let _ = reply.send(chain.is_revoked(&issuer, nonce));

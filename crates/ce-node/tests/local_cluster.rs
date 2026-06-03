@@ -18,7 +18,12 @@ fn alloc_ports() -> (u16, u16) {
     (p2p, p2p + 1)
 }
 
+/// Shared API token for tests: nodes read it from `CE_API_TOKEN`, clients send it as a Bearer.
+const TEST_API_TOKEN: &str = "ce-integration-test-token";
+
 fn tmpdir(label: &str) -> PathBuf {
+    // Set before any node starts so every test node adopts the same (env-provided) API token.
+    unsafe { std::env::set_var("CE_API_TOKEN", TEST_API_TOKEN) };
     let dir = std::env::temp_dir()
         .join(format!("ce-node-test-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -224,7 +229,7 @@ async fn api_job_bid_rejects_zero_balance() {
         "bid": "100"
     });
     let resp = client
-        .post(format!("http://127.0.0.1:{api}/jobs/bid"))
+        .post(format!("http://127.0.0.1:{api}/jobs/bid")).bearer_auth(TEST_API_TOKEN)
         .json(&body)
         .send()
         .await
@@ -324,7 +329,7 @@ async fn signal_propagates_between_nodes() {
         "burn_tx_id_hex": hex::encode(burn_tx_id),
     });
     let resp = client
-        .post(format!("http://127.0.0.1:{api_a}/signals/send"))
+        .post(format!("http://127.0.0.1:{api_a}/signals/send")).bearer_auth(TEST_API_TOKEN)
         .json(&body)
         .send()
         .await
@@ -441,7 +446,7 @@ async fn job_lifecycle() {
         "bid": "100"
     });
     let resp = client
-        .post(format!("http://127.0.0.1:{api_payer}/jobs/bid"))
+        .post(format!("http://127.0.0.1:{api_payer}/jobs/bid")).bearer_auth(TEST_API_TOKEN)
         .json(&bid_body)
         .send()
         .await
@@ -507,7 +512,7 @@ async fn job_lifecycle() {
         "payer_sig": hex::encode(payer_sig)
     });
     let resp = client
-        .post(format!("http://127.0.0.1:{api_host}/jobs/{job_id_hex}/settle"))
+        .post(format!("http://127.0.0.1:{api_host}/jobs/{job_id_hex}/settle")).bearer_auth(TEST_API_TOKEN)
         .json(&settle_body)
         .send()
         .await
@@ -616,7 +621,7 @@ async fn mesh_deploy_and_kill_roundtrip() {
 
     // B directs its local node to deploy on A through the mesh.
     let resp = client
-        .post(format!("http://127.0.0.1:{api_b}/mesh-deploy"))
+        .post(format!("http://127.0.0.1:{api_b}/mesh-deploy")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({
             "node_id": hex::encode(a_id),
             "image": "alpine:latest",
@@ -648,7 +653,7 @@ async fn mesh_deploy_and_kill_roundtrip() {
 
     // Kill it through the mesh.
     let resp = client
-        .post(format!("http://127.0.0.1:{api_b}/mesh-kill"))
+        .post(format!("http://127.0.0.1:{api_b}/mesh-kill")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({ "node_id": hex::encode(a_id), "job_id": job_id }))
         .send()
         .await
@@ -700,7 +705,7 @@ async fn blob_fetched_across_mesh() {
     // A distinctive multi-kilobyte payload, stored on A.
     let payload: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
     let resp = client
-        .post(format!("http://127.0.0.1:{api_a}/blobs"))
+        .post(format!("http://127.0.0.1:{api_a}/blobs")).bearer_auth(TEST_API_TOKEN)
         .body(payload.clone())
         .send()
         .await
@@ -770,7 +775,7 @@ async fn paid_provider_refuses_free_fetch() {
     let client = reqwest::Client::new();
     let payload = b"this costs credits".to_vec();
     let resp = client
-        .post(format!("http://127.0.0.1:{api_a}/blobs"))
+        .post(format!("http://127.0.0.1:{api_a}/blobs")).bearer_auth(TEST_API_TOKEN)
         .body(payload)
         .send()
         .await
@@ -854,7 +859,7 @@ async fn wasm_deploy_stages_module_from_mesh() {
     // A stores a tiny WASM module (and so advertises itself as its provider).
     let wasm = wat::parse_str(r#"(module (func (export "entry") (result i32) i32.const 42))"#).unwrap();
     let resp = client
-        .post(format!("http://127.0.0.1:{api_a}/blobs"))
+        .post(format!("http://127.0.0.1:{api_a}/blobs")).bearer_auth(TEST_API_TOKEN)
         .body(wasm)
         .send()
         .await
@@ -876,7 +881,7 @@ async fn wasm_deploy_stages_module_from_mesh() {
 
     // A deploys the WASM cell onto B. B stages the module from the mesh, then runs it.
     let resp = client
-        .post(format!("http://127.0.0.1:{api_a}/mesh-deploy"))
+        .post(format!("http://127.0.0.1:{api_a}/mesh-deploy")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({
             "node_id": hex::encode(host_node_id(&dir_b)),
             "wasm_module": module_hash,
@@ -944,7 +949,7 @@ async fn relay_rejects_payment_without_channel() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://127.0.0.1:{api_b}/relay/pay"))
+        .post(format!("http://127.0.0.1:{api_b}/relay/pay")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({
             "relay": hex::encode(a_id),
             "channel_id": hex::encode([0u8; 32]),
@@ -980,7 +985,7 @@ async fn name_claim_resolves_after_mining() {
 
     let client = reqwest::Client::new();
     let r = client
-        .post(format!("http://127.0.0.1:{api}/names/claim"))
+        .post(format!("http://127.0.0.1:{api}/names/claim")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({ "name": "my-node" }))
         .send()
         .await
@@ -989,7 +994,7 @@ async fn name_claim_resolves_after_mining() {
 
     // A malformed name is rejected up front.
     let bad = client
-        .post(format!("http://127.0.0.1:{api}/names/claim"))
+        .post(format!("http://127.0.0.1:{api}/names/claim")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({ "name": "Bad Name" }))
         .send()
         .await
@@ -1047,7 +1052,7 @@ async fn service_advertise_and_find() {
 
     let client = reqwest::Client::new();
     let r = client
-        .post(format!("http://127.0.0.1:{api_a}/discovery/advertise"))
+        .post(format!("http://127.0.0.1:{api_a}/discovery/advertise")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({ "service": "gpu-pool" }))
         .send()
         .await
@@ -1130,7 +1135,7 @@ async fn app_request_reply_roundtrip() {
                 .and_then(|a| a.iter().find_map(|m| m["reply_token"].as_u64()))
             {
                 client
-                    .post(format!("http://127.0.0.1:{api_b}/mesh/reply"))
+                    .post(format!("http://127.0.0.1:{api_b}/mesh/reply")).bearer_auth(TEST_API_TOKEN)
                     .json(&serde_json::json!({ "token": token, "payload_hex": hex::encode(b"pong") }))
                     .send()
                     .await
@@ -1143,7 +1148,7 @@ async fn app_request_reply_roundtrip() {
     // A issues the request and blocks until B's app replies.
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://127.0.0.1:{api_a}/mesh/request"))
+        .post(format!("http://127.0.0.1:{api_a}/mesh/request")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({
             "to": hex::encode(b_id),
             "topic": "rpc",
@@ -1201,7 +1206,7 @@ async fn app_pubsub_delivers_to_subscriber() {
     // Both subscribe so they share the topic's gossipsub mesh.
     for api in [api_a, api_b] {
         let r = client
-            .post(format!("http://127.0.0.1:{api}/mesh/subscribe"))
+            .post(format!("http://127.0.0.1:{api}/mesh/subscribe")).bearer_auth(TEST_API_TOKEN)
             .json(&serde_json::json!({ "topic": "telemetry" }))
             .send()
             .await
@@ -1216,7 +1221,7 @@ async fn app_pubsub_delivers_to_subscriber() {
     for _ in 0..15 {
         sleep(Duration::from_secs(1)).await;
         let _ = client
-            .post(format!("http://127.0.0.1:{api_a}/mesh/publish"))
+            .post(format!("http://127.0.0.1:{api_a}/mesh/publish")).bearer_auth(TEST_API_TOKEN)
             .json(&serde_json::json!({ "topic": "telemetry", "payload_hex": payload_hex }))
             .send()
             .await
@@ -1281,7 +1286,7 @@ async fn app_message_delivered_across_mesh() {
     // "ping" in hex.
     let payload_hex = hex::encode(b"ping");
     let resp = client
-        .post(format!("http://127.0.0.1:{api_a}/mesh/send"))
+        .post(format!("http://127.0.0.1:{api_a}/mesh/send")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({
             "to": hex::encode(b_id),
             "topic": "control",
