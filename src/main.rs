@@ -88,6 +88,15 @@ enum Commands {
         /// and stream receipts to stay paid-up.
         #[arg(long)]
         relay_price_per_min: Option<u128>,
+        /// Ephemeral / in-memory chain: keep the chain in RAM and skip per-block disk persistence.
+        /// Still syncs and gossips with normal nodes; snapshot to disk on demand with POST
+        /// /chain/save. Useful for throwaway / test fleets (saves disk I/O).
+        #[arg(long)]
+        ephemeral: bool,
+        /// Disable mDNS local peer discovery (isolate this node from others on the LAN). Use for
+        /// isolated local test meshes so they can't cross-link with a live node.
+        #[arg(long)]
+        no_mdns: bool,
     },
     /// Show this node's credit balance.
     Balance,
@@ -729,7 +738,7 @@ async fn main() -> Result<()> {
     let api_token = read_api_token(&data_dir);
 
     match cli.command {
-        Commands::Start { port, api_port, api_bind, bootstrap, relay, no_mine, light, tls, relay_price_per_min } => {
+        Commands::Start { port, api_port, api_bind, bootstrap, relay, no_mine, light, tls, relay_price_per_min, ephemeral, no_mdns } => {
             // CE_BOOTSTRAP_PEERS: colon-separated list of bootstrap multiaddrs.
             // Useful for Docker/systemd deployments where CLI flags are inconvenient.
             let mut bootstrap_peers = bootstrap;
@@ -773,6 +782,8 @@ async fn main() -> Result<()> {
                 prune_keep: if light { Some(ce_chain::PRUNE_KEEP_BLOCKS) } else { None },
                 tls,
                 relay_price_per_min,
+                ephemeral,
+                disable_local_discovery: no_mdns,
                 ..Default::default()
             };
             let node = Node::start(config).await?;

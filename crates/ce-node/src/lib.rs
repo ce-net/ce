@@ -204,6 +204,10 @@ pub struct NodeConfig {
     /// (`0` = a free, discoverable relay). `None` (default) = not advertised as a relay. Clients
     /// open a payment channel with the relay and stream `RelayReceipt`s to stay paid-up.
     pub relay_price_per_min: Option<u128>,
+    /// Ephemeral / in-memory chain: skip per-block disk persistence (the chain lives in RAM). The
+    /// node still syncs and gossips with persisting nodes (same protocol); snapshot to disk on
+    /// demand via `POST /chain/save`. Saves disk I/O for throwaway / test fleets.
+    pub ephemeral: bool,
 }
 
 impl Default for NodeConfig {
@@ -223,6 +227,7 @@ impl Default for NodeConfig {
             tls: false,
             data_price_per_byte: 0,
             relay_price_per_min: None,
+            ephemeral: false,
         }
     }
 }
@@ -378,6 +383,9 @@ impl Node {
             node.config.bootstrap_peers.is_empty(),
         ));
 
+        // Ephemeral mode keeps the chain in RAM: the background loops skip per-block disk saves.
+        let persist = !node.config.ephemeral;
+
         if node.config.mine {
             let chain2 = chain.clone();
             let identity2 = identity.clone();
@@ -388,7 +396,7 @@ impl Node {
             let block_tx2 = block_tx.clone();
             let synced2 = synced.clone();
             tokio::spawn(async move {
-                mining_loop(chain2, identity2, handle2, chain_path2, pool2, interval, block_tx2, synced2)
+                mining_loop(chain2, identity2, handle2, chain_path2, persist, pool2, interval, block_tx2, synced2)
                     .await;
             });
         }
@@ -451,6 +459,7 @@ impl Node {
                     relay_price,
                     relay_meter,
                     synced.clone(),
+                    persist,
                 )
                 .await;
             });
@@ -469,6 +478,7 @@ impl Node {
                     identity2,
                     handle2,
                     chain_path2,
+                    persist,
                     pool2,
                     js,
                     bid_notify_rx,
@@ -604,6 +614,7 @@ async fn mining_loop(
     identity: Arc<Identity>,
     mesh_handle: MeshHandle,
     chain_path: PathBuf,
+    persist: bool,
     pool: TxPool,
     poll_secs: u64,
     block_tx: broadcast::Sender<Block>,
@@ -681,8 +692,10 @@ async fn mining_loop(
 
         if chain.append(block.clone()).await {
             pool.remove_included(&block).await;
-            if let Err(e) = chain.save(chain_path.clone()).await {
-                warn!("save chain: {e}");
+            if persist {
+                if let Err(e) = chain.save(chain_path.clone()).await {
+                    warn!("save chain: {e}");
+                }
             }
             let _ = block_tx.send(block.clone());
             let _ = mesh_handle.broadcast_block(&block).await;
@@ -844,6 +857,7 @@ async fn mesh_event_loop(
     relay_price_per_min: Option<u128>,
     relay_meter: RelayMeter,
     synced: Arc<std::sync::atomic::AtomicBool>,
+    persist: bool,
 ) {
     use std::sync::atomic::Ordering as SyncedOrdering;
     let mut sync_ticks: u32 = 0;
@@ -908,8 +922,10 @@ async fn mesh_event_loop(
                 if chain.append(block.clone()).await {
                     info!("accepted block {} from mesh", block.index);
                     pool.remove_included(&block).await;
-                    if let Err(e) = chain.save(chain_path.clone()).await {
-                        warn!("save chain: {e}");
+                    if persist {
+                        if let Err(e) = chain.save(chain_path.clone()).await {
+                            warn!("save chain: {e}");
+                        }
                     }
                     let _ = block_tx.send(block.clone());
                 } else {
@@ -1068,8 +1084,10 @@ async fn mesh_event_loop(
                         }
                     }
 
-                    if let Err(e) = chain.save(chain_path.clone()).await {
-                        warn!("save chain after sync: {e}");
+                    if persist {
+                        if let Err(e) = chain.save(chain_path.clone()).await {
+                            warn!("save chain after sync: {e}");
+                        }
                     }
                     let snap = chain.sync_snap().await;
                     let _ = mesh_handle
@@ -1707,6 +1725,7 @@ async fn job_manager_loop(
     identity: Arc<Identity>,
     mesh_handle: MeshHandle,
     chain_path: PathBuf,
+    persist: bool,
     pool: TxPool,
     job_store: JobStore,
     mut bid_rx: mpsc::Receiver<Tx>,
@@ -1780,6 +1799,7 @@ async fn job_manager_loop(
             &identity,
             &mesh_handle,
             &chain_path,
+            persist,
             &pool,
             &job_store,
         )
@@ -1889,6 +1909,7 @@ async fn submit_pending_settles(
     identity: &Identity,
     mesh_handle: &MeshHandle,
     chain_path: &PathBuf,
+    persist: bool,
     pool: &TxPool,
     job_store: &JobStore,
 ) {
@@ -1931,7 +1952,9 @@ async fn submit_pending_settles(
 
     let settled_on_chain = chain.settled_on_chain(identity.node_id()).await;
     if !settled_on_chain.is_empty() {
-        let _ = chain.save(chain_path.clone()).await;
+        if persist {
+            let _ = chain.save(chain_path.clone()).await;
+        }
         let mut store = job_store.lock().await;
         for job_id in settled_on_chain {
             if let Some(r) = store.get_mut(&job_id) {

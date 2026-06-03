@@ -657,6 +657,16 @@ pub struct RevokeRequest {
 /// Revoke a capability this node issued by submitting an on-chain `RevokeCapability { issuer, nonce }`
 /// signed by this node. Revoking any link invalidates that link and its whole subtree once the tx
 /// is mined. See docs/capabilities.md.
+/// Snapshot the in-memory chain to disk on demand (the "dump" for ephemeral/in-memory nodes).
+/// Token-gated. Persisting nodes also expose it so an operator can force a flush.
+async fn chain_save(State(state): State<ApiState>) -> Response {
+    let path = state.data_dir.join("chain").join("chain.json");
+    match state.chain.save(path.clone()).await {
+        Ok(()) => Json(serde_json::json!({ "saved": path.display().to_string() })).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("save failed: {e}")),
+    }
+}
+
 /// Read-only: the on-chain revoked `(issuer, nonce)` set, so apps (e.g. rdev) can deny revoked
 /// capability chains. Issuer is hex-encoded.
 async fn get_revoked(State(state): State<ApiState>) -> Response {
@@ -1809,6 +1819,7 @@ pub async fn start(
         .route("/transfer", post(transfer))
         .route("/capabilities/revoke", post(revoke_capability))
         .route("/capabilities/revoked", get(get_revoked))
+        .route("/chain/save", post(chain_save))
         .route("/status", get(node_status))
         .route("/signals", get(list_signals))
         .route("/signals/send", post(send_signal))
