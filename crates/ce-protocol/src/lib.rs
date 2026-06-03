@@ -211,4 +211,49 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir.to_string_lossy().into_owned()
     }
+
+    fn idf(tag: &str) -> Identity {
+        let dir = std::env::temp_dir().join(format!("ce-proto-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Identity::load_or_generate(&dir).unwrap()
+    }
+
+    #[test]
+    fn tampered_payload_fails_verify() {
+        let id = idf("tamper");
+        let mut sig = CellSignal::build(id.node_id(), CellAddress::Broadcast, vec![], b"orig".to_vec(), None, 1, &id);
+        assert!(sig.verify().is_ok());
+        sig.payload = b"tampered".to_vec();
+        assert!(sig.verify().is_err(), "payload tamper must break the signature");
+    }
+
+    #[test]
+    fn wrong_signer_fails_verify() {
+        let a = idf("a");
+        let b = idf("b");
+        // signed by b, but claims to be from a
+        let mut sig = CellSignal::build(b.node_id(), CellAddress::Broadcast, vec![], b"x".to_vec(), None, 0, &b);
+        sig.from = a.node_id();
+        assert!(sig.verify().is_err());
+    }
+
+    #[test]
+    fn requires_burn_logic() {
+        let id = idf("burn");
+        // empty payload → no burn needed
+        let empty = CellSignal::build(id.node_id(), CellAddress::Broadcast, vec![], vec![], None, 0, &id);
+        assert!(!empty.requires_burn());
+        // payload + burn proof → satisfied
+        let burn = BurnProof { tx_id: [1u8; 32], amount: 1, block_height: 1, block_hash: [2u8; 32] };
+        let paid = CellSignal::build(id.node_id(), CellAddress::Broadcast, vec![], b"p".to_vec(), Some(burn), 0, &id);
+        assert!(!paid.requires_burn());
+    }
+
+    #[test]
+    fn id_changes_with_content() {
+        let id = idf("idc");
+        let s1 = CellSignal::build(id.node_id(), CellAddress::Broadcast, vec![], b"a".to_vec(), None, 0, &id);
+        let s2 = CellSignal::build(id.node_id(), CellAddress::Broadcast, vec![], b"b".to_vec(), None, 0, &id);
+        assert_ne!(s1.id(), s2.id());
+    }
 }
