@@ -15,7 +15,7 @@ pub fn peer_id_from_identity(identity: &ce_identity::Identity) -> anyhow::Result
 use anyhow::Result;
 use bollard::Docker;
 use ce_chain::{Block, Chain, ChunkReceipt, Tx, TxKind, verify_chunk_receipt_sig};
-use ce_container::{ContainerManager, ExecSpec, JobSpec, exec_in_container};
+use ce_container::{ContainerManager, JobSpec};
 use ce_runtime::Runtime;
 use ce_identity::{Identity, NodeId};
 use ce_mesh::{Mesh, MeshEvent, MeshHandle, RpcRequest, RpcResponse, peer_id_from_node_id};
@@ -1447,7 +1447,7 @@ async fn handle_incoming_rpc(
     correlation_id: u64,
     request: RpcRequest,
     data_dir: &Path,
-    docker: Option<Docker>,
+    _docker: Option<Docker>,
     mesh_handle: MeshHandle,
     self_tags: &[String],
     runtimes: &[Arc<dyn Runtime>],
@@ -1487,9 +1487,6 @@ async fn handle_incoming_rpc(
     //    (the `grant` field now transports bincode(Vec<SignedCapability>), root-first).
     // Action names are opaque to the capability verifier; the node defines its own vocabulary.
     let (action, chain_bytes): (&str, Option<Vec<u8>>) = match &request {
-        RpcRequest::Exec { grant, .. } => ("exec", grant.clone()),
-        RpcRequest::SyncFile { grant, .. } => ("sync", grant.clone()),
-        RpcRequest::SyncDelete { grant, .. } => ("delete", grant.clone()),
         RpcRequest::Deploy { grant, .. } => ("deploy", grant.clone()),
         RpcRequest::Kill { grant, .. } => ("kill", grant.clone()),
         _ => unreachable!("non-action RPCs are handled in the event loop"),
@@ -1530,111 +1527,11 @@ async fn handle_incoming_rpc(
     }
 
     match request {
-        RpcRequest::Exec { image, cmd, cwd, .. } => {
-            let Some(docker) = docker else {
-                tokio::spawn(async move {
-                    let _ = mesh_handle
-                        .respond_rpc(
-                            correlation_id,
-                            RpcResponse::Error("Docker not available on this node".into()),
-                        )
-                        .await;
-                });
-                return;
-            };
-            tokio::spawn(async move {
-                let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-                let spec = ExecSpec { image, cmd, cwd };
-                let resp = match exec_in_container(&docker, &spec, &home).await {
-                    Ok((stdout, stderr, exit_code)) => RpcResponse::ExecResult {
-                        stdout,
-                        stderr,
-                        exit_code: exit_code as i32,
-                    },
-                    Err(e) => RpcResponse::Error(format!("exec failed: {e}")),
-                };
-                let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
-            });
-        }
         RpcRequest::SegmentFetch { .. } => unreachable!("SegmentFetch handled in event loop"),
         RpcRequest::FetchChunk { .. } => unreachable!("FetchChunk handled in event loop"),
         RpcRequest::AppMessage { .. } => unreachable!("AppMessage handled in event loop"),
         RpcRequest::AppRequest { .. } => unreachable!("AppRequest handled in event loop"),
         RpcRequest::RelayReceipt { .. } => unreachable!("RelayReceipt handled in event loop"),
-        RpcRequest::SyncFile { path, data, .. } => {
-            let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-            let home_canon = home.canonicalize().unwrap_or(home.clone());
-
-            let resp = (|| -> RpcResponse {
-                if path.contains("..") {
-                    return RpcResponse::Error("path traversal not allowed".into());
-                }
-                let target = home.join(&path);
-                let canonical = match target.parent() {
-                    Some(p) => {
-                        let _ = std::fs::create_dir_all(p);
-                        match p.canonicalize().ok().map(|cp| {
-                            cp.join(target.file_name().unwrap_or_default())
-                        }) {
-                            Some(c) => c,
-                            None => {
-                                return RpcResponse::Error("cannot resolve target path".into())
-                            }
-                        }
-                    }
-                    None => return RpcResponse::Error("invalid path".into()),
-                };
-                if !canonical.starts_with(&home_canon) {
-                    return RpcResponse::Error("path traversal not allowed".into());
-                }
-                match std::fs::write(&canonical, &data) {
-                    Ok(()) => {
-                        info!("mesh sync: wrote {} ({} bytes)", canonical.display(), data.len());
-                        RpcResponse::SyncAck
-                    }
-                    Err(e) => RpcResponse::Error(format!("write failed: {e}")),
-                }
-            })();
-
-            tokio::spawn(async move {
-                let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
-            });
-        }
-        RpcRequest::SyncDelete { path, .. } => {
-            let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-            let home_canon = home.canonicalize().unwrap_or(home.clone());
-
-            let resp = (|| -> RpcResponse {
-                if path.contains("..") {
-                    return RpcResponse::Error("path traversal not allowed".into());
-                }
-                let target = home.join(&path);
-                // Resolve via the parent so a non-existent file still canonicalizes safely.
-                let canonical = match target.parent() {
-                    Some(p) => match p.canonicalize().ok().map(|cp| cp.join(target.file_name().unwrap_or_default())) {
-                        Some(c) => c,
-                        None => return RpcResponse::SyncAck, // parent gone → nothing to delete
-                    },
-                    None => return RpcResponse::Error("invalid path".into()),
-                };
-                if !canonical.starts_with(&home_canon) {
-                    return RpcResponse::Error("path traversal not allowed".into());
-                }
-                match std::fs::remove_file(&canonical) {
-                    Ok(()) => {
-                        info!("mesh sync: deleted {}", canonical.display());
-                        RpcResponse::SyncAck
-                    }
-                    // Already absent is success — a mirror delete is idempotent.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => RpcResponse::SyncAck,
-                    Err(e) => RpcResponse::Error(format!("delete failed: {e}")),
-                }
-            })();
-
-            tokio::spawn(async move {
-                let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
-            });
-        }
         RpcRequest::Deploy { workload, cpu_cores, mem_mb, duration_secs, bid, .. } => {
             // Decode the polymorphic workload (Docker | Wasm) and dispatch through the runtime
             // registry — the first runtime whose can_run matches its required tag.

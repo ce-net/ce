@@ -93,7 +93,8 @@ enum Commands {
     Id,
     /// Manage the local capability wallet (alias -> node id + held capability token).
     ///
-    /// Hold capabilities others issued you, so `ce exec`/`ce sync <alias>` auto-attach them.
+    /// Hold capabilities others issued you, so `ce tunnel`/`ce deploy <alias>` auto-attach them.
+    /// (Remote exec/sync are the `rdev` app, which has its own wallet.)
     Wallet {
         #[command(subcommand)]
         command: WalletCommands,
@@ -117,7 +118,8 @@ enum Commands {
     ///
     /// Self-issued: signed by THIS node's identity, so any node that accepts this node as a root
     /// (its own resources by default) honors it. Hand the printed token to the audience; they store
-    /// it with `ce wallet add` and `ce exec`/`ce sync` attach it automatically. See docs/capabilities.md.
+    /// it with `ce wallet add` (or the rdev app's wallet) and the relevant command attaches it.
+    /// See docs/capabilities.md.
     ///
     /// Example: ce grant <node-id> --can exec,sync,tunnel --port 22 --expires 90d
     Grant {
@@ -155,40 +157,8 @@ enum Commands {
         #[arg(long, default_value = "8844")]
         api_port: u16,
     },
-    /// Sync files to a remote device.
-    ///
-    /// Destination format: <device-name>:<remote-path>
-    /// Example: ce sync . desktop:~/code/ce
-    Sync {
-        src: String,
-        dst: String,
-        /// Scoped capability grant token (from `ce grant`), if you are not a full admin on the
-        /// target. (Not yet forwarded through the mesh proxy — see roadmap.)
-        #[arg(long)]
-        grant: Option<String>,
-        #[arg(long, default_value = "8844")]
-        api_port: u16,
-    },
-    /// Execute a command on a remote CE node inside a sandboxed container.
-    ///
-    /// The node's home directory is bind-mounted at /workspace inside the container.
-    /// Example: ce exec desktop --image rust:latest cargo build --release
-    Exec {
-        machine: String,
-        /// Docker image to run the command in (e.g. rust:latest, alpine:latest).
-        #[arg(long, short = 'i')]
-        image: String,
-        /// Working directory (relative to ~/). Defaults to ~/workspace.
-        #[arg(long)]
-        cwd: Option<String>,
-        /// Capability token override (else the wallet entry for the target is used).
-        #[arg(long)]
-        grant: Option<String>,
-        #[arg(long, default_value = "8844")]
-        api_port: u16,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
-    },
+    // Remote exec and file sync are apps now — see the `rdev` app (`rdev exec`, `rdev push`,
+    // `rdev watch`). CE keeps only the transport/economy/capability primitives below.
     /// Forward a local TCP port to a remote port on a peer over the CE mesh (TCP-over-libp2p).
     ///
     /// Needs a `tunnel` capability for the target. The forward runs in your local node and stays up
@@ -525,33 +495,6 @@ fn resolve_target(data_dir: &PathBuf, target: &str) -> Result<(String, Option<St
     }
 }
 
-
-/// Default paths to skip during sync.
-fn should_ignore(rel: &std::path::Path) -> bool {
-    let s = rel.to_string_lossy();
-    let ignore_dirs = ["target/", "node_modules/", ".git/objects/", "__pycache__/"];
-    let ignore_names = [".DS_Store"];
-    let ignore_exts = [".pyc"];
-
-    for d in &ignore_dirs {
-        if s.starts_with(d) || s.contains(&format!("/{d}")) {
-            return true;
-        }
-    }
-    if let Some(name) = rel.file_name() {
-        for n in &ignore_names {
-            if name == *n {
-                return true;
-            }
-        }
-    }
-    for ext in &ignore_exts {
-        if s.ends_with(ext) {
-            return true;
-        }
-    }
-    false
-}
 
 // ----- Service install/uninstall -----
 
@@ -1101,113 +1044,6 @@ async fn main() -> Result<()> {
             }
             let v: serde_json::Value = resp.json().await?;
             println!("revoked nonce {nonce} (tx {})", v["tx_id"].as_str().unwrap_or("?"));
-        }
-
-        Commands::Sync { src, dst, grant, api_port } => {
-            // Parse destination: "target:path" (target = wallet alias or 64-hex node id).
-            let (target, remote_path) = dst
-                .split_once(':')
-                .ok_or_else(|| anyhow!("dst must be in <target>:<path> format, e.g. desktop:~/code/ce"))?;
-
-            let (node_id_hex, wallet_cap) = resolve_target(&data_dir, target)?;
-            let cap = grant.clone().or(wallet_cap);
-
-            // Remote root is relative to the target's home (the mesh-sync endpoint joins it under ~/).
-            let remote_root = remote_path
-                .trim_start_matches("~/")
-                .trim_start_matches('~')
-                .trim_start_matches('/')
-                .trim_end_matches('/');
-
-            let src_path = std::path::Path::new(&src);
-            let client = reqwest::Client::new();
-            let mut synced = 0usize;
-            let mut skipped = 0usize;
-
-            for entry in walkdir::WalkDir::new(src_path)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
-            {
-                let rel = entry.path().strip_prefix(src_path).unwrap_or(entry.path());
-                if should_ignore(rel) {
-                    skipped += 1;
-                    continue;
-                }
-
-                let rel_str = rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let remote_file = if remote_root.is_empty() {
-                    rel_str
-                } else {
-                    format!("{remote_root}/{rel_str}")
-                };
-                // Route through the LOCAL node's mesh proxy (libp2p, NAT-traversing); the capability
-                // chain authorizing the write rides as the `caps` query param.
-                let mut url = format!("http://127.0.0.1:{api_port}/mesh-sync/{node_id_hex}/{remote_file}");
-                if let Some(c) = &cap {
-                    url.push_str("?caps=");
-                    url.push_str(c);
-                }
-
-                let file_bytes = std::fs::read(entry.path())?;
-                let resp = client.put(&url).body(file_bytes).send().await?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    eprintln!("WARN: {} -> {status}: {body}", rel.display());
-                } else {
-                    synced += 1;
-                }
-            }
-
-            println!("Synced {synced} files to {target}:{remote_path} ({skipped} ignored).");
-        }
-
-        Commands::Exec { machine, image, cwd, grant, command, api_port } => {
-            if command.is_empty() {
-                return Err(anyhow!("specify a command to run, e.g. ce exec desktop --image rust:latest cargo build"));
-            }
-
-            let (node_id_hex, wallet_cap) = resolve_target(&data_dir, &machine)?;
-            let cap = grant.clone().or(wallet_cap);
-
-            // Route through the LOCAL node's mesh proxy (libp2p) to the target host; the capability
-            // chain authorizing the exec rides in the `grant` field.
-            let url = format!("http://127.0.0.1:{api_port}/mesh-exec");
-            let body = serde_json::json!({
-                "node_id": node_id_hex,
-                "image": image,
-                "cmd": command,
-                "cwd": cwd,
-                "grant": cap,
-            });
-            let client = reqwest::Client::new();
-            let resp = client.post(&url).json(&body).send().await?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(anyhow!("exec failed ({status}): {text}"));
-            }
-
-            let result: serde_json::Value = resp.json().await?;
-            let stdout = result["stdout"].as_str().unwrap_or("");
-            let stderr = result["stderr"].as_str().unwrap_or("");
-            let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
-
-            if !stdout.is_empty() {
-                print!("{stdout}");
-            }
-            if !stderr.is_empty() {
-                eprint!("{stderr}");
-            }
-            if exit_code != 0 {
-                std::process::exit(exit_code as i32);
-            }
         }
 
         Commands::Tunnel { target, ports, grant, hint, api_port } => {

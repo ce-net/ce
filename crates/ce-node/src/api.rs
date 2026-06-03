@@ -6,7 +6,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
     Json, Router,
 };
 use bollard::{container::RemoveContainerOptions, Docker};
@@ -18,7 +18,6 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
     convert::Infallible,
     path::PathBuf,
     sync::Arc,
@@ -596,73 +595,6 @@ async fn revoke_capability(State(state): State<ApiState>, Json(req): Json<Revoke
     (StatusCode::CREATED, Json(serde_json::json!({ "tx_id": tx_id }))).into_response()
 }
 
-// ----- POST /mesh-exec -----
-//
-// Routes an exec request to a remote trusted device through the CE mesh (/ce/rpc/1).
-// The local node must be running with a relay connection; the target is identified by
-// CE NodeId (not an IP address). See docs/architecture.md for the full flow.
-
-#[derive(Debug, Deserialize)]
-struct MeshExecRequest {
-    /// CE NodeId of the target device (64 hex chars).
-    node_id: String,
-    /// Optional relay circuit multiaddr for dialing the target if not yet in the DHT.
-    /// Corresponds to the `multiaddr` field in machines.toml.
-    #[serde(default)]
-    hint_multiaddr: String,
-    image: String,
-    #[serde(default)]
-    cmd: Vec<String>,
-    #[serde(default)]
-    cwd: Option<String>,
-    /// Capability chain token (hex) authorizing this exec on the target. Forwarded to the host.
-    #[serde(default)]
-    grant: Option<String>,
-}
-
-async fn mesh_exec(State(state): State<ApiState>, Json(req): Json<MeshExecRequest>) -> Response {
-    let node_id: NodeId = match hex::decode(&req.node_id).ok().and_then(|b| b.try_into().ok()) {
-        Some(arr) => arr,
-        None => return err(StatusCode::BAD_REQUEST, "`node_id` must be 64 hex chars"),
-    };
-    let peer_id = match peer_id_from_node_id(&node_id) {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
-    };
-    if req.cmd.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "cmd must not be empty");
-    }
-
-    // Provide the relay circuit as a dial hint so the swarm can reach the target even
-    // if it isn't already in the Kademlia routing table.
-    if !req.hint_multiaddr.is_empty() {
-        let _ = state.mesh_handle.dial(req.hint_multiaddr).await;
-    }
-
-    let grant = match caps_to_bytes(&req.grant) {
-        Ok(g) => g,
-        Err(resp) => return resp,
-    };
-    let rpc_req = RpcRequest::Exec {
-        from_node: state.host_node_id,
-        image: req.image,
-        cmd: req.cmd,
-        cwd: req.cwd,
-        grant,
-    };
-
-    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
-        Ok(RpcResponse::ExecResult { stdout, stderr, exit_code }) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "stdout": stdout, "stderr": stderr, "exit_code": exit_code })),
-        )
-            .into_response(),
-        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
-        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
-        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
-    }
-}
-
 // ----- POST /mesh-deploy -----
 //
 // Directed placement: deploy a long-running cell on a SPECIFIC remote host through the mesh,
@@ -822,90 +754,6 @@ async fn mesh_kill(State(state): State<ApiState>, Json(req): Json<MeshKillReques
     let rpc_req = RpcRequest::Kill { from_node: state.host_node_id, job_id: req.job_id, grant };
     match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
         Ok(RpcResponse::Killed) => StatusCode::NO_CONTENT.into_response(),
-        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
-        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
-        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
-    }
-}
-
-// ----- PUT /mesh-sync/:node_id/*path -----
-//
-// Writes a single file on a remote trusted device through the CE mesh.
-// `:node_id` = 64 hex char CE NodeId of target. `*path` = path relative to target's `~/`.
-// Query param `hint` = optional relay circuit multiaddr dial hint.
-
-async fn mesh_sync_put(
-    State(state): State<ApiState>,
-    Path((node_id_hex, file_path)): Path<(String, String)>,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-    body: axum::body::Bytes,
-) -> Response {
-    let node_id: NodeId = match hex::decode(&node_id_hex).ok().and_then(|b| b.try_into().ok()) {
-        Some(arr) => arr,
-        None => return err(StatusCode::BAD_REQUEST, "node_id must be 64 hex chars"),
-    };
-    let peer_id = match peer_id_from_node_id(&node_id) {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
-    };
-
-    if let Some(hint) = params.get("hint") {
-        if !hint.is_empty() {
-            let _ = state.mesh_handle.dial(hint.clone()).await;
-        }
-    }
-
-    // Capability chain authorizing this write, presented as a hex `caps` query param.
-    let grant = match caps_to_bytes(&params.get("caps").cloned()) {
-        Ok(g) => g,
-        Err(resp) => return resp,
-    };
-    let rpc_req = RpcRequest::SyncFile {
-        from_node: state.host_node_id,
-        path: file_path,
-        data: body.to_vec(),
-        grant,
-    };
-
-    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
-        Ok(RpcResponse::SyncAck) => StatusCode::NO_CONTENT.into_response(),
-        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
-        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
-        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
-    }
-}
-
-// ----- DELETE /mesh-sync/:node_id/*path -----
-//
-// Delete a file on a remote trusted device through the mesh (true-mirror delete propagation).
-// Same `caps` query param as the PUT; authorized by a `delete` capability on the receiver.
-
-async fn mesh_sync_delete(
-    State(state): State<ApiState>,
-    Path((node_id_hex, file_path)): Path<(String, String)>,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Response {
-    let node_id: NodeId = match hex::decode(&node_id_hex).ok().and_then(|b| b.try_into().ok()) {
-        Some(arr) => arr,
-        None => return err(StatusCode::BAD_REQUEST, "node_id must be 64 hex chars"),
-    };
-    let peer_id = match peer_id_from_node_id(&node_id) {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
-    };
-    if let Some(hint) = params.get("hint") {
-        if !hint.is_empty() {
-            let _ = state.mesh_handle.dial(hint.clone()).await;
-        }
-    }
-    let grant = match caps_to_bytes(&params.get("caps").cloned()) {
-        Ok(g) => g,
-        Err(resp) => return resp,
-    };
-    let rpc_req = RpcRequest::SyncDelete { from_node: state.host_node_id, path: file_path, grant };
-
-    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
-        Ok(RpcResponse::SyncAck) => StatusCode::NO_CONTENT.into_response(),
         Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
         Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
         Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
@@ -1904,10 +1752,8 @@ pub async fn start(
         .route("/relay/pay", post(relay_pay))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         // Personal mesh OS: relay-routed mesh RPCs (correct path for NAT traversal).
-        .route("/mesh-exec", post(mesh_exec))
         .route("/mesh-deploy", post(mesh_deploy))
         .route("/mesh-kill", post(mesh_kill))
-        .route("/mesh-sync/:node_id/*path", put(mesh_sync_put).delete(mesh_sync_delete))
         .route("/tunnel", post(open_tunnel))
         .with_state(state);
 

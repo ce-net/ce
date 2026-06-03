@@ -98,35 +98,9 @@ const MAX_BLOCKS_PER_SYNC: usize = 10_000;
 /// Request payload for the /ce/rpc/1 protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcRequest {
-    /// Run a sandboxed command on the remote node. The caller's CE NodeId is included
-    /// so the receiver can cross-check it against the noise-authenticated PeerId.
-    Exec {
-        from_node: NodeId,
-        image: String,
-        cmd: Vec<String>,
-        cwd: Option<String>,
-        /// Optional scoped capability grant (bincode of `SignedGrant`), used when the
-        /// caller is not a full-scope admin. Opaque to the transport; the receiving node
-        /// decodes and enforces it. `None` means the caller relies on admin trust.
-        grant: Option<Vec<u8>>,
-    },
-    /// Write a single file on the remote node's home directory.
-    /// `path` is relative to `~/` — the receiver rejects any `..` components.
-    SyncFile {
-        from_node: NodeId,
-        path: String,
-        data: Vec<u8>,
-        /// Optional scoped capability grant (bincode of `SignedGrant`). See `Exec`.
-        grant: Option<Vec<u8>>,
-    },
-    /// Delete a single file on the remote node's home directory. `path` is relative to `~/` — the
-    /// receiver rejects any `..` components. Replies with `SyncAck`. Used by mirror to keep a true
-    /// 1:1 copy when a local file is removed or renamed.
-    SyncDelete {
-        from_node: NodeId,
-        path: String,
-        grant: Option<Vec<u8>>,
-    },
+    // exec / file-sync / file-delete used to live here as bespoke node RPCs. They are apps now
+    // (run processes / touch the filesystem) and live in the `rdev` app over `AppRequest` + the
+    // `ce-cap` verifier. CE keeps only transport/economy/data RPCs below.
     /// Fetch a historical archive segment from a peer's local archive.
     /// The peer replies with SegmentData if it holds the segment, or Error otherwise.
     SegmentFetch {
@@ -198,10 +172,7 @@ pub enum RpcRequest {
 impl RpcRequest {
     pub fn from_node(&self) -> NodeId {
         match self {
-            Self::Exec { from_node, .. }
-            | Self::SyncFile { from_node, .. }
-            | Self::SyncDelete { from_node, .. }
-            | Self::SegmentFetch { from_node, .. }
+            Self::SegmentFetch { from_node, .. }
             | Self::Deploy { from_node, .. }
             | Self::Kill { from_node, .. }
             | Self::FetchChunk { from_node, .. }
