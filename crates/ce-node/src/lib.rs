@@ -286,7 +286,7 @@ impl Node {
         // so the advertised set and the enforced set can never diverge.
         let self_tags = capability_tags(docker_available, num_cpus() as u32, available_mem_mb());
 
-        let (mesh, mesh_handle, mesh_rx) = if config.disable_local_discovery {
+        let (mesh, mesh_handle, mesh_rx, tunnel_control) = if config.disable_local_discovery {
             Mesh::new_isolated(identity.secret_bytes())?
         } else {
             Mesh::new(identity.secret_bytes())?
@@ -473,6 +473,19 @@ impl Node {
             });
         }
 
+        // Tunnel: accept inbound /ce/tunnel/1 streams and splice them to local TCP, gated by a
+        // `tunnel` capability (with optional allowed-ports caveat). Driven via the cloned control.
+        {
+            let control = tunnel_control.clone();
+            let host = identity.node_id();
+            let roots = Arc::new(load_accepted_roots(&node.config.data_dir));
+            let tags = Arc::new(self_tags.clone());
+            let chain_t = chain.clone();
+            tokio::spawn(async move {
+                tunnel_accept_loop(control, host, roots, tags, chain_t).await;
+            });
+        }
+
         {
             let chain2 = chain.clone();
             let identity2 = identity.clone();
@@ -487,6 +500,7 @@ impl Node {
             let atlas3 = atlas.clone();
             let docker3 = docker.clone();
             let self_tags3 = self_tags.clone();
+            let tunnel_control2 = tunnel_control.clone();
             let tls_seed = if node.config.tls { Some(identity.secret_bytes()) } else { None };
             tokio::spawn(async move {
                 if let Err(e) = api::start(
@@ -510,6 +524,7 @@ impl Node {
                     tls_seed,
                     app_inbox,
                     app_msg_tx,
+                    tunnel_control2,
                 )
                 .await
                 {
@@ -635,6 +650,104 @@ pub fn load_accepted_roots(data_dir: &Path) -> Vec<NodeId> {
         .filter(|l| !l.is_empty())
         .filter_map(|h| hex::decode(h).ok().and_then(|b| b.try_into().ok()))
         .collect()
+}
+
+// ----- TCP tunnel (TCP-over-libp2p) -----
+
+/// Accept inbound `/ce/tunnel/1` streams and splice each to a local TCP port. Each stream begins
+/// with a header — `remote_port: u16 BE`, `caps_len: u32 BE`, then the capability chain bytes — and
+/// is authorized by a `tunnel` capability before any bytes are forwarded. Runs as its own task via
+/// a cloned stream control (the swarm is `!Sync`).
+async fn tunnel_accept_loop(
+    mut control: ce_mesh::StreamControl,
+    host_node_id: NodeId,
+    accepted_roots: Arc<Vec<NodeId>>,
+    self_tags: Arc<Vec<String>>,
+    chain: ChainHandle,
+) {
+    use futures::StreamExt;
+    let mut incoming = match control.accept(ce_mesh::TUNNEL_PROTOCOL) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("tunnel: cannot register accept handler: {e}");
+            return;
+        }
+    };
+    while let Some((peer, stream)) = incoming.next().await {
+        let roots = accepted_roots.clone();
+        let tags = self_tags.clone();
+        let chain = chain.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                handle_tunnel_stream(peer, stream, host_node_id, &roots, &tags, &chain).await
+            {
+                debug!("tunnel stream rejected/closed: {e}");
+            }
+        });
+    }
+}
+
+async fn handle_tunnel_stream(
+    peer: ce_mesh::CePeerId,
+    stream: ce_mesh::MeshStream,
+    host_node_id: NodeId,
+    accepted_roots: &[NodeId],
+    self_tags: &[String],
+    chain: &ChainHandle,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let mut s = stream.compat();
+
+    // Header: remote_port (u16 BE), caps_len (u32 BE), then the capability chain bytes.
+    let mut hdr = [0u8; 6];
+    s.read_exact(&mut hdr).await?;
+    let port = u16::from_be_bytes([hdr[0], hdr[1]]);
+    let caps_len = u32::from_be_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]) as usize;
+    if caps_len > 64 * 1024 {
+        anyhow::bail!("capability header too large");
+    }
+    let mut caps_bytes = vec![0u8; caps_len];
+    s.read_exact(&mut caps_bytes).await?;
+
+    // Authorize: a `tunnel` capability rooted at us / a configured root, with the requested port
+    // within any allowed-ports caveat.
+    let requester = ce_mesh::node_id_from_peer_id(&peer)
+        .ok_or_else(|| anyhow::anyhow!("peer id is not a CE node id"))?;
+    let caps = crate::capability::decode_chain_bytes(&caps_bytes)?;
+    let mut revoked: std::collections::HashSet<(NodeId, u64)> = std::collections::HashSet::new();
+    for link in &caps {
+        if chain.is_revoked(link.cap.issuer, link.cap.nonce).await {
+            revoked.insert((link.cap.issuer, link.cap.nonce));
+        }
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let is_revoked = |i: &NodeId, n: u64| revoked.contains(&(*i, n));
+    crate::capability::authorize(
+        &host_node_id,
+        accepted_roots,
+        self_tags,
+        now,
+        &requester,
+        crate::capability::Ability::Tunnel,
+        &caps,
+        &is_revoked,
+    )
+    .map_err(|e| anyhow::anyhow!("tunnel denied: {e}"))?;
+    if let Some(leaf) = caps.last() {
+        if let Some(allowed) = &leaf.cap.caveats.allowed_ports {
+            if !allowed.contains(&port) {
+                anyhow::bail!("tunnel to port {port} not permitted by capability");
+            }
+        }
+    }
+
+    // Splice to the local TCP service.
+    let mut upstream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    info!("tunnel: {} -> 127.0.0.1:{port}", hex::encode(&requester[..4]));
+    tokio::io::copy_bidirectional(&mut s, &mut upstream).await?;
+    Ok(())
 }
 
 async fn mesh_event_loop(

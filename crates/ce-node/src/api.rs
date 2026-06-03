@@ -73,6 +73,8 @@ struct ApiState {
     self_tags: Arc<Vec<String>>,
     /// Capability root keys this node honors (in addition to its own identity). See docs/capabilities.md.
     accepted_roots: Arc<Vec<NodeId>>,
+    /// Stream control for opening outbound TCP tunnels over the mesh.
+    tunnel_control: ce_mesh::StreamControl,
 }
 
 #[derive(Debug, Serialize)]
@@ -1146,6 +1148,114 @@ async fn mesh_sync_put(
     }
 }
 
+// ----- POST /tunnel -----
+//
+// Forward a local TCP port to a remote port on a target node over the mesh (TCP-over-libp2p).
+// Binds 127.0.0.1:local_port; each accepted connection opens a `/ce/tunnel/1` stream to the target,
+// writes a header (remote_port + capability chain), and splices bytes both ways. Returns once the
+// listener is bound; the forwarding runs in the background until the node stops.
+
+#[derive(Debug, Deserialize)]
+pub struct TunnelRequest {
+    /// Target node id (64 hex chars).
+    pub node_id: String,
+    /// Local TCP port to bind on 127.0.0.1.
+    pub local_port: u16,
+    /// Remote TCP port on the target to forward to.
+    pub remote_port: u16,
+    /// Capability chain token (hex) authorizing the tunnel (needs the `tunnel` ability).
+    #[serde(default)]
+    pub caps: Option<String>,
+    /// Optional relay circuit multiaddr dial hint.
+    #[serde(default)]
+    pub hint: Option<String>,
+}
+
+async fn open_tunnel(State(state): State<ApiState>, Json(req): Json<TunnelRequest>) -> Response {
+    let node_id: NodeId = match hex::decode(&req.node_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "node_id must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&node_id) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
+    };
+    if let Some(h) = &req.hint {
+        if !h.is_empty() {
+            let _ = state.mesh_handle.dial(h.clone()).await;
+        }
+    }
+    // Validate the capability token now and carry its canonical bytes in each stream header.
+    let caps_bytes = match &req.caps {
+        Some(t) => match crate::capability::decode_chain(t) {
+            Ok(c) => crate::capability::encode_chain_bytes(&c),
+            Err(_) => return err(StatusCode::BAD_REQUEST, "malformed capability token"),
+        },
+        None => Vec::new(),
+    };
+
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", req.local_port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("bind 127.0.0.1:{}: {e}", req.local_port));
+        }
+    };
+
+    let remote_port = req.remote_port;
+    let control = state.tunnel_control.clone();
+    tokio::spawn(async move {
+        loop {
+            let conn = match listener.accept().await {
+                Ok((c, _)) => c,
+                Err(e) => {
+                    tracing::warn!("tunnel listener: {e}");
+                    break;
+                }
+            };
+            let mut control = control.clone();
+            let caps_bytes = caps_bytes.clone();
+            tokio::spawn(async move {
+                if let Err(e) = drive_tunnel_conn(&mut control, peer_id, conn, remote_port, &caps_bytes).await {
+                    tracing::debug!("tunnel conn closed: {e}");
+                }
+            });
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "local_port": req.local_port,
+            "remote_port": remote_port,
+            "node_id": req.node_id,
+        })),
+    )
+        .into_response()
+}
+
+/// Open a tunnel stream to `peer`, send the header, and splice `conn` to it both ways.
+async fn drive_tunnel_conn(
+    control: &mut ce_mesh::StreamControl,
+    peer: ce_mesh::CePeerId,
+    mut conn: tokio::net::TcpStream,
+    remote_port: u16,
+    caps_bytes: &[u8],
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let stream = control
+        .open_stream(peer, ce_mesh::TUNNEL_PROTOCOL)
+        .await
+        .map_err(|e| anyhow::anyhow!("open tunnel stream: {e}"))?;
+    let mut s = stream.compat();
+    s.write_all(&remote_port.to_be_bytes()).await?;
+    s.write_all(&(caps_bytes.len() as u32).to_be_bytes()).await?;
+    s.write_all(caps_bytes).await?;
+    tokio::io::copy_bidirectional(&mut conn, &mut s).await?;
+    Ok(())
+}
+
 // ----- GET /bootstrap -----
 
 #[derive(Serialize)]
@@ -1962,6 +2072,7 @@ pub async fn start(
     tls_seed: Option<[u8; 32]>,
     app_inbox: AppInbox,
     app_msg_tx: broadcast::Sender<AppMessage>,
+    tunnel_control: ce_mesh::StreamControl,
 ) -> Result<()> {
     if docker.is_none() {
         tracing::warn!("Docker unavailable — job routes and exec will return 503");
@@ -1991,6 +2102,7 @@ pub async fn start(
         listen_port,
         self_tags: Arc::new(self_tags),
         accepted_roots,
+        tunnel_control,
     };
 
     let app = Router::new()
@@ -2041,6 +2153,7 @@ pub async fn start(
         .route("/mesh-deploy", post(mesh_deploy))
         .route("/mesh-kill", post(mesh_kill))
         .route("/mesh-sync/:node_id/*path", put(mesh_sync_put))
+        .route("/tunnel", post(open_tunnel))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");

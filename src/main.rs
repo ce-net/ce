@@ -183,14 +183,31 @@ enum Commands {
         /// Working directory (relative to ~/). Defaults to ~/workspace.
         #[arg(long)]
         cwd: Option<String>,
-        /// Scoped capability grant token (from `ce grant`), if you are not a full admin on the
-        /// target. (Not yet forwarded through the mesh proxy — see roadmap.)
+        /// Capability token override (else the wallet entry for the target is used).
         #[arg(long)]
         grant: Option<String>,
         #[arg(long, default_value = "8844")]
         api_port: u16,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Forward a local TCP port to a remote port on a peer over the CE mesh (TCP-over-libp2p).
+    ///
+    /// Needs a `tunnel` capability for the target. The forward runs in your local node and stays up
+    /// while `ce start` runs. Example: ce tunnel desktop 2222:22  then  ssh -p 2222 you@localhost
+    Tunnel {
+        /// Target: a wallet alias or a 64-hex node id.
+        target: String,
+        /// Port mapping `<local>:<remote>` (e.g. 2222:22).
+        ports: String,
+        /// Capability token override (else the wallet entry for the target is used).
+        #[arg(long)]
+        grant: Option<String>,
+        /// Relay circuit multiaddr dial hint.
+        #[arg(long)]
+        hint: Option<String>,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
     },
     /// Deploy a cell (container job) on the local node.
     ///
@@ -1193,6 +1210,37 @@ async fn main() -> Result<()> {
             if exit_code != 0 {
                 std::process::exit(exit_code as i32);
             }
+        }
+
+        Commands::Tunnel { target, ports, grant, hint, api_port } => {
+            let (local, remote) = ports
+                .split_once(':')
+                .ok_or_else(|| anyhow!("ports must be <local>:<remote>, e.g. 2222:22"))?;
+            let local: u16 = local.parse().map_err(|_| anyhow!("bad local port"))?;
+            let remote: u16 = remote.parse().map_err(|_| anyhow!("bad remote port"))?;
+
+            let (node_id_hex, wallet_cap) = resolve_target(&data_dir, &target)?;
+            let cap = grant.or(wallet_cap);
+
+            let url = format!("http://127.0.0.1:{api_port}/tunnel");
+            let body = serde_json::json!({
+                "node_id": node_id_hex,
+                "local_port": local,
+                "remote_port": remote,
+                "caps": cap,
+                "hint": hint,
+            });
+            let client = reqwest::Client::new();
+            let resp = client.post(&url).json(&body).send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("tunnel failed ({status}): {text}"));
+            }
+            println!(
+                "Tunnel up: localhost:{local} -> {target}:{remote} over CE.\n\
+                 It runs inside your local node (keep `ce start` running). e.g. ssh -p {local} <user>@localhost"
+            );
         }
 
         Commands::Deploy { image, on, fund, cpu, mem, duration, cmd, grant, api_port } => {

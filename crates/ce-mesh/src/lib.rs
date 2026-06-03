@@ -422,7 +422,22 @@ struct CeBehaviour {
     relay_server: relay::Behaviour,
     /// /ce/rpc/1 — device-to-device exec and file sync, relay-routed.
     rpc: request_response::Behaviour<CeRpcCodec>,
+    /// /ce/tunnel/1 — raw bidirectional byte streams (TCP-over-libp2p), relay-routed. Driven
+    /// entirely through the cloned [`libp2p_stream::Control`] handed to the node; emits no events.
+    stream: libp2p_stream::Behaviour,
 }
+
+/// The libp2p protocol for CE TCP tunnels. The node forwards a local TCP port to a remote port
+/// over this protocol; authorization is a `tunnel` capability checked on the receiving node.
+pub const TUNNEL_PROTOCOL: libp2p::StreamProtocol = libp2p::StreamProtocol::new("/ce/tunnel/1");
+
+/// Cloneable handle to open/accept tunnel streams (re-exported so the node can drive tunnels from
+/// tasks without touching the `!Sync` swarm).
+pub use libp2p_stream::Control as StreamControl;
+
+/// A raw bidirectional byte stream (re-exported so the node can splice tunnels without a direct
+/// libp2p dependency). Implements `futures::{AsyncRead, AsyncWrite}`.
+pub use libp2p::Stream as MeshStream;
 
 // ----- Topic hash bundle -----
 
@@ -590,7 +605,7 @@ pub struct Mesh {
 impl Mesh {
     pub fn new(
         secret_key_bytes: [u8; 32],
-    ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>)> {
+    ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>, StreamControl)> {
         Self::new_inner(secret_key_bytes, false)
     }
 
@@ -598,14 +613,14 @@ impl Mesh {
     /// test nodes from connecting to live local nodes via multicast.
     pub fn new_isolated(
         secret_key_bytes: [u8; 32],
-    ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>)> {
+    ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>, StreamControl)> {
         Self::new_inner(secret_key_bytes, true)
     }
 
     fn new_inner(
         secret_key_bytes: [u8; 32],
         disable_local_discovery: bool,
-    ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>)> {
+    ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>, StreamControl)> {
         let ed_secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(secret_key_bytes)?;
         let ed_kp = libp2p::identity::ed25519::Keypair::from(ed_secret);
         let keypair = libp2p::identity::Keypair::from(ed_kp);
@@ -682,9 +697,14 @@ impl Mesh {
                     relay_client,
                     relay_server: relay::Behaviour::new(peer_id, relay::Config::default()),
                     rpc,
+                    stream: libp2p_stream::Behaviour::new(),
                 })
             })?
             .build();
+
+        // Clone a control handle out before the swarm is moved into the event loop; tunnels are
+        // driven from spawned tasks via this handle (the swarm itself is !Sync).
+        let stream_control = swarm.behaviour().stream.new_control();
 
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(256);
@@ -711,7 +731,7 @@ impl Mesh {
         };
 
         let handle = MeshHandle { cmd_tx };
-        Ok((mesh, handle, event_rx))
+        Ok((mesh, handle, event_rx, stream_control))
     }
 
     pub fn add_bootstrap(&mut self, addr: &str) -> Result<()> {
