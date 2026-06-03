@@ -154,10 +154,35 @@ pay-as-you-go cheap. The gradient itself lives in apps.
 
 ---
 
+## The line: CE provides primitives, apps provide policy
+
+CE is a substrate, not an application. The **primitives** it owns:
+
+- **Identity** — Ed25519 sign/verify.
+- **Mesh transport** — directed request/response (`AppRequest`/`AppReply`), pubsub (gossipsub),
+  raw bidirectional streams (`/ce/tunnel/1` via `libp2p-stream`), NAT traversal (relay/DCUtR).
+- **Content-addressed data** — blobs + chunk fetch.
+- **Economy** — the ledger: balances, transfer, emission (longer-term: generic conditional
+  payment/escrow rather than per-app tx types).
+- **Capability verification** — the `ce-cap` crate: verify a signed, attenuating chain authorizes
+  an **opaque action string**, rooted at a key. No application vocabulary lives in CE.
+
+Everything else is an **app** built on those primitives via the SDK (`ce-rs`):
+
+> **New device-to-device features are apps over `AppRequest` + stream + the `ce-cap` verifier +
+> payment — NOT new `RpcRequest` variants, HTTP endpoints, or consensus tx types.**
+
+`exec`/`sync`/`tunnel`/`deploy` are apps (being extracted; see the `rdev` repo). The node exposes a
+small set of privileged *local* services (run-workload, fs) that apps bridge to the mesh and gate
+with capabilities. The chain stays generic — resist app-specific tx types (they are forever after
+launch). Litmus test: product semantics (a job, a name, a tunnel) → app; a key/byte/coin mechanism
+every app would otherwise reinvent → primitive.
+
 ## Design invariants
 
 - Integers, never floats, for anything consensus touches.
-- Mesh-first: device-to-device always via `/ce/rpc/1`, never stored ip:port HTTP.
-- The node enforces authorization before doing work; clients are never trusted by default.
+- Mesh-first: device-to-device always over libp2p, never stored ip:port HTTP.
+- The enforcer authorizes before doing work (via `ce-cap`); clients are never trusted by default.
 - Amounts cross JSON as strings (exceed 2^53).
 - `Mesh` is `!Sync`; mining is `spawn_blocking`; Docker is optional.
+- Capability actions are opaque strings; the verifier knows no app vocabulary.
