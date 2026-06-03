@@ -164,9 +164,6 @@ pub enum TxKind {
     /// Job expiry: payer reclaims locked bid credits after EXPIRY_BLOCKS have elapsed
     /// without a matching JobSettle.
     JobExpire { job_id: [u8; 32], payer: NodeId },
-    /// Trust grant: records that `grantor` trusts `grantee` as a named device.
-    /// Used by the personal mesh OS layer for authenticated sync and exec.
-    TrustGrant { grantor: NodeId, grantee: NodeId, label: String },
     /// Periodic heartbeat payment for a long-running cell.
     /// Signed by the host; debits the cell's wallet and credits the host.
     /// `epoch` must strictly increase per (cell, host) pair to prevent replay.
@@ -557,7 +554,6 @@ impl Chain {
                     let h = block.index;
                     self.node_stat(payer, h).expiries += 1;
                 }
-                TxKind::TrustGrant { .. } => {}
                 TxKind::ChannelOpen { channel_id, payer, host, capacity, expiry_height } => {
                     self.open_channels.insert(*channel_id, (*payer, *host, *capacity, *expiry_height));
                 }
@@ -840,14 +836,6 @@ impl Chain {
                 }
                 // The bid must have been in a block long enough ago.
                 if block.index <= bid_block_index + EXPIRY_BLOCKS {
-                    return false;
-                }
-            }
-        }
-        // TrustGrant rules: must be signed by the grantor.
-        for tx in &block.transactions {
-            if let TxKind::TrustGrant { grantor, .. } = &tx.kind {
-                if &tx.origin != grantor {
                     return false;
                 }
             }
@@ -2083,16 +2071,6 @@ mod tests {
         Tx::new(kind, payer.node_id(), sig)
     }
 
-    fn signed_trust_grant(grantor: &Identity, grantee: NodeId, label: &str) -> Tx {
-        let kind = TxKind::TrustGrant {
-            grantor: grantor.node_id(),
-            grantee,
-            label: label.to_string(),
-        };
-        let data = bincode::serialize(&kind).unwrap();
-        let sig = grantor.sign(&data);
-        Tx::new(kind, grantor.node_id(), sig)
-    }
 
     #[test]
     fn job_expire_happy_path() {
@@ -2157,19 +2135,6 @@ mod tests {
         assert_eq!(chain.locked_balance(&payer.node_id()), 0, "locked balance must clear after settle");
     }
 
-    #[test]
-    fn trust_grant_happy_path() {
-        let grantor = make_identity("tg-grantor");
-        let grantee = make_identity("tg-grantee");
-        let mut chain = Chain::genesis();
-        fund(&mut chain, &grantor, 100);
-
-        let tg = signed_trust_grant(&grantor, grantee.node_id(), "laptop");
-        let reward = signed_uptime_reward(&grantor, chain.tip().index + 1);
-        let mut block = chain.next_block(vec![reward, tg], grantor.node_id());
-        block.seal(&grantor);
-        assert!(chain.append(block), "valid TrustGrant must be accepted");
-    }
 
     fn signed_heartbeat(host: &Identity, cell_id: NodeId, amount: u128, epoch: u64) -> Tx {
         let kind = TxKind::Heartbeat { cell: cell_id, host: host.node_id(), amount, epoch };
@@ -2284,27 +2249,6 @@ mod tests {
         assert!(!chain.append(block), "heartbeat with wrong signer must be rejected");
     }
 
-    #[test]
-    fn trust_grant_rejects_wrong_signer() {
-        let grantor = make_identity("tg-bad-grantor");
-        let grantee = make_identity("tg-bad-grantee");
-        let attacker = make_identity("tg-attacker");
-        let mut chain = Chain::genesis();
-        fund(&mut chain, &attacker, 100);
-
-        let kind = TxKind::TrustGrant {
-            grantor: grantor.node_id(),
-            grantee: grantee.node_id(),
-            label: "laptop".into(),
-        };
-        let data = bincode::serialize(&kind).unwrap();
-        let bad_sig = attacker.sign(&data);
-        let bad_tg = Tx::new(kind, attacker.node_id(), bad_sig);
-        let reward = signed_uptime_reward(&attacker, chain.tip().index + 1);
-        let mut block = chain.next_block(vec![reward, bad_tg], attacker.node_id());
-        block.seal(&attacker);
-        assert!(!chain.append(block), "TrustGrant with wrong signer must be rejected");
-    }
 
     fn signed_revoke_cap(issuer: &Identity, nonce: u64) -> Tx {
         let kind = TxKind::RevokeCapability { issuer: issuer.node_id(), nonce };

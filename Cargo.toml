@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/ce-identity",
+    "crates/ce-cap",
     "crates/ce-tls",
     "crates/ce-runtime",
     "crates/ce-wasm",
@@ -25,6 +26,7 @@ path = "src/main.rs"
 [dependencies]
 ce-node = { path = "crates/ce-node" }
 ce-identity = { path = "crates/ce-identity" }
+ce-cap = { path = "crates/ce-cap" }
 ce-chain = { path = "crates/ce-chain" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

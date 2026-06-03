@@ -379,7 +379,6 @@ fn tx_burn_amount(tx: &Tx) -> Option<u128> {
         TxKind::JobSettle { cost, .. } => Some(*cost),
         TxKind::Heartbeat { amount, .. } => Some(*amount),
         TxKind::JobExpire { .. }
-        | TxKind::TrustGrant { .. }
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
         | TxKind::ChannelExpire { .. }

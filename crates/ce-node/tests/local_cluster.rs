@@ -558,7 +558,7 @@ async fn job_lifecycle() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn mesh_deploy_and_kill_roundtrip() {
-    use ce_node::capability::{Ability, Caveats, Resource, SignedCapability, encode_chain};
+    use ce_node::capability::{Caveats, Resource, SignedCapability, encode_chain};
 
     // Host A — runs the container.
     let (p2p_a, api_a) = alloc_ports();
@@ -601,7 +601,7 @@ async fn mesh_deploy_and_kill_roundtrip() {
         let cap = SignedCapability::issue(
             &a_identity,
             b_id,
-            vec![Ability::Deploy],
+            vec!["deploy".to_string()],
             Resource::Node(a_id),
             Caveats::default(),
             1,
@@ -797,7 +797,7 @@ async fn paid_provider_refuses_free_fetch() {
 /// launching. Without Stage 4 staging this deploy fails ("module not in blob store").
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_deploy_stages_module_from_mesh() {
-    use ce_node::capability::{Ability, Caveats, Resource, SignedCapability, encode_chain};
+    use ce_node::capability::{Caveats, Resource, SignedCapability, encode_chain};
 
     // Deployer + provider A.
     let (p2p_a, api_a) = alloc_ports();
@@ -838,7 +838,7 @@ async fn wasm_deploy_stages_module_from_mesh() {
         let cap = SignedCapability::issue(
             &b_identity,
             a_id,
-            vec![Ability::Deploy],
+            vec!["deploy".to_string()],
             Resource::Node(b_identity.node_id()),
             Caveats::default(),
             1,

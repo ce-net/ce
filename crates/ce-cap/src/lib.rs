@@ -53,53 +53,11 @@ const CAP_DOMAIN: &[u8] = b"ce-cap-v1";
 /// and to name a capability for revocation.
 pub type CapId = [u8; 32];
 
-/// A generic action a capability can authorize. No product semantics — just operations a node can
-/// perform on behalf of a caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Ability {
-    /// Run a command in a sandboxed container (mesh `Exec`).
-    Exec,
-    /// Write a file (mesh `SyncFile`) — confine with [`Caveats::path_prefix`].
-    Sync,
-    /// Delete a file (mesh `SyncDelete`) — confine with [`Caveats::path_prefix`].
-    Delete,
-    /// Open a TCP tunnel to the node — confine target ports with [`Caveats::allowed_ports`].
-    Tunnel,
-    /// Deploy a cell / submit a job.
-    Deploy,
-    /// Force-stop a job.
-    Kill,
-    /// Read status / list jobs.
-    Status,
-}
-
-impl Ability {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Ability::Exec => "exec",
-            Ability::Sync => "sync",
-            Ability::Delete => "delete",
-            Ability::Tunnel => "tunnel",
-            Ability::Deploy => "deploy",
-            Ability::Kill => "kill",
-            Ability::Status => "status",
-        }
-    }
-
-    pub fn parse(s: &str) -> Result<Self> {
-        Ok(match s.to_ascii_lowercase().as_str() {
-            "exec" => Ability::Exec,
-            "sync" => Ability::Sync,
-            "delete" => Ability::Delete,
-            "tunnel" => Ability::Tunnel,
-            "deploy" => Ability::Deploy,
-            "kill" => Ability::Kill,
-            "status" => Ability::Status,
-            other => return Err(anyhow!("unknown ability '{other}'")),
-        })
-    }
-}
+// Abilities are **opaque action strings** (e.g. "exec", "sync", "tunnel"). CE assigns them no
+// meaning — the enforcer (the node, or an app) defines its own action vocabulary. The verifier only
+// checks that the requested action string is present in the capability's `abilities` set and is
+// preserved by attenuation. This keeps the primitive free of application semantics: adding a new
+// app action never touches this crate.
 
 /// Which nodes a capability applies to, matched against a node's id and capability self-tags
 /// (the same `gpu`/`docker`/`linux`/... set advertised in the atlas).
@@ -250,7 +208,7 @@ pub struct Capability {
     /// Who receives this authority (the holder).
     pub audience: NodeId,
     /// The operations granted.
-    pub abilities: Vec<Ability>,
+    pub abilities: Vec<String>,
     /// Which nodes this applies to.
     pub resource: Resource,
     /// Constraints.
@@ -311,7 +269,7 @@ impl SignedCapability {
     pub fn issue(
         issuer: &Identity,
         audience: NodeId,
-        abilities: Vec<Ability>,
+        abilities: Vec<String>,
         resource: Resource,
         caveats: Caveats,
         nonce: u64,
@@ -391,7 +349,7 @@ pub fn authorize(
     self_tags: &[String],
     now: u64,
     requester: &NodeId,
-    action: Ability,
+    action: &str,
     chain: &[SignedCapability],
     is_revoked: &dyn Fn(&NodeId, u64) -> bool,
 ) -> Result<(), String> {
@@ -454,13 +412,13 @@ pub fn authorize(
     if &leaf.audience != requester {
         return Err("leaf capability is not held by the request sender".into());
     }
-    if !leaf.abilities.contains(&action) {
-        return Err(format!("capability does not grant '{}'", action.as_str()));
+    if !leaf.abilities.iter().any(|a| a == action) {
+        return Err(format!("capability does not grant '{action}'"));
     }
     Ok(())
 }
 
-fn abilities_subset(child: &[Ability], parent: &[Ability]) -> bool {
+fn abilities_subset(child: &[String], parent: &[String]) -> bool {
     child.iter().all(|a| parent.contains(a))
 }
 
@@ -496,7 +454,7 @@ mod tests {
         let c = SignedCapability::issue(
             &node,
             laptop.node_id(),
-            vec![Ability::Exec, Ability::Sync],
+            vec!["exec".to_string(), "sync".to_string()],
             Resource::Any,
             Caveats::default(),
             1,
@@ -504,12 +462,12 @@ mod tests {
         );
         // Authorized by the resource owner (issuer == self) for a granted ability.
         assert!(
-            authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), Ability::Exec, &[c.clone()], &never_revoked)
+            authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), "exec", &[c.clone()], &never_revoked)
                 .is_ok()
         );
         // ...but not for an ability it doesn't grant.
         assert!(
-            authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), Ability::Tunnel, &[c], &never_revoked)
+            authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), "tunnel", &[c], &never_revoked)
                 .is_err()
         );
     }
@@ -519,7 +477,7 @@ mod tests {
         let node = id("node");
         let who = id("who");
         assert!(
-            authorize(&node.node_id(), &[], &[], 1000, &who.node_id(), Ability::Exec, &[], &never_revoked).is_err()
+            authorize(&node.node_id(), &[], &[], 1000, &who.node_id(), "exec", &[], &never_revoked).is_err()
         );
     }
 
@@ -531,13 +489,13 @@ mod tests {
         let c = SignedCapability::issue(
             &stranger,
             laptop.node_id(),
-            vec![Ability::Exec],
+            vec!["exec".to_string()],
             Resource::Any,
             Caveats::default(),
             1,
             None,
         );
-        let r = authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), Ability::Exec, &[c], &never_revoked);
+        let r = authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), "exec", &[c], &never_revoked);
         assert!(r.unwrap_err().contains("accepted authority"));
     }
 
@@ -549,14 +507,14 @@ mod tests {
         let c = SignedCapability::issue(
             &org,
             employee.node_id(),
-            vec![Ability::Exec],
+            vec!["exec".to_string()],
             Resource::Any,
             Caveats::default(),
             7,
             None,
         );
         assert!(
-            authorize(&node.node_id(), &[org.node_id()], &[], 1000, &employee.node_id(), Ability::Exec, &[c], &never_revoked)
+            authorize(&node.node_id(), &[org.node_id()], &[], 1000, &employee.node_id(), "exec", &[c], &never_revoked)
                 .is_ok()
         );
     }
@@ -566,9 +524,9 @@ mod tests {
         let node = id("node");
         let laptop = id("laptop");
         let stranger = id("stranger");
-        let c = SignedCapability::issue(&node, laptop.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 1, None);
+        let c = SignedCapability::issue(&node, laptop.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 1, None);
         // stranger presents laptop's capability
-        let r = authorize(&node.node_id(), &[], &[], 1000, &stranger.node_id(), Ability::Exec, &[c], &never_revoked);
+        let r = authorize(&node.node_id(), &[], &[], 1000, &stranger.node_id(), "exec", &[c], &never_revoked);
         assert!(r.unwrap_err().contains("not held by"));
     }
 
@@ -576,10 +534,10 @@ mod tests {
     fn tampered_signature_is_denied() {
         let node = id("node");
         let laptop = id("laptop");
-        let mut c = SignedCapability::issue(&node, laptop.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 1, None);
+        let mut c = SignedCapability::issue(&node, laptop.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 1, None);
         // escalate abilities after signing
-        c.cap.abilities.push(Ability::Tunnel);
-        let r = authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), Ability::Tunnel, &[c], &never_revoked);
+        c.cap.abilities.push("tunnel".to_string());
+        let r = authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), "tunnel", &[c], &never_revoked);
         assert!(r.unwrap_err().contains("signature"));
     }
 
@@ -587,16 +545,16 @@ mod tests {
     fn expiry_is_enforced() {
         let node = id("node");
         let laptop = id("laptop");
-        let c = SignedCapability::issue(&node, laptop.node_id(), vec![Ability::Exec], Resource::Any, expires(500), 1, None);
+        let c = SignedCapability::issue(&node, laptop.node_id(), vec!["exec".to_string()], Resource::Any, expires(500), 1, None);
         // expired at now=1000
         assert!(
-            authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), Ability::Exec, &[c.clone()], &never_revoked)
+            authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), "exec", &[c.clone()], &never_revoked)
                 .unwrap_err()
                 .contains("expired")
         );
         // valid before expiry
         assert!(
-            authorize(&node.node_id(), &[], &[], 499, &laptop.node_id(), Ability::Exec, &[c], &never_revoked).is_ok()
+            authorize(&node.node_id(), &[], &[], 499, &laptop.node_id(), "exec", &[c], &never_revoked).is_ok()
         );
     }
 
@@ -607,28 +565,28 @@ mod tests {
         let c = SignedCapability::issue(
             &node,
             laptop.node_id(),
-            vec![Ability::Exec],
+            vec!["exec".to_string()],
             Resource::Any,
             Caveats { not_before: 1000, ..Default::default() },
             1,
             None,
         );
         assert!(
-            authorize(&node.node_id(), &[], &[], 999, &laptop.node_id(), Ability::Exec, &[c.clone()], &never_revoked)
+            authorize(&node.node_id(), &[], &[], 999, &laptop.node_id(), "exec", &[c.clone()], &never_revoked)
                 .unwrap_err()
                 .contains("not yet valid")
         );
-        assert!(authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), Ability::Exec, &[c], &never_revoked).is_ok());
+        assert!(authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), "exec", &[c], &never_revoked).is_ok());
     }
 
     #[test]
     fn revocation_is_enforced() {
         let node = id("node");
         let laptop = id("laptop");
-        let c = SignedCapability::issue(&node, laptop.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 42, None);
+        let c = SignedCapability::issue(&node, laptop.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 42, None);
         let revoke_42 = |_issuer: &NodeId, nonce: u64| nonce == 42;
         assert!(
-            authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), Ability::Exec, &[c], &revoke_42)
+            authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), "exec", &[c], &revoke_42)
                 .unwrap_err()
                 .contains("revoked")
         );
@@ -643,13 +601,13 @@ mod tests {
         let c = SignedCapability::issue(
             &node,
             laptop.node_id(),
-            vec![Ability::Exec],
+            vec!["exec".to_string()],
             Resource::Node(other.node_id()),
             Caveats::default(),
             1,
             None,
         );
-        let r = authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), Ability::Exec, &[c], &never_revoked);
+        let r = authorize(&node.node_id(), &[], &[], 1000, &laptop.node_id(), "exec", &[c], &never_revoked);
         assert!(r.unwrap_err().contains("does not match"));
     }
 
@@ -660,24 +618,24 @@ mod tests {
         let c = SignedCapability::issue(
             &node,
             laptop.node_id(),
-            vec![Ability::Exec],
+            vec!["exec".to_string()],
             Resource::Tag("gpu".into()),
             Caveats::default(),
             1,
             None,
         );
         let tags = vec!["gpu".to_string(), "linux".to_string()];
-        assert!(authorize(&node.node_id(), &[], &tags, 1000, &laptop.node_id(), Ability::Exec, &[c.clone()], &never_revoked).is_ok());
+        assert!(authorize(&node.node_id(), &[], &tags, 1000, &laptop.node_id(), "exec", &[c.clone()], &never_revoked).is_ok());
         // a node without the tag is not covered
-        assert!(authorize(&node.node_id(), &[], &["linux".to_string()], 1000, &laptop.node_id(), Ability::Exec, &[c], &never_revoked).is_err());
+        assert!(authorize(&node.node_id(), &[], &["linux".to_string()], 1000, &laptop.node_id(), "exec", &[c], &never_revoked).is_err());
     }
 
     // ---- multi-level delegation chains ----
 
     /// Build a valid root→mid→leaf chain: `root` (self) → `mid` → `leaf`, all Exec/Any.
     fn three_level(root: &Identity, mid: &Identity, leaf: &Identity) -> Vec<SignedCapability> {
-        let c0 = SignedCapability::issue(root, mid.node_id(), vec![Ability::Exec, Ability::Sync], Resource::Any, Caveats::default(), 1, None);
-        let c1 = SignedCapability::issue(mid, leaf.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 2, Some(c0.id()));
+        let c0 = SignedCapability::issue(root, mid.node_id(), vec!["exec".to_string(), "sync".to_string()], Resource::Any, Caveats::default(), 1, None);
+        let c1 = SignedCapability::issue(mid, leaf.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 2, Some(c0.id()));
         vec![c0, c1]
     }
 
@@ -688,7 +646,7 @@ mod tests {
         let leaf = id("leaf");
         let chain = three_level(&root, &mid, &leaf);
         assert!(
-            authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), Ability::Exec, &chain, &never_revoked).is_ok()
+            authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), "exec", &chain, &never_revoked).is_ok()
         );
     }
 
@@ -697,14 +655,14 @@ mod tests {
         let root = id("root");
         let a = id("a");
         let b = id("b");
-        let c0 = SignedCapability::issue(&root, a.node_id(), vec![Ability::Exec, Ability::Sync, Ability::Tunnel], Resource::Any, Caveats::default(), 1, None);
-        let c1 = SignedCapability::issue(&a, b.node_id(), vec![Ability::Exec, Ability::Sync], Resource::Any, Caveats::default(), 2, Some(c0.id()));
+        let c0 = SignedCapability::issue(&root, a.node_id(), vec!["exec".to_string(), "sync".to_string(), "tunnel".to_string()], Resource::Any, Caveats::default(), 1, None);
+        let c1 = SignedCapability::issue(&a, b.node_id(), vec!["exec".to_string(), "sync".to_string()], Resource::Any, Caveats::default(), 2, Some(c0.id()));
         let leaf = id("leaf");
-        let c2 = SignedCapability::issue(&b, leaf.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 3, Some(c1.id()));
+        let c2 = SignedCapability::issue(&b, leaf.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 3, Some(c1.id()));
         let chain = vec![c0, c1, c2];
-        assert!(authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), Ability::Exec, &chain, &never_revoked).is_ok());
+        assert!(authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), "exec", &chain, &never_revoked).is_ok());
         // leaf cannot use an ability it wasn't delegated, even though the root had it
-        assert!(authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), Ability::Tunnel, &chain, &never_revoked).is_err());
+        assert!(authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), "tunnel", &chain, &never_revoked).is_err());
     }
 
     #[test]
@@ -712,10 +670,10 @@ mod tests {
         let root = id("root");
         let mid = id("mid");
         let leaf = id("leaf");
-        let c0 = SignedCapability::issue(&root, mid.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 1, None);
+        let c0 = SignedCapability::issue(&root, mid.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 1, None);
         // mid tries to grant Tunnel, which it was never given
-        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec![Ability::Exec, Ability::Tunnel], Resource::Any, Caveats::default(), 2, Some(c0.id()));
-        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), Ability::Tunnel, &[c0, c1], &never_revoked);
+        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec!["exec".to_string(), "tunnel".to_string()], Resource::Any, Caveats::default(), 2, Some(c0.id()));
+        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), "tunnel", &[c0, c1], &never_revoked);
         assert!(r.unwrap_err().contains("exceed the parent"));
     }
 
@@ -724,10 +682,10 @@ mod tests {
         let root = id("root");
         let mid = id("mid");
         let leaf = id("leaf");
-        let c0 = SignedCapability::issue(&root, mid.node_id(), vec![Ability::Exec], Resource::Any, expires(500), 1, None);
+        let c0 = SignedCapability::issue(&root, mid.node_id(), vec!["exec".to_string()], Resource::Any, expires(500), 1, None);
         // child tries to outlive parent
-        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec![Ability::Exec], Resource::Any, expires(9999), 2, Some(c0.id()));
-        let r = authorize(&root.node_id(), &[], &[], 100, &leaf.node_id(), Ability::Exec, &[c0, c1], &never_revoked);
+        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec!["exec".to_string()], Resource::Any, expires(9999), 2, Some(c0.id()));
+        let r = authorize(&root.node_id(), &[], &[], 100, &leaf.node_id(), "exec", &[c0, c1], &never_revoked);
         assert!(r.unwrap_err().contains("caveats are broader"));
     }
 
@@ -736,11 +694,11 @@ mod tests {
         let root = id("root");
         let mid = id("mid");
         let leaf = id("leaf");
-        let c0 = SignedCapability::issue(&root, mid.node_id(), vec![Ability::Exec], Resource::Tag("gpu".into()), Caveats::default(), 1, None);
+        let c0 = SignedCapability::issue(&root, mid.node_id(), vec!["exec".to_string()], Resource::Tag("gpu".into()), Caveats::default(), 1, None);
         // child tries to broaden from tag=gpu to any
-        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 2, Some(c0.id()));
+        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 2, Some(c0.id()));
         let tags = vec!["gpu".to_string()];
-        let r = authorize(&root.node_id(), &[], &tags, 1000, &leaf.node_id(), Ability::Exec, &[c0, c1], &never_revoked);
+        let r = authorize(&root.node_id(), &[], &tags, 1000, &leaf.node_id(), "exec", &[c0, c1], &never_revoked);
         assert!(r.unwrap_err().contains("broader than the parent"));
     }
 
@@ -750,10 +708,10 @@ mod tests {
         let mid = id("mid");
         let other = id("other");
         let leaf = id("leaf");
-        let c0 = SignedCapability::issue(&root, mid.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 1, None);
+        let c0 = SignedCapability::issue(&root, mid.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 1, None);
         // c1 issued by `other`, not by the parent's audience `mid`
-        let c1 = SignedCapability::issue(&other, leaf.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 2, Some(c0.id()));
-        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), Ability::Exec, &[c0, c1], &never_revoked);
+        let c1 = SignedCapability::issue(&other, leaf.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 2, Some(c0.id()));
+        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), "exec", &[c0, c1], &never_revoked);
         assert!(r.unwrap_err().contains("not the parent's audience"));
     }
 
@@ -762,10 +720,10 @@ mod tests {
         let root = id("root");
         let mid = id("mid");
         let leaf = id("leaf");
-        let c0 = SignedCapability::issue(&root, mid.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 1, None);
+        let c0 = SignedCapability::issue(&root, mid.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 1, None);
         // c1 names a bogus parent hash
-        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 2, Some([9u8; 32]));
-        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), Ability::Exec, &[c0, c1], &never_revoked);
+        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 2, Some([9u8; 32]));
+        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), "exec", &[c0, c1], &never_revoked);
         assert!(r.unwrap_err().contains("parent hash"));
     }
 
@@ -774,8 +732,8 @@ mod tests {
         let root = id("root");
         let leaf = id("leaf");
         // a root link must have parent == None
-        let c0 = SignedCapability::issue(&root, leaf.node_id(), vec![Ability::Exec], Resource::Any, Caveats::default(), 1, Some([1u8; 32]));
-        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), Ability::Exec, &[c0], &never_revoked);
+        let c0 = SignedCapability::issue(&root, leaf.node_id(), vec!["exec".to_string()], Resource::Any, Caveats::default(), 1, Some([1u8; 32]));
+        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), "exec", &[c0], &never_revoked);
         assert!(r.unwrap_err().contains("must not name a parent"));
     }
 
@@ -787,7 +745,7 @@ mod tests {
         let chain = three_level(&root, &mid, &leaf);
         // revoke the root link's nonce (1) — the whole subtree dies
         let revoke_root = |_i: &NodeId, nonce: u64| nonce == 1;
-        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), Ability::Exec, &chain, &revoke_root);
+        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), "exec", &chain, &revoke_root);
         assert!(r.unwrap_err().contains("revoked"));
     }
 
@@ -797,11 +755,11 @@ mod tests {
         let mid = id("mid");
         let leaf = id("leaf");
         let restricted = Caveats { allowed_ports: Some(vec![22]), ..Default::default() };
-        let c0 = SignedCapability::issue(&root, mid.node_id(), vec![Ability::Tunnel], Resource::Any, restricted, 1, None);
+        let c0 = SignedCapability::issue(&root, mid.node_id(), vec!["tunnel".to_string()], Resource::Any, restricted, 1, None);
         // child tries to allow an extra port
         let widened = Caveats { allowed_ports: Some(vec![22, 8080]), ..Default::default() };
-        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec![Ability::Tunnel], Resource::Any, widened, 2, Some(c0.id()));
-        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), Ability::Tunnel, &[c0, c1], &never_revoked);
+        let c1 = SignedCapability::issue(&mid, leaf.node_id(), vec!["tunnel".to_string()], Resource::Any, widened, 2, Some(c0.id()));
+        let r = authorize(&root.node_id(), &[], &[], 1000, &leaf.node_id(), "tunnel", &[c0, c1], &never_revoked);
         assert!(r.unwrap_err().contains("caveats are broader"));
     }
 

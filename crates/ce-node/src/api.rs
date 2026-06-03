@@ -1,8 +1,7 @@
 use anyhow::Result;
 use axum::{
-    body::Body,
-    extract::{Path, Request, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, State},
+    http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -12,7 +11,6 @@ use axum::{
 };
 use bollard::{container::RemoveContainerOptions, Docker};
 use ce_chain::{channel_receipt_bytes, payer_settle_bytes, Block, ChunkReceipt, Tx, TxKind};
-use ce_container::{exec_in_container, ExecSpec};
 use ce_identity::{verify, Identity, NodeId};
 use ce_mesh::{AppPubSubMsg, MeshHandle, RpcRequest, RpcResponse, app_pubsub_bytes, peer_id_from_node_id};
 use ce_protocol::{BurnProof, Capability, CellAddress, CellSignal};
@@ -23,7 +21,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -36,7 +34,6 @@ use crate::{
 
 /// Per-sender last-accepted timestamp (ms). Used to enforce strictly increasing
 /// nonces and close replay attacks within the 5-minute freshness window.
-type NonceCache = Arc<StdMutex<HashMap<NodeId, u64>>>;
 
 #[derive(Clone)]
 struct ApiState {
@@ -61,18 +58,12 @@ struct ApiState {
     pool: TxPool,
     /// Poke the job manager to check for newly-signed settlements immediately.
     settle_notify_tx: mpsc::Sender<()>,
-    /// CE data directory; used to load devices.toml for sync/exec auth.
+    /// CE data directory; used for the local blob store.
     data_dir: PathBuf,
-    /// Anti-replay: last accepted timestamp per sender NodeId.
-    nonce_cache: NonceCache,
     /// Peer capacity atlas updated by incoming capacity signals.
     atlas: Atlas,
     /// libp2p listen port — used by GET /bootstrap to build multiaddrs.
     listen_port: u16,
-    /// This node's capability self-tags — what capability resource selectors are matched against.
-    self_tags: Arc<Vec<String>>,
-    /// Capability root keys this node honors (in addition to its own identity). See docs/capabilities.md.
-    accepted_roots: Arc<Vec<NodeId>>,
     /// Stream control for opening outbound TCP tunnels over the mesh.
     tunnel_control: ce_mesh::StreamControl,
 }
@@ -503,275 +494,11 @@ fn tx_value(tx: &ce_chain::Tx) -> Option<u128> {
         TxKind::JobSettle { cost, .. } => Some(*cost),
         TxKind::Heartbeat { amount, .. } => Some(*amount),
         TxKind::JobExpire { .. }
-        | TxKind::TrustGrant { .. }
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
         | TxKind::ChannelExpire { .. }
         | TxKind::NameClaim { .. }
         | TxKind::RevokeCapability { .. } => None,
-    }
-}
-
-// ----- Device auth -----
-
-/// Verify CE device auth headers against the request body and the devices registry.
-///
-/// - `body`: the raw request body bytes (already read by the caller).
-///   The signature commits to SHA256(body), so a tampered body invalidates the sig.
-/// - `nonce_cache`: per-sender last-accepted timestamp; enforces strictly
-///   increasing nonces to prevent replay within the 5-minute window.
-fn verify_device_auth(
-    headers: &HeaderMap,
-    method: &str,
-    path: &str,
-    host_node_id: &NodeId,
-    accepted_roots: &[NodeId],
-    body: &[u8],
-    nonce_cache: &NonceCache,
-    required: crate::capability::Ability,
-    self_tags: &[String],
-) -> Result<NodeId, Response> {
-    let from_hex = headers
-        .get("x-ce-from")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing X-CE-From"))?;
-    let ts_str = headers
-        .get("x-ce-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing X-CE-Timestamp"))?;
-    let sig_hex = headers
-        .get("x-ce-sig")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing X-CE-Sig"))?;
-
-    let from: NodeId = crate::auth::parse_from_header(from_hex)
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "X-CE-From must be 64 hex chars"))?;
-
-    let ts_ms: u64 = ts_str
-        .parse()
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad X-CE-Timestamp"))?;
-
-    let sig_bytes = hex::decode(sig_hex)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad X-CE-Sig"))?;
-    let sig: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "X-CE-Sig must be 128 hex chars"))?;
-
-    // Freshness: timestamp must be within ±5 minutes of server time.
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    if now_ms.abs_diff(ts_ms) > 5 * 60 * 1000 {
-        return Err(err(StatusCode::UNAUTHORIZED, "X-CE-Timestamp out of range"));
-    }
-
-    // Anti-replay: require strictly increasing timestamp per sender.
-    {
-        let mut cache = nonce_cache.lock().expect("nonce cache poisoned");
-        if let Some(&last) = cache.get(&from) {
-            if ts_ms <= last {
-                return Err(err(
-                    StatusCode::UNAUTHORIZED,
-                    format!("replayed request: ts {ts_ms} <= last accepted {last}"),
-                ));
-            }
-        }
-        // Update before signature check so a burst of replays can't race through.
-        cache.insert(from, ts_ms);
-    }
-
-    // Signature covers method + path + timestamp + SHA256(body).
-    let bytes = crate::auth::auth_bytes(method, path, ts_ms, body);
-    if let Err(_) = verify(&from, &bytes, &sig) {
-        // On bad sig, roll back the nonce update so the client can retry with a newer ts.
-        let mut cache = nonce_cache.lock().expect("nonce cache poisoned");
-        cache.remove(&from);
-        return Err(err(StatusCode::UNAUTHORIZED, "invalid CE signature"));
-    }
-
-    // Capability authorization. The chain is presented in X-CE-Caps (a hex token, root-first).
-    // The direct HTTP path verifies signature/expiry/attenuation/root but not on-chain revocation
-    // (the mesh path does that); rely on short expiries here.
-    let caps = match headers.get("x-ce-caps").and_then(|v| v.to_str().ok()) {
-        Some(token) => crate::capability::decode_chain(token)
-            .map_err(|_| err(StatusCode::BAD_REQUEST, "malformed X-CE-Caps"))?,
-        None => return Err(err(StatusCode::UNAUTHORIZED, "missing X-CE-Caps capability")),
-    };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let never_revoked = |_: &NodeId, _: u64| false;
-    if let Err(reason) = crate::capability::authorize(
-        host_node_id,
-        accepted_roots,
-        self_tags,
-        now,
-        &from,
-        required,
-        &caps,
-        &never_revoked,
-    ) {
-        return Err(err(StatusCode::FORBIDDEN, reason));
-    }
-
-    Ok(from)
-}
-
-// ----- PUT /sync/*path -----
-
-async fn sync_put(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    req: Request,
-) -> Response {
-    let path = req.uri().path().to_string();
-
-    // Read body FIRST — auth signature commits to SHA256(body).
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 256 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("read body: {e}")),
-    };
-
-    if let Err(resp) =
-        verify_device_auth(&headers, "PUT", &path, &state.host_node_id, &state.accepted_roots, &body_bytes, &state.nonce_cache, crate::capability::Ability::Sync, &state.self_tags)
-    {
-        return resp;
-    }
-
-    // Resolve the target path under the user's home directory.
-    let rel = path.trim_start_matches("/sync/");
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let target = home.join(rel);
-    let canonical_home = home.canonicalize().unwrap_or(home.clone());
-
-    let canonical_target = match target.parent() {
-        Some(p) => {
-            let _ = std::fs::create_dir_all(p);
-            match target.canonicalize().ok().or_else(|| {
-                p.canonicalize().ok().map(|cp| cp.join(target.file_name().unwrap_or_default()))
-            }) {
-                Some(c) => c,
-                None => return err(StatusCode::BAD_REQUEST, "cannot resolve target path"),
-            }
-        }
-        None => return err(StatusCode::BAD_REQUEST, "invalid path"),
-    };
-    if !canonical_target.starts_with(&canonical_home) {
-        return err(StatusCode::BAD_REQUEST, "path traversal not allowed");
-    }
-
-    if let Some(parent) = canonical_target.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}"));
-        }
-    }
-    if let Err(e) = std::fs::write(&canonical_target, &body_bytes) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"));
-    }
-
-    tracing::info!("sync PUT {} ({} bytes)", canonical_target.display(), body_bytes.len());
-    StatusCode::NO_CONTENT.into_response()
-}
-
-// ----- GET /sync/*path -----
-
-async fn sync_get(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    req: Request,
-) -> Response {
-    let path = req.uri().path().to_string();
-    // GET has no body; sign against empty bytes.
-    if let Err(resp) =
-        verify_device_auth(&headers, "GET", &path, &state.host_node_id, &state.accepted_roots, b"", &state.nonce_cache, crate::capability::Ability::Sync, &state.self_tags)
-    {
-        return resp;
-    }
-
-    let rel = path.trim_start_matches("/sync/");
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let target = home.join(rel);
-    let canonical_home = home.canonicalize().unwrap_or(home.clone());
-    let canonical_target = match target.canonicalize() {
-        Ok(c) => c,
-        Err(_) => return err(StatusCode::NOT_FOUND, "file not found"),
-    };
-    if !canonical_target.starts_with(&canonical_home) {
-        return err(StatusCode::BAD_REQUEST, "path traversal not allowed");
-    }
-
-    match std::fs::read(&canonical_target) {
-        Ok(data) => (StatusCode::OK, Body::from(data)).into_response(),
-        Err(_) => err(StatusCode::NOT_FOUND, "file not found"),
-    }
-}
-
-// ----- POST /exec -----
-
-#[derive(Debug, Deserialize)]
-pub struct ExecRequest {
-    /// Docker image to run the command in, e.g. "rust:latest" or "alpine:latest".
-    pub image: String,
-    /// Command and arguments, e.g. ["cargo", "build", "--release"].
-    pub cmd: Vec<String>,
-    /// Working directory relative to `~/` (e.g. `~/code/ce` or `code/ce`). Defaults to `~/`.
-    #[serde(default)]
-    pub cwd: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ExecResponse {
-    stdout: String,
-    stderr: String,
-    exit_code: i32,
-}
-
-async fn exec_command(State(state): State<ApiState>, headers: HeaderMap, req: Request) -> Response {
-    // Read body first — auth signature must commit to the body hash.
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("read body: {e}")),
-    };
-
-    if let Err(resp) =
-        verify_device_auth(&headers, "POST", "/exec", &state.host_node_id, &state.accepted_roots, &body_bytes, &state.nonce_cache, crate::capability::Ability::Exec, &state.self_tags)
-    {
-        return resp;
-    }
-
-    let req: ExecRequest = match serde_json::from_slice(&body_bytes) {
-        Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")),
-    };
-
-    if req.cmd.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "cmd must not be empty");
-    }
-    if req.image.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "image must not be empty");
-    }
-
-    let docker = match &state.docker {
-        Some(d) => d,
-        None => return err(StatusCode::SERVICE_UNAVAILABLE, "Docker not available on this node"),
-    };
-
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let spec = ExecSpec { image: req.image.clone(), cmd: req.cmd.clone(), cwd: req.cwd.clone() };
-
-    match exec_in_container(docker, &spec, &home).await {
-        Ok((stdout, stderr, exit_code)) => {
-            let exit_code = exit_code as i32;
-            tracing::info!(
-                "exec {:?} image={} → exit {exit_code}",
-                req.cmd, req.image
-            );
-            (
-                StatusCode::OK,
-                Json(ExecResponse { stdout, stderr, exit_code }),
-            )
-                .into_response()
-        }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("exec failed: {e}")),
     }
 }
 
@@ -1013,8 +740,8 @@ fn parse_cids(hexes: &[String]) -> Result<Vec<[u8; 32]>, Response> {
 /// Decode an optional capability-chain token (hex) to RPC-ready bincode bytes; validates the token.
 fn caps_to_bytes(token: &Option<String>) -> Result<Option<Vec<u8>>, Response> {
     match token {
-        Some(t) => match crate::capability::decode_chain(t) {
-            Ok(chain) => Ok(Some(crate::capability::encode_chain_bytes(&chain))),
+        Some(t) => match ce_cap::decode_chain(t) {
+            Ok(chain) => Ok(Some(ce_cap::encode_chain_bytes(&chain))),
             Err(_) => Err(err(StatusCode::BAD_REQUEST, "malformed capability token")),
         },
         None => Ok(None),
@@ -1224,8 +951,8 @@ async fn open_tunnel(State(state): State<ApiState>, Json(req): Json<TunnelReques
     }
     // Validate the capability token now and carry its canonical bytes in each stream header.
     let caps_bytes = match &req.caps {
-        Some(t) => match crate::capability::decode_chain(t) {
-            Ok(c) => crate::capability::encode_chain_bytes(&c),
+        Some(t) => match ce_cap::decode_chain(t) {
+            Ok(c) => ce_cap::encode_chain_bytes(&c),
             Err(_) => return err(StatusCode::BAD_REQUEST, "malformed capability token"),
         },
         None => Vec::new(),
@@ -1377,7 +1104,6 @@ fn tx_stream_view(tx: &Tx) -> TxStreamView {
         TxKind::JobBid { bid, .. } => ("JobBid", *bid),
         TxKind::JobSettle { cost, .. } => ("JobSettle", *cost),
         TxKind::JobExpire { .. } => ("JobExpire", 0),
-        TxKind::TrustGrant { .. } => ("TrustGrant", 0),
         TxKind::Heartbeat { amount, .. } => ("Heartbeat", *amount),
         TxKind::ChannelOpen { capacity, .. } => ("ChannelOpen", *capacity),
         TxKind::ChannelClose { cumulative, .. } => ("ChannelClose", *cumulative),
@@ -2103,7 +1829,6 @@ pub async fn start(
     data_dir: PathBuf,
     atlas: Atlas,
     docker: Option<Docker>,
-    self_tags: Vec<String>,
     // When set, serve the API over TLS with a cert keyed by this Ed25519 seed (the node
     // identity). Clients pin the cert against the node's NodeId. None = plain HTTP.
     tls_seed: Option<[u8; 32]>,
@@ -2112,11 +1837,9 @@ pub async fn start(
     tunnel_control: ce_mesh::StreamControl,
 ) -> Result<()> {
     if docker.is_none() {
-        tracing::warn!("Docker unavailable — job routes and exec will return 503");
+        tracing::warn!("Docker unavailable — job routes return 503");
     }
     let host_node_id = identity.node_id();
-    let accepted_roots = Arc::new(crate::load_accepted_roots(&data_dir));
-    let nonce_cache: NonceCache = Arc::new(StdMutex::new(HashMap::new()));
     let state = ApiState {
         docker,
         chain,
@@ -2134,11 +1857,8 @@ pub async fn start(
         pool,
         settle_notify_tx,
         data_dir,
-        nonce_cache,
         atlas,
         listen_port,
-        self_tags: Arc::new(self_tags),
-        accepted_roots,
         tunnel_control,
     };
 
@@ -2183,8 +1903,6 @@ pub async fn start(
         .route("/discovery/find/:service", get(find_service))
         .route("/relay/pay", post(relay_pay))
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
-        .route("/sync/*path", put(sync_put).get(sync_get))
-        .route("/exec", post(exec_command))
         // Personal mesh OS: relay-routed mesh RPCs (correct path for NAT traversal).
         .route("/mesh-exec", post(mesh_exec))
         .route("/mesh-deploy", post(mesh_deploy))

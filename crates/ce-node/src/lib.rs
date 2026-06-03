@@ -1,7 +1,9 @@
 mod api;
-pub mod auth;
-pub mod capability;
 pub mod chain_actor;
+
+/// Re-export the capability verifier so node consumers can use `ce_node::capability::*`
+/// (the canonical home is the standalone `ce-cap` crate, also usable by apps).
+pub use ce_cap as capability;
 
 pub use chain_actor::{ChainHandle, ChainStatusSnap, SyncSnap, spawn_chain_actor};
 
@@ -499,7 +501,6 @@ impl Node {
             let data_dir2 = node.config.data_dir.clone();
             let atlas3 = atlas.clone();
             let docker3 = docker.clone();
-            let self_tags3 = self_tags.clone();
             let tunnel_control2 = tunnel_control.clone();
             let tls_seed = if node.config.tls { Some(identity.secret_bytes()) } else { None };
             tokio::spawn(async move {
@@ -520,7 +521,6 @@ impl Node {
                     data_dir2,
                     atlas3,
                     docker3,
-                    self_tags3,
                     tls_seed,
                     app_inbox,
                     app_msg_tx,
@@ -715,7 +715,7 @@ async fn handle_tunnel_stream(
     // within any allowed-ports caveat.
     let requester = ce_mesh::node_id_from_peer_id(&peer)
         .ok_or_else(|| anyhow::anyhow!("peer id is not a CE node id"))?;
-    let caps = crate::capability::decode_chain_bytes(&caps_bytes)?;
+    let caps = ce_cap::decode_chain_bytes(&caps_bytes)?;
     let mut revoked: std::collections::HashSet<(NodeId, u64)> = std::collections::HashSet::new();
     for link in &caps {
         if chain.is_revoked(link.cap.issuer, link.cap.nonce).await {
@@ -724,13 +724,13 @@ async fn handle_tunnel_stream(
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let is_revoked = |i: &NodeId, n: u64| revoked.contains(&(*i, n));
-    crate::capability::authorize(
+    ce_cap::authorize(
         &host_node_id,
         accepted_roots,
         self_tags,
         now,
         &requester,
-        crate::capability::Ability::Tunnel,
+        "tunnel",
         &caps,
         &is_revoked,
     )
@@ -1456,7 +1456,7 @@ async fn handle_incoming_rpc(
     chain: ChainHandle,
     accepted_roots: &[NodeId],
 ) {
-    use crate::capability::{self, Ability};
+    use ce_cap as capability;
 
     // Reject helper: send an Error response and stop.
     let reject = |msg: String| {
@@ -1485,12 +1485,13 @@ async fn handle_incoming_rpc(
 
     // 2. Capability authorization. The action this RPC performs and the capability chain it carries
     //    (the `grant` field now transports bincode(Vec<SignedCapability>), root-first).
-    let (action, chain_bytes): (Ability, Option<Vec<u8>>) = match &request {
-        RpcRequest::Exec { grant, .. } => (Ability::Exec, grant.clone()),
-        RpcRequest::SyncFile { grant, .. } => (Ability::Sync, grant.clone()),
-        RpcRequest::SyncDelete { grant, .. } => (Ability::Delete, grant.clone()),
-        RpcRequest::Deploy { grant, .. } => (Ability::Deploy, grant.clone()),
-        RpcRequest::Kill { grant, .. } => (Ability::Kill, grant.clone()),
+    // Action names are opaque to the capability verifier; the node defines its own vocabulary.
+    let (action, chain_bytes): (&str, Option<Vec<u8>>) = match &request {
+        RpcRequest::Exec { grant, .. } => ("exec", grant.clone()),
+        RpcRequest::SyncFile { grant, .. } => ("sync", grant.clone()),
+        RpcRequest::SyncDelete { grant, .. } => ("delete", grant.clone()),
+        RpcRequest::Deploy { grant, .. } => ("deploy", grant.clone()),
+        RpcRequest::Kill { grant, .. } => ("kill", grant.clone()),
         _ => unreachable!("non-action RPCs are handled in the event loop"),
     };
     let caps = match chain_bytes.as_deref().map(capability::decode_chain_bytes) {
@@ -1523,7 +1524,7 @@ async fn handle_incoming_rpc(
         &caps,
         &is_revoked,
     ) {
-        warn!("rpc: denied {} from {}: {reason}", action.as_str(), hex::encode(&from_node[..4]));
+        warn!("rpc: denied {action} from {}: {reason}", hex::encode(&from_node[..4]));
         reject(reason);
         return;
     }
@@ -2178,7 +2179,6 @@ fn tx_burn_amount(tx: &Tx) -> Option<u128> {
         TxKind::JobSettle { cost, .. } => Some(*cost),
         TxKind::Heartbeat { amount, .. } => Some(*amount),
         TxKind::JobExpire { .. }
-        | TxKind::TrustGrant { .. }
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
         | TxKind::ChannelExpire { .. }

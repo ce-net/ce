@@ -1,10 +1,8 @@
 use anyhow::{anyhow, Result};
 use ce_chain::{Chain, CREDIT};
 use ce_identity::Identity;
-use ce_node::{
-    capability::{self, Ability, Caveats, Resource, SignedCapability},
-    Node, NodeConfig,
-};
+use ce_cap::{self as capability, Caveats, Resource, SignedCapability};
+use ce_node::{Node, NodeConfig};
 use serde::{Deserialize, Serialize};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
@@ -1034,7 +1032,7 @@ async fn main() -> Result<()> {
                 .try_into()
                 .map_err(|_| anyhow!("subject must be exactly 32 bytes (64 hex chars)"))?;
 
-            let abilities: Vec<Ability> = can.iter().map(|a| Ability::parse(a)).collect::<Result<_>>()?;
+            let abilities: Vec<String> = can.iter().map(|a| a.trim().to_ascii_lowercase()).collect();
             let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
 
             // Resolve the resource matcher: `self` = this node, `any`/`*` = Any, `node=<hex>`, else tags.

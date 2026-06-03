@@ -601,6 +601,7 @@ name = "ce"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ce-cap",
  "ce-chain",
  "ce-identity",
  "ce-node",
@@ -616,6 +617,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
+]
+
+[[package]]
+name = "ce-cap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "ce-identity",
+ "hex",
+ "serde",
+ "sha2",
 ]
 
 [[package]]
@@ -706,6 +719,7 @@ dependencies = [
  "axum",
  "bincode",
  "bollard",
+ "ce-cap",
  "ce-chain",
  "ce-container",
  "ce-identity",

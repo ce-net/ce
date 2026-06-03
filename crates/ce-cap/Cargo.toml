@@ -1,0 +1,14 @@
+[package]
+name = "ce-cap"
+version = "0.1.0"
+edition = "2024"
+description = "CE capability primitive — verify signed, attenuating capability chains. Shared by the node and apps."
+license = "MIT"
+
+[dependencies]
+ce-identity = { path = "../ce-identity" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+sha2 = "0.10"
+hex = "0.4"
+anyhow = "1"
