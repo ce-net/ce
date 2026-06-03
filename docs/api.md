@@ -421,90 +421,14 @@ Build a CEP-1 signal locally, sign it, and broadcast it on the `ce-protocol-1` g
 
 ---
 
-## Authenticated node services
+## Node services moved to apps
 
-These endpoints let CE nodes sync files and execute commands. Authorization is a **capability** —
-there is no device allowlist. See `docs/capabilities.md` for the full model.
-
-### Authentication
-
-Every request to `/sync/*` and `/exec` must include three signing headers, plus a capability:
-
-| Header | Value |
-|---|---|
-| `X-CE-From` | Sender's NodeId as 64 hex chars |
-| `X-CE-Timestamp` | Current Unix time in milliseconds (u64) |
-| `X-CE-Sig` | Ed25519 signature (128 hex) over `b"ce-auth-v1 " + method + " " + path + " " + timestamp_le_u64` |
-| `X-CE-Caps` | A capability-chain token (hex), root-first, from `ce grant`. **Required.** |
-
-The receiver validates that:
-1. The timestamp is within ±5 minutes of server time (prevents replay attacks).
-2. The signature is valid for the declared sender key.
-3. The `X-CE-Caps` chain **authorizes** the action (`sync` for `/sync/*`, `exec` for `/exec`):
-   roots at this node's own key or a configured root, every link's signature/temporal validity and
-   attenuation hold, and the leaf's audience is the sender and grants the action. Denied → `403`;
-   missing capability → `401`; malformed → `400`. (The HTTP path checks expiry but not on-chain
-   revocation — the mesh path does both; rely on short expiries here.)
-
-Mesh-routed calls (`/mesh-exec`, `/mesh-sync`, `/mesh-deploy`, `/mesh-kill`) carry the same chain in
-a `grant`/`caps` field and the receiving node enforces it identically (with on-chain revocation).
-
-### PUT /sync/*path
-
-Upload a file to the receiver's home directory at the given path. Path is relative to `~/`.
-
-Intermediate directories are created automatically. Path traversal outside `~/` is rejected.
-
-**Headers:** CE auth headers (see above)  
-**Body:** Raw file bytes  
-**Response:** `204 No Content`
-
-### GET /sync/*path
-
-Download a file from the receiver's home directory at the given path.
-
-**Headers:** CE auth headers (see above)  
-**Response:** `200 OK` with raw file bytes, or `404 Not Found`
-
-### POST /exec
-
-Run a command on the remote node inside a sandboxed Docker container and return its output.
-
-The node's home directory is bind-mounted read-write at `/workspace` inside the container, so files synced via `PUT /sync/*` are accessible to the command. Isolation matches job containers: gVisor when available, no network, 1 CPU / 512 MB limits, container removed on exit.
-
-**Headers:** CE auth headers (see above)
-
-**Request body**
-```json
-{
-  "image": "rust:latest",
-  "cmd": ["cargo", "build", "--release"],
-  "cwd": "~/code/ce"
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `image` | string | yes | Docker image to run the command in (e.g. `rust:latest`, `alpine:latest`) |
-| `cmd` | array | yes | Command and arguments to execute |
-| `cwd` | string | no | Working directory relative to `~/` (e.g. `~/code/ce`). Defaults to `~/`. |
-
-**Response** `200 OK`
-```json
-{
-  "stdout": "...",
-  "stderr": "...",
-  "exit_code": 0
-}
-```
-
-**Error responses**
-
-| Code | Meaning |
-|---|---|
-| 401 Unauthorized | Missing or invalid auth headers |
-| 403 Forbidden | Sender is not in the device registry |
-| 503 Service Unavailable | Docker not available on this node |
+Remote **exec** and **file sync/delete** are no longer node endpoints — they're the `rdev` app,
+built on the mesh `AppRequest` primitive + the `ce-cap` verifier (see github.com/ce-net/rdev and
+`docs/primitives.md`). The former `/sync`, `/exec`, `/mesh-exec`, and `/mesh-sync` endpoints are
+**removed**. CE keeps the **capability** primitive (issue via `ce grant`, revoke via
+`POST /capabilities/revoke`; verify via `ce-cap`), the **tunnel** transport (`POST /tunnel`), and
+the compute-market endpoints below.
 
 ---
 
@@ -542,7 +466,7 @@ and killable) and returns a `job_id`.
 Stop a mesh-deployed job. Body: `{ "node_id": "<64 hex>", "job_id": "<64 hex>", "grant": null }`.
 **Response** `204 No Content`. Errors mirror `/mesh-deploy`.
 
-(See also `POST /mesh-exec` and `PUT /mesh-sync/:node_id/*path` for one-shot exec / file push.)
+(Remote exec / file sync are the `rdev` app over `AppRequest`, not node endpoints.)
 
 ---
 

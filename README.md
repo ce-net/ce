@@ -269,14 +269,15 @@ ce status
 ce balance
 ce id
 
-# Node-to-node services (authorized by capabilities; see docs/capabilities.md)
+# Capabilities (authorize others on your resources; see docs/capabilities.md)
 ce grant <node-id> --can exec,sync,tunnel --expires 90d   # issue a capability token
 ce revoke <nonce>                   # revoke a capability you issued (on-chain)
 ce wallet add <alias> <node-id> --cap <token>   # hold a capability you were issued
-ce wallet ls                        # list held capabilities
-ce sync <src> <alias:remote-path>   # push files to a peer (wallet supplies the cap)
-ce exec <alias> --image <img> [--cwd ~/path] <command...>
-                                    # run in sandboxed container on a peer
+ce tunnel <alias> 2222:22           # forward a local port to a peer over the mesh
+
+# Remote exec + file sync/mirror are the `rdev` app (built on CE primitives):
+#   rdev exec <alias> --image rust -- cargo build
+#   rdev watch ~/code <alias>:code     # continuous 1:1 folder mirror
 
 # Cell economy
 ce deploy <image> [--fund N] [--cpu N] [--mem N] [--duration N]

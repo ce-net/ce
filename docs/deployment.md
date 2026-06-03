@@ -68,14 +68,18 @@ the wallet supplies the capability. Revoke with `ce revoke <nonce>` (on-chain) o
 ### Step 4: Use the authorized peer
 
 ```bash
-# Run a sandboxed command on desktop
-ce exec desktop --image alpine:latest -- echo hello
+# Forward a local port to the peer over the mesh (transport primitive)
+ce tunnel desktop 2222:22       # then: ssh -p 2222 you@localhost
 
-# Sync a file to laptop
-ce sync ./myfile.txt laptop:/home/user/myfile.txt
-
-# Submit a compute job (any node with capacity will pick it up)
+# Submit a compute job (any node with capacity picks it up)
 ce deploy alpine:latest --cpu 2 --mem 512 --duration 60
+```
+
+Remote exec and file sync/mirror are the **`rdev` app** (built on CE primitives), not node commands:
+
+```bash
+rdev exec desktop --image alpine:latest -- echo hello
+rdev watch ./code desktop:code      # continuous 1:1 folder mirror
 ```
 
 ---
