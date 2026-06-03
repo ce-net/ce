@@ -1147,3 +1147,48 @@ fn peer_id_from_multiaddr(ma: &Multiaddr) -> Result<PeerId> {
     }
     Err(anyhow!("multiaddr {ma} has no /p2p/<peer-id> component"))
 }
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    #[test]
+    fn node_id_peer_id_roundtrip() {
+        // A node id (ed25519 pubkey) ↔ libp2p PeerId must round-trip both directions, since the
+        // node addresses peers by CE node id and the mesh authenticates by PeerId.
+        let peer = peer_id_from_secret([7u8; 32]).unwrap();
+        let node_id = node_id_from_peer_id(&peer).expect("ed25519 peer carries an inlined key");
+        let peer2 = peer_id_from_node_id(&node_id).unwrap();
+        assert_eq!(peer, peer2, "node_id -> peer_id -> node_id is stable");
+        assert_eq!(node_id_from_peer_id(&peer2), Some(node_id));
+    }
+
+    #[test]
+    fn distinct_secrets_give_distinct_ids() {
+        let a = node_id_from_peer_id(&peer_id_from_secret([1u8; 32]).unwrap()).unwrap();
+        let b = node_id_from_peer_id(&peer_id_from_secret([2u8; 32]).unwrap()).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn tunnel_protocol_is_stable() {
+        assert_eq!(TUNNEL_PROTOCOL.as_ref(), "/ce/tunnel/1");
+    }
+
+    #[test]
+    fn rpc_from_node_is_extractable() {
+        let n = [3u8; 32];
+        let req = RpcRequest::Deploy {
+            from_node: n,
+            workload: vec![],
+            cpu_cores: 1,
+            mem_mb: 1,
+            duration_secs: 1,
+            bid: 0,
+            grant: None,
+        };
+        assert_eq!(req.from_node(), n);
+        let app = RpcRequest::AppMessage { from_node: n, topic: "t".into(), payload: vec![] };
+        assert_eq!(app.from_node(), n);
+    }
+}
