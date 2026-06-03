@@ -29,10 +29,8 @@ These are the same system from two angles. The identity primitive that lets untr
 | `ce-container` | ✅ Complete | gVisor detection, CPU/memory/network limits, image pull, wait-for-exit, stop_job |
 | `ce-node` | ✅ Complete | Mining loop, mesh event loop, job manager, heartbeat loop (30s), capacity broadcast (60s), atlas, signal ring buffer, tx pool, nonce replay prevention |
 | HTTP API | ✅ Complete | /jobs/bid, /jobs (list), /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /transfer, /status, /signals, /signals/send, /health, /atlas, /sync/*, /exec, /bootstrap, /mesh-exec, /mesh-sync |
-| CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, devices (add/ls/revoke — inline node-id support, `--tag`), fleet (ls/tag/untag), grant, sync, exec, deploy, ps, kill, fund, run |
-| Device registry | ✅ Complete | machines.toml, trusted-admin management, CE identity auth for sync/exec, owner tags |
-| Fleet categorization | ✅ Complete | Owner tags in machines.toml + capability-derived self-tags advertised on the mesh (`gpu`, `docker`, `linux`, `manycore`, `highmem`, ...). `ce fleet ls [--select TAG]` joins both. Tags are the selector surface scoped grants target. |
-| Scoped capability grants | ✅ Complete | Generic signed delegation (`Permission` × `Selector` × `Constraints`) replacing binary trust. Enforced at both gates (HTTP `X-CE-Grant`, mesh RPC). `ce grant` issues tokens. On-chain revocation anchor planned. See the security model section. |
+| CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, grant, revoke, wallet (add/ls/rm), sync, exec, deploy, ps, kill, fund, run |
+| Capability authorization | ✅ Complete | **The single trust primitive — `machines.toml`/`ce devices`/the v1 grant are removed.** A node honors a signed, attenuating capability chain rooted at its own key or a configured root (`<data_dir>/roots`); multi-level delegation, expiry, and on-chain `RevokeCapability` revocation. Enforced on mesh RPC and HTTP (`X-CE-Caps`). `ce grant`/`ce revoke` + a client wallet. **Spec: `docs/capabilities.md`; core: `crates/ce-node/src/capability.rs`.** (Sections below describing the old device-registry/grant-v1 model are superseded.) |
 | `ce-deploy` | ✅ Complete | Hetzner provisioning, SSH deploy, E2E tests |
 | Integration tests | ✅ Complete | single node mines, two nodes sync, tx pool propagates, API health/status, signal propagation, job lifecycle (requires Docker, skipped by default) |
 | Chain persistence | ✅ Complete | bincode+zstd (level 3) storage (~8x smaller than JSON), O(1) tip validation, checkpoint pruning, JSON migration on first load |
@@ -175,9 +173,10 @@ addr    = "192.168.1.10:8844"
 
 CLI commands implemented:
 ```
-ce devices add <name> <node-id>   # trust a peer by node ID (no address needed)
-ce devices ls                  # list registered devices
-ce devices revoke <name>       # remove trust
+ce grant <node-id> --can exec,sync,tunnel --expires 90d   # issue a capability token
+ce revoke <nonce>                       # revoke a capability you issued (on-chain)
+ce wallet add <alias> <node-id> --cap <token>   # hold a capability you were issued
+ce wallet ls                            # list held capabilities
 ```
 
 The chain supports `TrustGrant { grantor, grantee, label }` tx type (validated and signed by grantor). Broadcasting `TrustGrant` from the CLI is planned — currently devices are stored locally only.

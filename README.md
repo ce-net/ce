@@ -79,12 +79,15 @@ cargo build --release
 ### Adding another device (two-command setup)
 
 ```bash
-# On the machine you want to add — copy the node ID
+# On the machine you want to control — copy its node ID
 ce id
 # ce node id : 7a3f9b... (copy this)
 
-# On your local machine (trust by node ID; no address — traffic routes over the mesh)
-ce devices add desktop 7a3f9b...
+# On that same machine (the resource owner) — issue a capability to your controller
+ce grant <controller-node-id> --can exec,sync,tunnel --expires 90d   # prints a token
+
+# On your local machine — store it under an alias (the capability wallet)
+ce wallet add desktop 7a3f9b... --cap <token>
 ```
 
 ### Manual bootstrap (advanced)
@@ -266,12 +269,13 @@ ce status
 ce balance
 ce id
 
-# Node-to-node services (sync files and run sandboxed commands on trusted peers)
-ce devices add <name> <node-id>     # trust a peer by node ID (no address; mesh-routed)
-ce devices ls                       # list registered peers
-ce devices revoke <name>            # remove trust
-ce sync <src> <device:remote-path>  # push files to a peer
-ce exec <device> --image <img> [--cwd ~/path] <command...>
+# Node-to-node services (authorized by capabilities; see docs/capabilities.md)
+ce grant <node-id> --can exec,sync,tunnel --expires 90d   # issue a capability token
+ce revoke <nonce>                   # revoke a capability you issued (on-chain)
+ce wallet add <alias> <node-id> --cap <token>   # hold a capability you were issued
+ce wallet ls                        # list held capabilities
+ce sync <src> <alias:remote-path>   # push files to a peer (wallet supplies the cap)
+ce exec <alias> --image <img> [--cwd ~/path] <command...>
                                     # run in sandboxed container on a peer
 
 # Cell economy

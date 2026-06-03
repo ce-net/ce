@@ -423,30 +423,31 @@ Build a CEP-1 signal locally, sign it, and broadcast it on the `ce-protocol-1` g
 
 ## Authenticated node services
 
-These endpoints let trusted CE nodes sync files and execute commands. Any CE node can offer these services to any other CE node that it trusts. Register trusted peers in `machines.toml` (via `ce devices add`).
+These endpoints let CE nodes sync files and execute commands. Authorization is a **capability** —
+there is no device allowlist. See `docs/capabilities.md` for the full model.
 
 ### Authentication
 
-Every request to `/sync/*` and `/exec` must include three headers, plus an optional fourth:
+Every request to `/sync/*` and `/exec` must include three signing headers, plus a capability:
 
 | Header | Value |
 |---|---|
 | `X-CE-From` | Sender's NodeId as 64 hex chars |
 | `X-CE-Timestamp` | Current Unix time in milliseconds (u64) |
 | `X-CE-Sig` | Ed25519 signature (128 hex) over `b"ce-auth-v1 " + method + " " + path + " " + timestamp_le_u64` |
-| `X-CE-Grant` | *(optional)* A scoped capability grant token (hex of bincode `SignedGrant`), from `ce grant`. Required when the sender is not a full-scope admin. |
+| `X-CE-Caps` | A capability-chain token (hex), root-first, from `ce grant`. **Required.** |
 
 The receiver validates that:
 1. The timestamp is within ±5 minutes of server time (prevents replay attacks).
 2. The signature is valid for the declared sender key.
-3. The sender is **authorized** for the action (`Sync` for `/sync/*`, `Exec` for `/exec`):
-   - either the sender's NodeId is a trusted admin in the local `machines.toml` (full scope), or
-   - the request carries an `X-CE-Grant` whose `subject` is the sender, whose `issuer` is a
-     trusted admin on this node, whose signature verifies, which has not expired, whose
-     `permissions` include the action, and whose `selector` matches this node's capability
-     self-tags. Denied requests get `403`; a malformed grant token gets `400`.
+3. The `X-CE-Caps` chain **authorizes** the action (`sync` for `/sync/*`, `exec` for `/exec`):
+   roots at this node's own key or a configured root, every link's signature/temporal validity and
+   attenuation hold, and the leaf's audience is the sender and grants the action. Denied → `403`;
+   missing capability → `401`; malformed → `400`. (The HTTP path checks expiry but not on-chain
+   revocation — the mesh path does both; rely on short expiries here.)
 
-See the **Scoped capability grants** section in `docs/roadmap.md` for the full model.
+Mesh-routed calls (`/mesh-exec`, `/mesh-sync`, `/mesh-deploy`, `/mesh-kill`) carry the same chain in
+a `grant`/`caps` field and the receiving node enforces it identically (with on-chain revocation).
 
 ### PUT /sync/*path
 

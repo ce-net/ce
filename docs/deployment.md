@@ -36,9 +36,10 @@ ce status
 # prints: node ID, chain height, balance
 ```
 
-### Step 3: Register devices as trusted peers
+### Step 3: Authorize a peer with a capability
 
-CE uses on-chain `TrustGrant` transactions to authorize one node to exec/sync on another.
+CE's only trust primitive is the **capability** — a signed, attenuating grant from a node (or a
+configured root key) to a principal. There is no device allowlist. See `docs/capabilities.md`.
 
 **On the device you want to control remotely, get its node ID:**
 ```bash
@@ -46,23 +47,25 @@ ce id
 # output: 7a3f9b2c...  (64 hex chars)
 ```
 
-**On your primary machine, register it (trust is by node ID — no address):**
+**On the machine being controlled (the resource owner), issue a capability to the controller:**
 ```bash
-ce devices add desktop 7a3f9b2c...
-ce devices add laptop  4d8e1f0a...
+# desktop authorizes the laptop to exec/sync/tunnel on it, for 90 days
+ce grant <laptop-node-id> --can exec,sync,tunnel --expires 90d
+# → prints a capability token
 ```
 
-No IP:port is needed, on the LAN or behind NAT. Device-to-device traffic
-(`exec`/`sync`/`deploy`) routes through the mesh over libp2p, and the relay handles
-NAT traversal. Each command talks to your *local* node (`--api-port`, default 8844),
-which signs and forwards the request to the target.
-
-**Verify the device list:**
+**On the controller, store it under an alias (the capability wallet):**
 ```bash
-ce devices ls
+ce wallet add desktop 7a3f9b2c... --cap <token>
+ce wallet ls
 ```
 
-### Step 4: Use the devices
+No IP:port anywhere, on the LAN or behind NAT: device-to-device traffic (`exec`/`sync`/`deploy`/
+`tunnel`) routes through the mesh over libp2p, and the relay handles NAT traversal. Each command
+talks to your *local* node (`--api-port`, default 8844), which signs and forwards to the target;
+the wallet supplies the capability. Revoke with `ce revoke <nonce>` (on-chain) or let it expire.
+
+### Step 4: Use the authorized peer
 
 ```bash
 # Run a sandboxed command on desktop
