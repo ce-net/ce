@@ -29,8 +29,38 @@ whole path **mint → pay → authorize → execute → contain**, designed fail
 - **sync-before-mine** stops a fresh node forking its own chain;
 - clean-break on-disk format (version-prefixed) so incompatible chains are rejected, not misread.
 
-Residual: absolute security scales with honest hashrate (inherent to PoW). `MIN_DIFFICULTY` is a
-floor; the retarget raises the effective difficulty under real mining.
+**What PoW does NOT defend, stated honestly:** the rules above reject *forged* (no-work) and
+*understated-difficulty* blocks. They do **not** stop an attacker who does *real* work and simply
+has more of it. **A majority of hashrate wins, by design** — and on a small or young network that
+majority is **cheap**.
+
+> ### CRITICAL, CONFIRMED: cheap 51% takeover — and CE makes it cheaper
+> Honest nodes **self-limit** mining to one block per `mining_interval` (the pacing ticker in
+> `mining_loop`). An attacker forks out that one line and mines **valid** PoW flat-out. At the low
+> difficulty a small network sits at, **a single box out-produces the entire paced honest mesh**,
+> builds a genuinely heavier *valid* chain, and honest nodes **correctly reorg to it** — history
+> rewritten, credits minted, payments double-spent.
+>
+> **Demonstrated.** A 5-node paced honest mesh reached height 17 in 40s; an attacker that only
+> removed the pacing line produced a *valid* 895-block chain in 22s on **one machine** (~52× the
+> honest rate). On rejoin the honest nodes reorged to it (17 → 1529), adopting the attacker's
+> history and the 900,000 credits it minted to itself. (Test kept private — it's an attack recipe.)
+>
+> The pacing floor throttles *honest* hashrate but not the attacker, so this is **cheaper than a
+> normal 51%**: you don't need a majority of the hardware, only to ignore a speed limit everyone
+> else obeys. Anyone who can run the (low) honest difficulty faster than the honest aggregate wins.
+>
+> **This is not fixed.** It is the dominant risk before there is large, decentralized honest
+> hashrate. Directions (none yet implemented):
+> - Remove the self-limiting pacing footgun, or make block production genuinely difficulty-bound
+>   (so honest hashrate isn't throttled below an attacker's).
+> - Raise `MIN_DIFFICULTY` / require meaningful work even at genesis (raises the floor cost).
+> - **Checkpoints / finality** (signed checkpoints, or a finality gadget) so deep reorgs are
+>   rejected regardless of work — the standard defense for young chains.
+> - Don't treat credits as real money until honest hashrate is large and difficulty reflects it.
+>
+> Until then: **CE's economy is only as secure as its total honest hashrate, which on today's tiny
+> mesh is trivially exceeded.** Do not rely on it for value.
 
 ### Path B — forge or steal authority (capabilities → exec/spawn)
 **Risk:** a forged/stolen capability or a too-loose `spawn` grant runs code on a host; with
