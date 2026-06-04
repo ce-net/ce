@@ -84,11 +84,16 @@ async fn two_nodes_sync() {
     let bs_addr = bootstrap_addr(&dir1, p2p1);
     let (node2, _dir2) = start_node("sync-b", Some(bs_addr)).await;
 
-    sleep(Duration::from_secs(5)).await;
-
-    let h1 = node1.status().await.height;
-    let h2 = node2.status().await.height;
-
+    // Poll for convergence instead of a fixed sleep — robust on slow/loaded CI runners.
+    let (mut h1, mut h2) = (0, 0);
+    for _ in 0..60 {
+        sleep(Duration::from_secs(1)).await;
+        h1 = node1.status().await.height;
+        h2 = node2.status().await.height;
+        if h1 >= 1 && h2 >= 1 && (h1 as i64 - h2 as i64).abs() <= 2 {
+            break;
+        }
+    }
     assert!(h1 >= 1, "node1 did not mine: height={h1}");
     assert!(h2 >= 1, "node2 did not mine or sync: height={h2}");
     let drift = (h1 as i64 - h2 as i64).abs();
