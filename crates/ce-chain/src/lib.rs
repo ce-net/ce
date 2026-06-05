@@ -1244,12 +1244,35 @@ impl Chain {
                         }
                     }
                     in_block_epochs.insert((*cell, *host), *epoch);
-                    // Cell balance must cover heartbeat + any credits the cell transferred
-                    // away earlier in this same block (cross-type double-spend defence).
+                    // The cell's FREE balance must cover the heartbeat: total balance minus already
+                    // locked credits (open bids, channel capacity, active bond) minus every other
+                    // in-block debit of the cell (transfers, prior heartbeats, new bids, new bonds).
+                    // Without subtracting locked_balance + in-block bids/bonds, a cell could lock
+                    // credits in a bid and still have them drained by a heartbeat — a cross-type
+                    // double-spend (same defence the transfer/bid/channel paths already apply).
                     let prior_balance = self.balance(cell);
+                    let locked = self.locked_balance(cell) as i128;
                     let hb_accumulated = *heartbeat_debits.get(cell).unwrap_or(&0) as i128;
                     let transferred = *in_block_transfer.get(cell).unwrap_or(&0) as i128;
-                    if prior_balance - hb_accumulated - transferred < *amount as i128 {
+                    let in_block_bids: u128 = block
+                        .transactions
+                        .iter()
+                        .filter_map(|t| match &t.kind {
+                            TxKind::JobBid { payer, bid, .. } if payer == cell => Some(*bid),
+                            _ => None,
+                        })
+                        .sum();
+                    let in_block_bonds: u128 = block
+                        .transactions
+                        .iter()
+                        .filter_map(|t| match &t.kind {
+                            TxKind::HostBond { host, amount, .. } if host == cell => Some(*amount),
+                            _ => None,
+                        })
+                        .sum();
+                    let committed =
+                        locked + hb_accumulated + transferred + (in_block_bids + in_block_bonds) as i128;
+                    if prior_balance - committed < *amount as i128 {
                         return false;
                     }
                     *heartbeat_debits.entry(*cell).or_insert(0) += amount;
@@ -2508,6 +2531,30 @@ mod tests {
         );
         assert_eq!(chain.burned_total(), burn);
         assert_eq!(chain.node_history(&host.node_id()).earned, amount - burn);
+    }
+
+    // Cross-type double-spend: a node locks its whole balance in a bid, then a host tries to drain
+    // the same credits via a heartbeat. Locked funds are not free, so the heartbeat must be rejected.
+    #[test]
+    fn heartbeat_cannot_drain_locked_funds() {
+        let cell = make_identity("hb-lock-cell");
+        let host = make_identity("hb-lock-host");
+        let neutral = make_identity("hb-lock-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &cell, 1);
+        let bal = chain.balance(&cell.node_id()) as u128;
+
+        // Cell locks its entire balance in an open bid.
+        let job_id = [42u8; 32];
+        assert!(append_with(&mut chain, &neutral, signed_job_bid(&cell, job_id, bal)));
+        assert_eq!(chain.locked_balance(&cell.node_id()), bal);
+
+        // A heartbeat draining even 1 base unit must be rejected — no free balance remains.
+        let hb = signed_heartbeat(&host, cell.node_id(), 1, 0);
+        assert!(
+            !append_with(&mut chain, &neutral, hb),
+            "heartbeat must not drain bid-locked funds"
+        );
     }
 
     // ----- Phase 1: host bonds + equivocation slashing (docs/consensus.md §4.1) -----

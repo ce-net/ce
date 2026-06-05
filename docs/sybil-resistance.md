@@ -111,6 +111,7 @@ young-chain defense).
 | E3 | Unverified heartbeat billing (host fabricates amounts) | high | confirmed |
 | E4 | Wash-traded reputation / unverified job work | low | partial |
 | E5 | Off-chain receipt reuse across host restart | medium | confirmed |
+| E6 | Heartbeat drains bid/channel/bond-locked funds (cross-type double-spend) | high | **FIXED** |
 
 **E1 — Sybil mining inflation.** `UptimeReward` pays a flat per-block emission
 (`ce-node/src/lib.rs:646`), and identities are free, so N identities on one machine earn ~N times
@@ -149,6 +150,14 @@ to stage, and only pays off if some honest party later trusts that reputation. I
 and positive-feedback scoring is Sybil-vulnerable unless anchored to a cost). Fix: anchor
 reputation to a bond, and never let reputation alone buy out redundant verification on high-value
 jobs.
+
+**E6 — Heartbeat cross-type double-spend (found during Phase 1 implementation, FIXED).**
+`Heartbeat` validation checked the cell's *total* balance, not its *free* balance — it never
+subtracted `locked_balance` (or in-block bids/bonds), unlike the transfer/bid/channel paths. A node
+could lock its whole balance in a `JobBid` and still have those same credits drained by a
+`Heartbeat`, leaving a negative free balance and double-spending the locked funds. Fixed in
+`ce-chain` (`apply`/validation): the heartbeat check now subtracts `locked_balance(cell)` plus the
+cell's in-block bids and bonds, with a regression test (`heartbeat_cannot_drain_locked_funds`).
 
 **E5 — Off-chain receipt reuse across restart.** Payment-channel receipts sign only
 `(channel_id, host, cumulative)` with no per-channel served-state binding
