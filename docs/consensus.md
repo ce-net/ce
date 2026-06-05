@@ -243,7 +243,19 @@ signed checkpoint into the new genesis, so **no credits are lost and PoW miners 
     rather than netting to zero. **Still TODO in this phase:** net-outflow/cluster accounting and
     per-counterparty caps (these belong with the Phase 2 weight oracle, since they only matter once
     `earned` feeds consensus weight; the burn alone closes the *economic* leak today).
-- **Phase 1 — Bond + slash:** `HostBond`/`HostUnbond` (reuse `locked_balance`) + `SlashEquivocation`.
+- **Phase 1 — Bond + slash: IMPLEMENTED** (`ce-chain`, branch `phase0-settlement-burn`).
+  `TxKind::HostBond { host, amount, nonce }` locks credits as a slow-release bond (reuses
+  `locked_balance`, validated against every other in-block debit so it can't double-spend);
+  `HostUnbond` starts a `UNBOND_BLOCKS` (2016) window during which funds stay locked and slashable,
+  then auto-release lazily. `TxKind::SlashEquivocation { offender, reporter, proof }` carries a
+  self-contained `EquivocationProof` (two offender-signed statements for one `(domain, epoch)` via
+  `equivocation_signed_bytes`); a valid proof against an active bond burns 100% of it —
+  `SLASH_REPORTER_BPS` (25%) to the reporter, the rest destroyed — idempotent per
+  `(offender, domain, epoch)`, recorded in `NodeStats.slashes`. Accessors `bond_of`/`total_bonded`.
+  **Not yet wired:** the bond does not yet *gate* `UptimeReward`/capacity eligibility (Phase 2/3, the
+  weight oracle and VRF), and there is no CLI/HTTP bonding surface — chain primitives only. The proof
+  format is forward-compatible: future VRF block tickets and capacity ads sign through
+  `equivocation_signed_bytes`, making double-signing slashable.
 - **Phase 2 — Weight oracle:** pure deterministic `W(node, height)` at `height−LOOKBACK`; fuzz for
   cross-architecture determinism.
 - **Phase 3 — VRF leader election:** confirmed-depth seed, VRF prove/verify, weighted ticket

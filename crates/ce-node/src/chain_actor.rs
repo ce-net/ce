@@ -401,11 +401,14 @@ fn tx_burn_amount(tx: &Tx) -> Option<u128> {
         TxKind::JobBid { bid, .. } => Some(*bid),
         TxKind::JobSettle { cost, .. } => Some(*cost),
         TxKind::Heartbeat { amount, .. } => Some(*amount),
+        TxKind::HostBond { amount, .. } => Some(*amount),
         TxKind::JobExpire { .. }
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
         | TxKind::ChannelExpire { .. }
         | TxKind::NameClaim { .. }
-        | TxKind::RevokeCapability { .. } => None,
+        | TxKind::RevokeCapability { .. }
+        | TxKind::HostUnbond { .. }
+        | TxKind::SlashEquivocation { .. } => None,
     }
 }

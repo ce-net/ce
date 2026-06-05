@@ -574,12 +574,15 @@ fn tx_value(tx: &ce_chain::Tx) -> Option<u128> {
         TxKind::JobBid { bid, .. } => Some(*bid),
         TxKind::JobSettle { cost, .. } => Some(*cost),
         TxKind::Heartbeat { amount, .. } => Some(*amount),
+        TxKind::HostBond { amount, .. } => Some(*amount),
         TxKind::JobExpire { .. }
         | TxKind::ChannelOpen { .. }
         | TxKind::ChannelClose { .. }
         | TxKind::ChannelExpire { .. }
         | TxKind::NameClaim { .. }
-        | TxKind::RevokeCapability { .. } => None,
+        | TxKind::RevokeCapability { .. }
+        | TxKind::HostUnbond { .. }
+        | TxKind::SlashEquivocation { .. } => None,
     }
 }
 
@@ -1061,6 +1064,9 @@ fn tx_stream_view(tx: &Tx) -> TxStreamView {
         TxKind::ChannelExpire { .. } => ("ChannelExpire", 0),
         TxKind::NameClaim { .. } => ("NameClaim", 0),
         TxKind::RevokeCapability { .. } => ("RevokeCapability", 0),
+        TxKind::HostBond { amount, .. } => ("HostBond", *amount),
+        TxKind::HostUnbond { .. } => ("HostUnbond", 0),
+        TxKind::SlashEquivocation { .. } => ("SlashEquivocation", 0),
     };
     TxStreamView { id: hex::encode(tx.id()), origin: hex::encode(tx.origin), kind, amount }
 }

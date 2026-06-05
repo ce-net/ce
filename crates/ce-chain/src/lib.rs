@@ -255,6 +255,21 @@ pub enum TxKind {
     /// chain invalidates that link and its whole subtree. See `ce-node`'s `capability` module and
     /// `docs/capabilities.md`.
     RevokeCapability { issuer: NodeId, nonce: u64 },
+    /// Post or top up a standing host bond. Locks `amount` of the host's free balance (like a JobBid
+    /// lock) and re-activates the bond if it was unbonding. Signed by the host (origin == host).
+    /// In later phases the bond gates marketplace roles (capacity ads, reward/leader eligibility); in
+    /// this phase it is a slashable, slow-release lock. See docs/consensus.md. `nonce` only
+    /// disambiguates otherwise-identical top-ups so two equal-amount bonds don't collide on tx id
+    /// (the duplicate-tx-id rule still blocks true replay); it is not otherwise validated.
+    HostBond { host: NodeId, amount: u128, nonce: u64 },
+    /// Begin unbonding the host's standing bond. The funds stay locked and slashable for
+    /// `UNBOND_BLOCKS` more blocks, then auto-release to free balance (no second tx). Signed by the host.
+    HostUnbond { host: NodeId },
+    /// Slash an `offender`'s standing bond for provable equivocation (two conflicting host-signed
+    /// statements for one slot). Submitted by the `reporter` (origin == reporter). Burns 100% of the
+    /// bond: the reporter receives `SLASH_REPORTER_BPS`, the remainder is destroyed. Idempotent per
+    /// `(offender, domain, epoch)`.
+    SlashEquivocation { offender: NodeId, reporter: NodeId, proof: EquivocationProof },
 }
 
 /// Validate a claimable name: 3–32 chars, lowercase ascii letters/digits/hyphen, not starting or
@@ -284,6 +299,34 @@ pub fn payer_settle_bytes(job_id: &[u8; 32], host: &NodeId, cost: u128) -> Vec<u
 /// on-chain via `ChannelClose`. The chain validates that closing receipt with identical bytes.
 pub fn channel_receipt_bytes(channel_id: &[u8; 32], host: &NodeId, cumulative: u128) -> Vec<u8> {
     bincode::serialize(&(b"ce-channel-receipt-v1", channel_id, host, cumulative)).unwrap_or_default()
+}
+
+/// Canonical bytes a host signs when it commits to a single `statement` for a `(domain, epoch)` slot.
+/// Any future per-slot signed artifact (a VRF block ticket, a capacity advertisement) signs through
+/// this helper, which makes double-signing two different statements for the same slot a self-contained,
+/// on-chain-verifiable equivocation — the evidence in `SlashEquivocation`. `statement` is a hash of
+/// the artifact's payload; `domain` tags which kind of slot it is.
+pub fn equivocation_signed_bytes(domain: &[u8; 16], epoch: u64, statement: &[u8; 32]) -> Vec<u8> {
+    bincode::serialize(&(b"ce-equivocation-v1", domain, epoch, statement)).unwrap_or_default()
+}
+
+/// Self-contained proof that one host signed two conflicting statements for the same `(domain, epoch)`
+/// slot — the evidence carried by `TxKind::SlashEquivocation`. The chain re-verifies both signatures
+/// and that the statements differ; no external context is needed (cf. Filecoin `ReportConsensusFault`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EquivocationProof {
+    /// Context tag for the slot the offender equivocated on (e.g. a capacity-ad or block-ticket domain).
+    pub domain: [u8; 16],
+    /// The slot/epoch both signed statements claim.
+    pub epoch: u64,
+    /// Hash of the first statement the offender signed.
+    pub statement_a: [u8; 32],
+    /// Hash of the conflicting second statement (must differ from `statement_a`).
+    pub statement_b: [u8; 32],
+    #[serde(with = "sig_serde")]
+    pub sig_a: [u8; 64],
+    #[serde(with = "sig_serde")]
+    pub sig_b: [u8; 64],
 }
 
 /// An off-chain payment-channel receipt carried with a data-layer chunk fetch (Stage 3): the
@@ -469,6 +512,17 @@ pub fn settlement_burn(gross: u128) -> u128 {
     gross.saturating_mul(SETTLEMENT_BURN_BPS) / BPS_DENOM
 }
 
+/// Blocks a `HostBond` stays locked and slashable after `HostUnbond` before it auto-releases to the
+/// host's free balance. One difficulty window (~2 weeks at the 10-min target), so a host cannot
+/// cheat-then-flee: equivocation proven during this window still burns the bond. See docs/consensus.md.
+pub const UNBOND_BLOCKS: u64 = 2016;
+
+/// Share of a slashed bond paid to the reporter who submitted the equivocation proof, in basis
+/// points; the remainder is destroyed (burned), never paid to a counterparty (which would incentivise
+/// fraudulent disputes). v0 uses a flat share — the Filecoin-style Dutch-auction rising reward is a
+/// later refinement (docs/consensus.md §4).
+pub const SLASH_REPORTER_BPS: u128 = 2_500; // 25%
+
 
 /// Per-node interaction history derived from the chain — the **reputation substrate**.
 /// CE does not score trust; it guarantees these immutable facts, and apps compute their own
@@ -490,6 +544,8 @@ pub struct NodeStats {
     pub earned: u128,
     /// Total credits spent on work (settlements + heartbeats paid).
     pub spent: u128,
+    /// Times this node's bond was slashed for provable equivocation.
+    pub slashes: u64,
     /// Block height at which this node was first seen in an interaction (0 = never).
     pub first_height: u64,
     /// Block height of this node's most recent interaction.
@@ -531,6 +587,17 @@ pub struct Chain {
     /// Capacity is locked in the payer's balance until ChannelClose or ChannelExpire.
     #[serde(skip, default)]
     open_channels: std::collections::HashMap<[u8; 32], (NodeId, NodeId, u128, u64)>,
+
+    /// Standing host bonds: host → (amount, unbonding_at). `unbonding_at == None` means active;
+    /// `Some(h)` means unbonding — still locked and slashable until block height `h`, then released to
+    /// free balance. Rebuilt from available blocks (same prune caveat as `node_stats`).
+    #[serde(skip, default)]
+    bonds: std::collections::HashMap<NodeId, (u128, Option<u64>)>,
+
+    /// Equivocations already slashed, keyed by `(offender, domain, epoch)`, so the same fault cannot
+    /// be slashed twice. Rebuilt from available blocks (mirrors the `revoked` set).
+    #[serde(skip, default)]
+    slashed_equivocations: std::collections::HashSet<(NodeId, [u8; 16], u64)>,
 
     /// Cumulative UptimeReward supply. Avoids O(n) scan in append().
     #[serde(skip, default)]
@@ -586,6 +653,8 @@ impl Chain {
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
             open_channels: std::collections::HashMap::new(),
+            bonds: std::collections::HashMap::new(),
+            slashed_equivocations: std::collections::HashSet::new(),
             total_supply_cache: 0,
             burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
@@ -605,6 +674,9 @@ impl Chain {
         // Rebuilt from available blocks (not seeded from checkpoint). Channels are short-lived
         // and retained within the light-node prune window; archive nodes hold full state.
         self.open_channels.clear();
+        // Bonds and slash records are rebuilt from available blocks (same prune caveat as node_stats).
+        self.bonds.clear();
+        self.slashed_equivocations.clear();
         self.total_supply_cache = 0;
         // Rebuilt from available blocks (same prune caveat as node_stats); never seeded from
         // checkpoint — it is observational, not consensus-critical.
@@ -739,6 +811,34 @@ impl Chain {
                 }
                 TxKind::RevokeCapability { issuer, nonce } => {
                     self.revoked.insert((*issuer, *nonce));
+                }
+                TxKind::HostBond { host, amount, .. } => {
+                    // Lock (or top up) the bond and re-activate it if it was unbonding. The funds stay
+                    // in the host's balance but become locked (counted by locked_balance).
+                    let entry = self.bonds.entry(*host).or_insert((0, None));
+                    entry.0 = entry.0.saturating_add(*amount);
+                    entry.1 = None;
+                }
+                TxKind::HostUnbond { host } => {
+                    if let Some(entry) = self.bonds.get_mut(host) {
+                        // Start the slow release; funds stay locked and slashable until this height.
+                        entry.1 = Some(block.index + UNBOND_BLOCKS);
+                    }
+                }
+                TxKind::SlashEquivocation { offender, reporter, proof } => {
+                    // append() validated the bond is active and the fault is unslashed. Confiscate the
+                    // whole bond: it leaves the offender's balance, the reporter gets its share, the
+                    // remainder is destroyed.
+                    if let Some((amount, _)) = self.bonds.remove(offender) {
+                        let reporter_share = amount.saturating_mul(SLASH_REPORTER_BPS) / BPS_DENOM;
+                        let destroyed = amount.saturating_sub(reporter_share);
+                        *self.balances.entry(*offender).or_insert(0) -= amount as i128;
+                        *self.balances.entry(*reporter).or_insert(0) += reporter_share as i128;
+                        self.burned_total_cache = self.burned_total_cache.saturating_add(destroyed);
+                        let h = block.index;
+                        self.node_stat(offender, h).slashes += 1;
+                    }
+                    self.slashed_equivocations.insert((*offender, proof.domain, proof.epoch));
                 }
             }
             self.tx_index.insert(tx.id(), (block.index, pos));
@@ -1031,6 +1131,89 @@ impl Chain {
                 }
             }
         }
+        // Host-bond / unbond / slash rules. A HostBond locks `amount` of the host's free balance and
+        // is validated against EVERY other in-block debit of the same host (transfers, bids,
+        // heartbeats-as-cell, prior bonds) so it cannot double-spend; the payment-channel section
+        // (validated last) in turn subtracts in-block bonds, so a bond never collides with a channel.
+        {
+            let mut in_block_bond: std::collections::HashMap<NodeId, u128> =
+                std::collections::HashMap::new();
+            let mut slashing: std::collections::HashSet<(NodeId, [u8; 16], u64)> =
+                std::collections::HashSet::new();
+            for tx in &block.transactions {
+                match &tx.kind {
+                    TxKind::HostBond { host, amount, .. } => {
+                        if &tx.origin != host || *amount == 0 {
+                            return false;
+                        }
+                        let bids: u128 = block
+                            .transactions
+                            .iter()
+                            .filter_map(|t| match &t.kind {
+                                TxKind::JobBid { payer, bid, .. } if payer == host => Some(*bid),
+                                _ => None,
+                            })
+                            .sum();
+                        let hbs: u128 = block
+                            .transactions
+                            .iter()
+                            .filter_map(|t| match &t.kind {
+                                TxKind::Heartbeat { cell, amount, .. } if cell == host => Some(*amount),
+                                _ => None,
+                            })
+                            .sum();
+                        let transfers = *in_block_transfer.get(host).unwrap_or(&0);
+                        let prior_bonds = *in_block_bond.get(host).unwrap_or(&0);
+                        let committed =
+                            (self.locked_balance(host) + transfers + bids + hbs + prior_bonds) as i128;
+                        if self.balance(host) - committed < *amount as i128 {
+                            return false;
+                        }
+                        *in_block_bond.entry(*host).or_insert(0) += *amount;
+                    }
+                    TxKind::HostUnbond { host } => {
+                        if &tx.origin != host {
+                            return false;
+                        }
+                        // Must have an active, not-already-unbonding bond to unbond.
+                        match self.bonds.get(host) {
+                            Some((amount, None)) if *amount > 0 => {}
+                            _ => return false,
+                        }
+                    }
+                    TxKind::SlashEquivocation { offender, reporter, proof } => {
+                        // Submitted by the reporter; a node cannot slash itself.
+                        if &tx.origin != reporter || reporter == offender {
+                            return false;
+                        }
+                        // The two statements must actually conflict.
+                        if proof.statement_a == proof.statement_b {
+                            return false;
+                        }
+                        // Both must be validly signed by the offender for the same (domain, epoch).
+                        let bytes_a =
+                            equivocation_signed_bytes(&proof.domain, proof.epoch, &proof.statement_a);
+                        let bytes_b =
+                            equivocation_signed_bytes(&proof.domain, proof.epoch, &proof.statement_b);
+                        if verify(offender, &bytes_a, &proof.sig_a).is_err()
+                            || verify(offender, &bytes_b, &proof.sig_b).is_err()
+                        {
+                            return false;
+                        }
+                        // The offender must have an active (locked, slashable) bond.
+                        if self.active_bond(offender) == 0 {
+                            return false;
+                        }
+                        // Idempotent: not already slashed on-chain or earlier in this block.
+                        let key = (*offender, proof.domain, proof.epoch);
+                        if self.slashed_equivocations.contains(&key) || !slashing.insert(key) {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Heartbeat rules.
         {
             let mut in_block_epochs: std::collections::HashMap<(NodeId, NodeId), u64> =
@@ -1112,10 +1295,22 @@ impl Chain {
                                 _ => None,
                             })
                             .sum();
+                        let bonds: u128 = block
+                            .transactions
+                            .iter()
+                            .filter_map(|t| match &t.kind {
+                                TxKind::HostBond { host, amount, .. } if host == payer => Some(*amount),
+                                _ => None,
+                            })
+                            .sum();
                         let transfers = *in_block_transfer.get(payer).unwrap_or(&0);
                         let prior_chan = *in_block_channel.get(payer).unwrap_or(&0);
-                        let committed =
-                            (self.locked_balance(payer) + transfers + bids + hbs + prior_chan) as i128;
+                        let committed = (self.locked_balance(payer)
+                            + transfers
+                            + bids
+                            + hbs
+                            + bonds
+                            + prior_chan) as i128;
                         if self.balance(payer) - committed < *capacity as i128 {
                             return false;
                         }
@@ -1281,6 +1476,8 @@ impl Chain {
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
             open_channels: std::collections::HashMap::new(),
+            bonds: std::collections::HashMap::new(),
+            slashed_equivocations: std::collections::HashSet::new(),
             total_supply_cache: 0,
             burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
@@ -1322,6 +1519,8 @@ impl Chain {
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
             open_channels: std::collections::HashMap::new(),
+            bonds: std::collections::HashMap::new(),
+            slashed_equivocations: std::collections::HashSet::new(),
             total_supply_cache: 0,
             burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
@@ -1367,7 +1566,31 @@ impl Chain {
             .filter(|(payer, _, _, _)| payer == node)
             .map(|(_, _, capacity, _)| *capacity)
             .sum();
-        in_bids + in_channels
+        // A standing host bond is locked while active (including during unbonding, until it releases).
+        in_bids + in_channels + self.active_bond(node)
+    }
+
+    /// The host's currently-active (locked and slashable) bond amount, or 0. A bond past its
+    /// `unbonding_at` height has released and is neither locked nor slashable.
+    fn active_bond(&self, node: &NodeId) -> u128 {
+        match self.bonds.get(node) {
+            Some((amount, None)) => *amount,
+            Some((amount, Some(release_at))) if *release_at > self.height() => *amount,
+            _ => 0,
+        }
+    }
+
+    /// The host's active bond amount (0 if none / already released). Public reputation/economy read.
+    pub fn bond_of(&self, node: &NodeId) -> u128 {
+        self.active_bond(node)
+    }
+
+    /// Total credits currently locked in active host bonds across all nodes (base units).
+    pub fn total_bonded(&self) -> u128 {
+        self.bonds
+            .keys()
+            .map(|n| self.active_bond(n))
+            .fold(0u128, |a, b| a.saturating_add(b))
     }
 
     /// O(1) lookup for the highest confirmed Heartbeat epoch for a (cell, host) pair.
@@ -2285,6 +2508,190 @@ mod tests {
         );
         assert_eq!(chain.burned_total(), burn);
         assert_eq!(chain.node_history(&host.node_id()).earned, amount - burn);
+    }
+
+    // ----- Phase 1: host bonds + equivocation slashing (docs/consensus.md §4.1) -----
+
+    fn signed_host_bond(host: &Identity, amount: u128) -> Tx {
+        // A unique nonce per call so equal-amount top-ups don't collide on tx id.
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let kind = TxKind::HostBond { host: host.node_id(), amount, nonce };
+        let sig = host.sign(&bincode::serialize(&kind).unwrap());
+        Tx::new(kind, host.node_id(), sig)
+    }
+
+    fn signed_host_unbond(host: &Identity) -> Tx {
+        let kind = TxKind::HostUnbond { host: host.node_id() };
+        let sig = host.sign(&bincode::serialize(&kind).unwrap());
+        Tx::new(kind, host.node_id(), sig)
+    }
+
+    fn equivocation_proof(
+        offender: &Identity,
+        domain: [u8; 16],
+        epoch: u64,
+        a: [u8; 32],
+        b: [u8; 32],
+    ) -> EquivocationProof {
+        let sig_a = offender.sign(&equivocation_signed_bytes(&domain, epoch, &a));
+        let sig_b = offender.sign(&equivocation_signed_bytes(&domain, epoch, &b));
+        EquivocationProof { domain, epoch, statement_a: a, statement_b: b, sig_a, sig_b }
+    }
+
+    fn signed_slash(reporter: &Identity, offender: NodeId, proof: EquivocationProof) -> Tx {
+        let kind = TxKind::SlashEquivocation { offender, reporter: reporter.node_id(), proof };
+        let sig = reporter.sign(&bincode::serialize(&kind).unwrap());
+        Tx::new(kind, reporter.node_id(), sig)
+    }
+
+    #[test]
+    fn host_bond_locks_funds() {
+        let host = make_identity("bond-host");
+        let neutral = make_identity("bond-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &host, 1);
+        let bal = chain.balance(&host.node_id());
+
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&host, 500)));
+        assert_eq!(chain.bond_of(&host.node_id()), 500, "bond is active");
+        assert_eq!(chain.locked_balance(&host.node_id()), 500, "bond is locked");
+        assert_eq!(chain.total_bonded(), 500);
+        // A top-up adds to the same bond.
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&host, 250)));
+        assert_eq!(chain.bond_of(&host.node_id()), 750);
+        // Balance is unchanged (the bond is locked, not spent); only free balance shrinks.
+        assert_eq!(chain.balance(&host.node_id()), bal);
+    }
+
+    #[test]
+    fn bonded_funds_cannot_be_spent() {
+        let host = make_identity("bond-lock-host");
+        let other = make_identity("bond-lock-other");
+        let neutral = make_identity("bond-lock-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &host, 1);
+        let bal = chain.balance(&host.node_id()) as u128;
+
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&host, 500)));
+        // Free balance is now bal - 500. A transfer that dips into the bonded 500 is rejected.
+        let too_big = signed_transfer(&host, other.node_id(), bal - 100);
+        assert!(!append_with(&mut chain, &neutral, too_big), "cannot spend bonded funds");
+        // A transfer within free balance is fine.
+        let ok = signed_transfer(&host, other.node_id(), bal - 600);
+        assert!(append_with(&mut chain, &neutral, ok), "free balance is still spendable");
+    }
+
+    #[test]
+    fn host_bond_rejects_over_balance_and_wrong_origin() {
+        let host = make_identity("bond-rej-host");
+        let imposter = make_identity("bond-rej-imp");
+        let neutral = make_identity("bond-rej-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &host, 1);
+        let bal = chain.balance(&host.node_id()) as u128;
+
+        // Bonding more than the whole balance is rejected.
+        assert!(!append_with(&mut chain, &neutral, signed_host_bond(&host, bal + 1)));
+        // A bond whose origin isn't the named host is rejected (imposter signs/sends).
+        let kind = TxKind::HostBond { host: host.node_id(), amount: 100, nonce: 0 };
+        let bad = Tx::new(kind.clone(), imposter.node_id(), imposter.sign(&bincode::serialize(&kind).unwrap()));
+        assert!(!append_with(&mut chain, &neutral, bad), "origin must equal host");
+    }
+
+    #[test]
+    fn unbond_keeps_funds_locked_until_window() {
+        let host = make_identity("unbond-host");
+        let neutral = make_identity("unbond-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &host, 1);
+
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&host, 500)));
+        assert!(append_with(&mut chain, &neutral, signed_host_unbond(&host)));
+        // Immediately after unbond the bond is still active: locked and slashable for UNBOND_BLOCKS.
+        assert_eq!(chain.bond_of(&host.node_id()), 500, "still slashable during unbonding");
+        assert_eq!(chain.locked_balance(&host.node_id()), 500, "still locked during unbonding");
+        // Cannot unbond again while already unbonding.
+        assert!(!append_with(&mut chain, &neutral, signed_host_unbond(&host)));
+    }
+
+    #[test]
+    fn slash_equivocation_burns_bond_and_pays_reporter() {
+        let offender = make_identity("slash-offender");
+        let reporter = make_identity("slash-reporter");
+        let neutral = make_identity("slash-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &offender, 1);
+
+        let bond = 1_000u128;
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&offender, bond)));
+        let off_bal_before = chain.balance(&offender.node_id());
+        let rep_bal_before = chain.balance(&reporter.node_id());
+        let burned_before = chain.burned_total();
+
+        // The offender signed two different statements for the same (domain, epoch) slot.
+        let proof = equivocation_proof(&offender, *b"ce-capacity-ad\0\0", 7, [1u8; 32], [2u8; 32]);
+        assert!(append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), proof)));
+
+        let reporter_share = bond * SLASH_REPORTER_BPS / 10_000;
+        let destroyed = bond - reporter_share;
+        assert_eq!(chain.bond_of(&offender.node_id()), 0, "bond is gone");
+        assert_eq!(chain.balance(&offender.node_id()), off_bal_before - bond as i128, "offender loses the whole bond");
+        assert_eq!(chain.balance(&reporter.node_id()), rep_bal_before + reporter_share as i128, "reporter paid its share");
+        assert_eq!(chain.burned_total(), burned_before + destroyed, "the rest is destroyed");
+        assert_eq!(chain.node_history(&offender.node_id()).slashes, 1);
+    }
+
+    #[test]
+    fn slash_rejects_bad_proof_and_no_bond() {
+        let offender = make_identity("slash2-offender");
+        let reporter = make_identity("slash2-reporter");
+        let neutral = make_identity("slash2-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &offender, 1);
+
+        // No bond yet → nothing to slash, even with a valid proof.
+        let proof = equivocation_proof(&offender, *b"d\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 1, [3u8; 32], [4u8; 32]);
+        assert!(!append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), proof.clone())));
+
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&offender, 800)));
+
+        // Non-conflicting statements (a == b) are not equivocation.
+        let same = equivocation_proof(&offender, *b"d\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 1, [5u8; 32], [5u8; 32]);
+        assert!(!append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), same)));
+
+        // A proof signed by someone other than the offender is invalid.
+        let forged = equivocation_proof(&reporter, *b"d\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 1, [6u8; 32], [7u8; 32]);
+        assert!(!append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), forged)));
+
+        // The bond survived all the rejected attempts.
+        assert_eq!(chain.bond_of(&offender.node_id()), 800);
+    }
+
+    #[test]
+    fn slash_is_idempotent_per_slot() {
+        let offender = make_identity("slash3-offender");
+        let reporter = make_identity("slash3-reporter");
+        let neutral = make_identity("slash3-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &offender, 1);
+
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&offender, 500)));
+        let domain = *b"ce-capacity-ad\0\0";
+        let proof = equivocation_proof(&offender, domain, 9, [1u8; 32], [2u8; 32]);
+        assert!(append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), proof.clone())));
+
+        // Re-bond, then try to slash the SAME (offender, domain, epoch) again — rejected as already slashed.
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&offender, 500)));
+        assert!(
+            !append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), proof)),
+            "the same fault cannot be slashed twice"
+        );
+        assert_eq!(chain.node_history(&offender.node_id()).slashes, 1);
+        // A DIFFERENT epoch is still slashable.
+        let proof2 = equivocation_proof(&offender, domain, 10, [1u8; 32], [2u8; 32]);
+        assert!(append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), proof2)));
+        assert_eq!(chain.node_history(&offender.node_id()).slashes, 2);
     }
 
     #[test]
