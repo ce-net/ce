@@ -5,6 +5,18 @@ control of machines**. An attacker who defeats CE doesn't get "fake credits"; th
 to run code on participating devices, amplified by self-replication. Security is therefore about the
 whole path **mint → pay → authorize → execute → contain**, designed fail-closed and least-privilege.
 
+> **Companion document:** [sybil-resistance.md](sybil-resistance.md) is the deep audit of Sybil
+> resistance plus the network-, marketplace-, and DoS-layer findings (each adversarially verified
+> against the code and cross-referenced to the literature), and the three-pillar defense design
+> (bond+slashing, verification dial, libp2p hardening). The core insight there: **PoW gives CE
+> Sybil resistance over consensus weight only — the peer/DHT/relay/marketplace layer gets none from
+> PoW and needs its own economic defenses.** Paths C and D below summarize what that audit added to
+> this model. The audit's conclusion that PoW is the wrong backbone for CE led to a consensus
+> bake-off and a recommended replacement — **CE-TWLE** (VRF leader election weighted by
+> `min(bond, earned-work)`, zero wasted compute) — documented in [consensus.md](consensus.md). It
+> eliminates Path A's cheap-51% by removing PoW; its Phase 0 (a mandatory settlement burn that kills
+> the wash-trade leak) ships on the current chain first.
+
 ## The three paths to running an attacker's code on a victim
 
 ### Path 0 — reach the node's control API directly
@@ -76,6 +88,53 @@ self-replication, one compromise propagates down the tree.
   ability **and** a program on `$RDEV_SPAWN_ALLOW`, runs with a **scrubbed environment**, and
   confines `cwd` to the target's home.
 - **`rdev/exec`** runs in a gVisor container with no network.
+
+### Path C — multiply identities to farm the marketplace (Sybil economics)
+**Risk:** identities are free Ed25519 keypairs, so a single operator can run N of them. PoW caps
+*consensus* weight per hashrate, but nothing caps *marketplace* weight per identity. Verified
+findings (see [sybil-resistance.md](sybil-resistance.md) §3):
+- **Sybil reward concentration** — `UptimeReward` is flat per block; N identities split a machine's
+  hashrate into N reward streams. Bounded by total PoW, but uncapped per identity. (E1)
+- **Unverified capacity ads** — `CellSignal` capacity values (`cpu`, `mem_mb`, `tag:gpu`) are signed
+  but never checked for truth; a Sybil advertises capacity it doesn't have and wins JobBids it can't
+  serve (the io.net April-2024 fake-GPU pattern). (E2)
+- **Unverified heartbeat billing** — `Heartbeat.amount` has no proof field; a modified host bills
+  arbitrary amounts up to the cell's balance with no proof a container ran. (E3)
+- **Wash-traded reputation** — `JobSettle` never verifies host work, so payer+host identities owned
+  by one attacker self-deal to fabricate `/history` reputation (the EigenTrust self-promotion
+  problem). (E4)
+- **Off-chain receipt reuse** — payment-channel `served` state is in-memory; after a host restart a
+  payer replays an old receipt for free service. (E5)
+
+**Defense (planned, not yet implemented):** a single standing **`HostBond`** that gates capacity-ad
+publication and `UptimeReward` eligibility, slashable only on the three on-chain-provable fault
+classes (equivocation, fake-capacity-by-`/beacon`-challenge, failed redundant verification), with
+an Ethereum-style correlation multiplier so flaky hardware pays a small FaultFee while a colluding
+ring loses near-100%. Plus a per-job **verification dial** (T0 interactive → T4 TEE-attested) seeded
+by `/beacon` for unbiasable replica placement. Full design in sybil-resistance.md §4.1–4.2.
+
+### Path D — network / authz / DoS holes
+**Risk:** the libp2p layer has no Sybil/DoS defenses configured, and one authz check is too coarse.
+Verified findings (see [sybil-resistance.md](sybil-resistance.md) §3):
+- **Kill-RPC authorization is coarse** — mesh-kill checks the caller holds a "kill" capability but
+  not that it owns the target job, so any "kill" cap can stop **any** job by `job_id`. Bind kill to
+  the job's `payer`/owner. (D1, the most important new finding)
+- **No gossipsub peer scoring / no validation feedback / no connection limits / no rate limits** —
+  the entire gossipsub v1.1 Sybil/DoS layer is off; P4 can't fire because the app never reports
+  validation results. (N1)
+- **Four topics carry an unauthenticated in-payload `node_id`** (`ce-heights`, `ce-syncreq`,
+  `ce-syncresp`, `ce-segments`) — the envelope is signed but the payload can name another node,
+  enabling forged height/sync claims. (N2)
+- **No Kademlia IP-diversity caps** (eclipse / routing-table poisoning), **dead `allowed_peers`**,
+  **`synced`-flag race**, **CellSignal nonce replay + unbounded nonce map**, **unpaid relay window**,
+  **AppRequest channel leak**, **single relay/bootstrap chokepoint**. (N3–N8, D2–D5)
+
+**Defense (planned):** Pillar 3 in sybil-resistance.md §4.3 — wire P4 validation feedback, enable
+peer scoring with P6 IP-colocation and **P5 bound to on-chain bond/reputation** (the bridge that
+makes Sybil cost economic at the transport layer), add connection limits, hand-roll Kademlia /24
+diversity caps, set explicit circuit-relay-v2 limits, run ≥3 independent relays. Note: P6/diversity
+must whitelist capability-rooted own-peers and skip `/p2p-circuit` addrs, or it penalizes CE's own
+laptop+desktop behind one NAT.
 
 ## Known residual risk / follow-ups
 - **Signed-binary attestation** for replication is not yet enforced: a `sync` cap can overwrite an
