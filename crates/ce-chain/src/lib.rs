@@ -523,6 +523,14 @@ pub const UNBOND_BLOCKS: u64 = 2016;
 /// later refinement (docs/consensus.md §4).
 pub const SLASH_REPORTER_BPS: u128 = 2_500; // 25%
 
+/// Fork-choice / VRF look-back depth (blocks). Consensus weight is read from chain state this many
+/// blocks behind the tip, so an attacker cannot mint fresh weight inside a private fork to make its
+/// suffix heavier — the weight is fixed by history both forks already agree on. The weight ORACLE
+/// (`consensus_weight`) is a pure function of whatever state it is given; `LOOKBACK` is how Phase 3's
+/// VRF leader election and weighted fork choice will *call* it (against appropriately-aged state).
+/// See docs/consensus.md.
+pub const LOOKBACK: u64 = 64;
+
 
 /// Per-node interaction history derived from the chain — the **reputation substrate**.
 /// CE does not score trust; it guarantees these immutable facts, and apps compute their own
@@ -1614,6 +1622,25 @@ impl Chain {
             .keys()
             .map(|n| self.active_bond(n))
             .fold(0u128, |a, b| a.saturating_add(b))
+    }
+
+    /// A node's earned-work-score: the Sybil-resistant half of consensus weight. v0 uses net credits
+    /// earned hosting verified work (`NodeStats.earned`, already post-settlement-burn, so wash-trading
+    /// it costs real capital — docs/sybil-resistance.md E4). The fuller net-outflow / distinct-
+    /// counterparty accounting (docs/consensus.md §4.1, "Still TODO") is a later refinement; this is a
+    /// monotone, deterministic, integer proxy.
+    pub fn earned_work_score(&self, node: &NodeId) -> u128 {
+        self.node_stats.get(node).map(|s| s.earned).unwrap_or(0)
+    }
+
+    /// A node's consensus weight `W = min(active bond, earned-work-score)` — the scarce,
+    /// non-manufacturable anchor for Phase 3's VRF leader election and weighted fork choice. Both
+    /// terms must be non-zero: you cannot buy weight without doing verified work (the bond is capped
+    /// by what you've earned), and cannot earn weight without staking (the work is capped by the
+    /// bond). A fresh, unbonded, or fully-slashed node has `W = 0`. Pure, integer-only, deterministic.
+    /// (Genesis bootstrap weight — `max(genesis_grant·decay, this)` — is layered on in Phase 5.)
+    pub fn consensus_weight(&self, node: &NodeId) -> u128 {
+        self.active_bond(node).min(self.earned_work_score(node))
     }
 
     /// O(1) lookup for the highest confirmed Heartbeat epoch for a (cell, host) pair.
@@ -2739,6 +2766,111 @@ mod tests {
         let proof2 = equivocation_proof(&offender, domain, 10, [1u8; 32], [2u8; 32]);
         assert!(append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), proof2)));
         assert_eq!(chain.node_history(&offender.node_id()).slashes, 2);
+    }
+
+    // ----- Phase 2: the consensus weight oracle W = min(bond, earned-work) -----
+
+    /// Bond `node` to `bond` and have it host a settled job of gross `gross`, so it accrues earned
+    /// work (net of the settlement burn). Returns the net earned amount. Blocks are mined by a neutral
+    /// party so emission never perturbs the bonded node's economics.
+    fn bond_and_earn(chain: &mut Chain, node: &Identity, bond: u128, gross: u128) -> u128 {
+        // Unique tags per call so parallel tests don't race on the same on-disk identity.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let neutral = make_identity(&format!("we-miner-{seq}"));
+        let payer = make_identity(&format!("we-payer-{seq}"));
+        fund(chain, node, 1);
+        fund(chain, &payer, gross + 10);
+        assert!(append_with(chain, &neutral, signed_host_bond(node, bond)));
+        // payer bids, `node` settles as host → node.earned += net.
+        let job_id = {
+            let mut id = [0u8; 32];
+            id[0] = (gross % 251) as u8;
+            id[1] = 0xAB;
+            id
+        };
+        assert!(append_with(chain, &neutral, signed_job_bid(&payer, job_id, gross)));
+        assert!(append_with(chain, &neutral, signed_job_settle(node, &payer, job_id, gross)));
+        gross - settlement_burn(gross)
+    }
+
+    #[test]
+    fn consensus_weight_needs_both_bond_and_work() {
+        let fresh = make_identity("w-fresh");
+        let chain = Chain::genesis();
+        // A fresh node has no bond and no earned work → zero weight.
+        assert_eq!(chain.consensus_weight(&fresh.node_id()), 0);
+
+        // Bonded but no earned work → still zero (you can't buy weight without working).
+        let bonded = make_identity("w-bonded");
+        let neutral = make_identity("w-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &bonded, 1);
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&bonded, 1_000)));
+        assert_eq!(chain.earned_work_score(&bonded.node_id()), 0);
+        assert_eq!(chain.consensus_weight(&bonded.node_id()), 0, "bond alone is not weight");
+
+        // Earned work but no bond → still zero (you can't earn weight without staking).
+        let worker = make_identity("w-worker");
+        let mut chain2 = Chain::genesis();
+        let net = {
+            let n = make_identity("w-miner2");
+            let payer = make_identity("w-payer2");
+            fund(&mut chain2, &worker, 1);
+            fund(&mut chain2, &payer, 1_010);
+            assert!(append_with(&mut chain2, &n, signed_job_bid(&payer, [9u8; 32], 1_000)));
+            assert!(append_with(&mut chain2, &n, signed_job_settle(&worker, &payer, [9u8; 32], 1_000)));
+            1_000 - settlement_burn(1_000)
+        };
+        assert_eq!(chain2.earned_work_score(&worker.node_id()), net);
+        assert_eq!(chain2.bond_of(&worker.node_id()), 0);
+        assert_eq!(chain2.consensus_weight(&worker.node_id()), 0, "earned work alone is not weight");
+    }
+
+    #[test]
+    fn consensus_weight_is_min_of_bond_and_earned() {
+        // Bond exceeds earned → weight is capped by earned work.
+        let a = make_identity("w-a");
+        let mut chain = Chain::genesis();
+        let net = bond_and_earn(&mut chain, &a, 5_000, 1_000);
+        assert_eq!(chain.consensus_weight(&a.node_id()), net, "capped by earned work");
+        assert!(net < 5_000);
+
+        // Bond below earned → weight is capped by the bond.
+        let b = make_identity("w-b");
+        let mut chain2 = Chain::genesis();
+        let net2 = bond_and_earn(&mut chain2, &b, 300, 1_000);
+        assert_eq!(net2, 1_000 - settlement_burn(1_000));
+        assert_eq!(chain2.consensus_weight(&b.node_id()), 300, "capped by the bond");
+    }
+
+    #[test]
+    fn slashing_zeroes_consensus_weight() {
+        let offender = make_identity("w-slash");
+        let reporter = make_identity("w-slash-rep");
+        let neutral = make_identity("w-slash-miner");
+        let mut chain = Chain::genesis();
+        let _net = bond_and_earn(&mut chain, &offender, 300, 1_000);
+        assert_eq!(chain.consensus_weight(&offender.node_id()), 300);
+
+        let proof = equivocation_proof(&offender, *b"ce-capacity-ad\0\0", 1, [1u8; 32], [2u8; 32]);
+        assert!(append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), proof)));
+        // Bond gone → weight collapses to zero even though earned work remains.
+        assert!(chain.earned_work_score(&offender.node_id()) > 0);
+        assert_eq!(chain.consensus_weight(&offender.node_id()), 0, "slashing the bond zeroes weight");
+    }
+
+    #[test]
+    fn consensus_weight_is_deterministic() {
+        let a = make_identity("w-det");
+        let mut chain = Chain::genesis();
+        let _ = bond_and_earn(&mut chain, &a, 400, 2_000);
+        let w1 = chain.consensus_weight(&a.node_id());
+        // Recomputing is stable, and a full cache rebuild reproduces the same weight.
+        assert_eq!(w1, chain.consensus_weight(&a.node_id()));
+        chain.rebuild_caches();
+        assert_eq!(chain.consensus_weight(&a.node_id()), w1, "weight survives cache rebuild");
+        assert_eq!(w1, 400.min(2_000 - settlement_burn(2_000)));
     }
 
     #[test]

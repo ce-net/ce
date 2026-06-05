@@ -194,6 +194,12 @@ pub struct NodeStatusResponse {
     /// Credits destroyed by the settlement burn so far, base units as a decimal string.
     #[serde(with = "amount_str")]
     pub burned_total: u128,
+    /// This node's active host bond, base units as a decimal string.
+    #[serde(with = "amount_str")]
+    pub bond: u128,
+    /// This node's consensus weight = min(bond, earned-work-score), base units as a decimal string.
+    #[serde(with = "amount_str")]
+    pub weight: u128,
 }
 
 // ----- POST /jobs/bid -----
@@ -422,6 +428,8 @@ async fn node_status(State(state): State<ApiState>) -> Response {
             balance: snap.balance,
             circulating_supply: snap.circulating_supply,
             burned_total: snap.burned_total,
+            bond: snap.bond,
+            weight: snap.weight,
         }),
     )
         .into_response()

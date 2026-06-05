@@ -31,7 +31,9 @@ Node status snapshot.
   "difficulty": 4,
   "balance": "987000",
   "circulating_supply": "1042000000000000000000",
-  "burned_total": "5000000000000000000"
+  "burned_total": "5000000000000000000",
+  "bond": "0",
+  "weight": "0"
 }
 ```
 
@@ -43,6 +45,8 @@ Node status snapshot.
 | `balance` | string | This node's credit balance, base units (decimal string) |
 | `circulating_supply` | string | Total emitted minus total burned, base units (decimal string) |
 | `burned_total` | string | Credits destroyed by the settlement burn (see below), base units (decimal string) |
+| `bond` | string | This node's active host bond, base units (decimal string) |
+| `weight` | string | This node's consensus weight = `min(bond, earned-work-score)`, base units (decimal string) |
 
 **Settlement burn.** Every `JobSettle`, `Heartbeat`, and `ChannelClose` debits the payer/cell the
 full amount, credits the host `amount − burn`, and destroys the burn (`SETTLEMENT_BURN_BPS`, currently

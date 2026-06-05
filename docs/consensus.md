@@ -256,8 +256,15 @@ signed checkpoint into the new genesis, so **no credits are lost and PoW miners 
   weight oracle and VRF), and there is no CLI/HTTP bonding surface — chain primitives only. The proof
   format is forward-compatible: future VRF block tickets and capacity ads sign through
   `equivocation_signed_bytes`, making double-signing slashable.
-- **Phase 2 — Weight oracle:** pure deterministic `W(node, height)` at `height−LOOKBACK`; fuzz for
-  cross-architecture determinism.
+- **Phase 2 — Weight oracle: IMPLEMENTED** (`ce-chain`, branch `phase0-settlement-burn`).
+  `consensus_weight(node) = min(active_bond, earned_work_score)` — pure, integer-only, deterministic
+  (survives a cache rebuild). `earned_work_score` v0 = `NodeStats.earned` (net-of-burn, so washing it
+  costs real capital; the net-outflow/distinct-counterparty refinement is still TODO). Both terms must
+  be non-zero: you can't buy weight without working, or earn weight without staking; a fresh/unbonded/
+  fully-slashed node has `W=0`. `LOOKBACK=64` defined for Phase 3 to read weight at confirmed depth.
+  `bond` and `weight` surfaced on `/status`. **Not yet wired:** `W` does not yet drive block production
+  or fork choice (Phase 3, the VRF + seal swap — the first real consensus change), and genesis
+  bootstrap weight `max(genesis_grant·decay, W)` is Phase 5.
 - **Phase 3 — VRF leader election:** confirmed-depth seed, VRF prove/verify, weighted ticket
   sampling, adaptive threshold via the repurposed 2016-block retarget; swap `Block::work()`.
 - **Phase 4 — Seal swap:** replace `meets_difficulty`/`expected_difficulty` with VRF + eligibility

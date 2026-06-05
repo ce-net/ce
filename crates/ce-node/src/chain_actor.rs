@@ -29,6 +29,10 @@ pub struct ChainStatusSnap {
     pub circulating_supply: u128,
     /// Credits destroyed by the settlement burn so far (base units).
     pub burned_total: u128,
+    /// This node's active host bond (base units).
+    pub bond: u128,
+    /// This node's consensus weight = min(bond, earned-work-score) (base units).
+    pub weight: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +157,8 @@ impl ChainHandle {
             balance: 0,
             circulating_supply: 0,
             burned_total: 0,
+            bond: 0,
+            weight: 0,
         })
     }
 
@@ -291,6 +297,8 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
                     balance: chain.balance(&node),
                     circulating_supply: chain.circulating_supply(),
                     burned_total: chain.burned_total(),
+                    bond: chain.bond_of(&node),
+                    weight: chain.consensus_weight(&node),
                 });
             }
             ChainCmd::SyncSnap { reply } => {
