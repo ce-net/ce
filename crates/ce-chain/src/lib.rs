@@ -531,6 +531,52 @@ pub const SLASH_REPORTER_BPS: u128 = 2_500; // 25%
 /// See docs/consensus.md.
 pub const LOOKBACK: u64 = 64;
 
+/// Slot length for VRF leader election (seconds): `slot = (timestamp − genesis_timestamp) / SLOT_SECS`.
+pub const SLOT_SECS: u64 = 10;
+
+/// Domain-separated leader-election seed for a slot. Bound to a CONFIRMED block (`LOOKBACK` behind the
+/// tip) so the current leader cannot grind it, and to the slot number. Every eligible node computes
+/// the same seed, signs it, and `H(signature)` is its VRF ticket.
+pub fn leader_seed(confirmed_hash: &[u8; 32], slot: u64) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"ce-twle-seed-v1");
+    h.update(confirmed_hash);
+    h.update(slot.to_be_bytes());
+    h.finalize().into()
+}
+
+/// A node's VRF ticket for a seed: `H(its Ed25519 signature over the seed)`. Ed25519 signatures are
+/// deterministic (RFC 8032) and unique per `(key, message)`, so the ticket is a deterministic,
+/// publicly-verifiable, unpredictable-without-the-key value — a usable VRF output. (v0 is
+/// signature-as-VRF; RFC 9381 ECVRF is a later hardening for stronger uniqueness guarantees.)
+pub fn vrf_ticket(proof_sig: &[u8; 64]) -> [u8; 32] {
+    Sha256::digest(proof_sig).into()
+}
+
+/// Verify a VRF proof: `proof_sig` must be `node`'s valid signature over `seed`. Returns the ticket on
+/// success; the proof is unforgeable without `node`'s secret key.
+pub fn vrf_verify(node: &NodeId, seed: &[u8; 32], proof_sig: &[u8; 64]) -> Option<[u8; 32]> {
+    verify(node, seed, proof_sig).ok().map(|_| vrf_ticket(proof_sig))
+}
+
+/// Interpret a VRF ticket as a `u128` (its high 16 bytes) for the eligibility comparison.
+pub fn ticket_value(ticket: &[u8; 32]) -> u128 {
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&ticket[..16]);
+    u128::from_be_bytes(b)
+}
+
+/// The eligibility cutoff for a node of `weight` out of `total_weight`: it leads a slot iff its
+/// `ticket_value` is strictly below this. Sized so the expected number of leaders per slot is ~1
+/// across the whole weight (Filecoin Expected-Consensus style: 0..n winners, empty slots normal).
+/// A zero-weight node (cutoff 0) can never lead.
+pub fn leader_threshold(weight: u128, total_weight: u128) -> u128 {
+    if total_weight == 0 || weight == 0 {
+        return 0;
+    }
+    (u128::MAX / total_weight).saturating_mul(weight)
+}
+
 
 /// Per-node interaction history derived from the chain — the **reputation substrate**.
 /// CE does not score trust; it guarantees these immutable facts, and apps compute their own
@@ -607,6 +653,14 @@ pub struct Chain {
     #[serde(skip, default)]
     slashed_equivocations: std::collections::HashSet<(NodeId, [u8; 16], u64)>,
 
+    /// Genesis bootstrap weight per node — network config (a chain spec), NOT chain data: re-applied
+    /// from node config on every startup, identical across honest nodes, so it is `skip`'d and survives
+    /// cache rebuilds (it is not derived from blocks). Solves the cold-start deadlock where nobody has
+    /// a bond or earned work yet. Decay toward zero as real earned weight accrues is Phase 5. See
+    /// docs/consensus.md §4.1.
+    #[serde(skip, default)]
+    genesis_weights: std::collections::HashMap<NodeId, u128>,
+
     /// Cumulative UptimeReward supply. Avoids O(n) scan in append().
     #[serde(skip, default)]
     total_supply_cache: u128,
@@ -663,6 +717,7 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             bonds: std::collections::HashMap::new(),
             slashed_equivocations: std::collections::HashSet::new(),
+            genesis_weights: std::collections::HashMap::new(),
             total_supply_cache: 0,
             burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
@@ -1509,6 +1564,7 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             bonds: std::collections::HashMap::new(),
             slashed_equivocations: std::collections::HashSet::new(),
+            genesis_weights: std::collections::HashMap::new(),
             total_supply_cache: 0,
             burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
@@ -1524,6 +1580,8 @@ impl Chain {
         }
 
         reorg_chain.rebuild_caches();
+        // genesis_weights is node config (not chain data), so carry it across the reorg.
+        reorg_chain.genesis_weights = self.genesis_weights.clone();
         *self = reorg_chain;
         true
     }
@@ -1552,6 +1610,7 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             bonds: std::collections::HashMap::new(),
             slashed_equivocations: std::collections::HashSet::new(),
+            genesis_weights: std::collections::HashMap::new(),
             total_supply_cache: 0,
             burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
@@ -1638,9 +1697,37 @@ impl Chain {
     /// terms must be non-zero: you cannot buy weight without doing verified work (the bond is capped
     /// by what you've earned), and cannot earn weight without staking (the work is capped by the
     /// bond). A fresh, unbonded, or fully-slashed node has `W = 0`. Pure, integer-only, deterministic.
-    /// (Genesis bootstrap weight — `max(genesis_grant·decay, this)` — is layered on in Phase 5.)
+    /// Genesis bootstrap weight gives `max(genesis_grant, min(bond, earned))` so the network can
+    /// produce blocks before anyone has bonded or earned (the cold-start deadlock). Grant decay toward
+    /// zero as real earned weight accrues is Phase 5.
     pub fn consensus_weight(&self, node: &NodeId) -> u128 {
-        self.active_bond(node).min(self.earned_work_score(node))
+        let earned = self.active_bond(node).min(self.earned_work_score(node));
+        let genesis = self.genesis_weights.get(node).copied().unwrap_or(0);
+        earned.max(genesis)
+    }
+
+    /// Total consensus weight across every node with a bond, earned history, or genesis grant — the
+    /// denominator the per-slot leader threshold is sized against.
+    pub fn total_consensus_weight(&self) -> u128 {
+        let mut nodes: std::collections::HashSet<&NodeId> = std::collections::HashSet::new();
+        nodes.extend(self.bonds.keys());
+        nodes.extend(self.node_stats.keys());
+        nodes.extend(self.genesis_weights.keys());
+        nodes
+            .into_iter()
+            .map(|n| self.consensus_weight(n))
+            .fold(0u128, |a, b| a.saturating_add(b))
+    }
+
+    /// Set the genesis bootstrap weights (network config / chain spec). Applied by the node at startup
+    /// from its configuration; must be identical across honest nodes. Not persisted in the chain file.
+    pub fn set_genesis_weights(&mut self, weights: std::collections::HashMap<NodeId, u128>) {
+        self.genesis_weights = weights;
+    }
+
+    /// A node's genesis bootstrap weight (0 if none).
+    pub fn genesis_weight(&self, node: &NodeId) -> u128 {
+        self.genesis_weights.get(node).copied().unwrap_or(0)
     }
 
     /// O(1) lookup for the highest confirmed Heartbeat epoch for a (cell, host) pair.
@@ -2871,6 +2958,99 @@ mod tests {
         chain.rebuild_caches();
         assert_eq!(chain.consensus_weight(&a.node_id()), w1, "weight survives cache rebuild");
         assert_eq!(w1, 400.min(2_000 - settlement_burn(2_000)));
+    }
+
+    // ----- Phase 3 (additive primitives): VRF leader election + genesis bootstrap weight -----
+
+    #[test]
+    fn genesis_weight_bootstraps_otherwise_zero_weight_node() {
+        let node = make_identity("gw-node");
+        let mut chain = Chain::genesis();
+        assert_eq!(chain.consensus_weight(&node.node_id()), 0, "no bond/earned/grant → 0");
+
+        let mut grants = std::collections::HashMap::new();
+        grants.insert(node.node_id(), 1_000u128);
+        chain.set_genesis_weights(grants);
+        assert_eq!(chain.consensus_weight(&node.node_id()), 1_000, "genesis grant bootstraps weight");
+        assert_eq!(chain.total_consensus_weight(), 1_000);
+        // Genesis config survives a cache rebuild (it is not chain data).
+        chain.rebuild_caches();
+        assert_eq!(chain.consensus_weight(&node.node_id()), 1_000);
+    }
+
+    #[test]
+    fn consensus_weight_takes_max_of_grant_and_earned() {
+        // Earned/bonded weight above the grant wins; below it, the grant floors it.
+        let a = make_identity("gw-max");
+        let mut chain = Chain::genesis();
+        let net = bond_and_earn(&mut chain, &a, 5_000, 1_000); // earned-weight = net (<1000)
+        let mut grants = std::collections::HashMap::new();
+        grants.insert(a.node_id(), 300u128); // grant below earned
+        chain.set_genesis_weights(grants);
+        assert_eq!(chain.consensus_weight(&a.node_id()), net, "earned weight exceeds the grant");
+
+        let mut grants2 = std::collections::HashMap::new();
+        grants2.insert(a.node_id(), net + 500); // grant above earned
+        chain.set_genesis_weights(grants2);
+        assert_eq!(chain.consensus_weight(&a.node_id()), net + 500, "grant floors the weight");
+    }
+
+    #[test]
+    fn vrf_ticket_is_deterministic_and_verifiable() {
+        let leader = make_identity("vrf-leader");
+        let other = make_identity("vrf-other");
+        let seed = leader_seed(&[7u8; 32], 42);
+
+        // Deterministic: signing the same seed twice yields the same proof and ticket.
+        let proof1 = leader.sign(&seed);
+        let proof2 = leader.sign(&seed);
+        assert_eq!(proof1, proof2, "Ed25519 is deterministic → stable VRF proof");
+        assert_eq!(vrf_ticket(&proof1), vrf_ticket(&proof2));
+
+        // Verifiable by anyone holding the leader's node_id; rejects a wrong signer.
+        assert_eq!(vrf_verify(&leader.node_id(), &seed, &proof1), Some(vrf_ticket(&proof1)));
+        assert_eq!(vrf_verify(&other.node_id(), &seed, &proof1), None, "proof binds to the signer");
+        // A different slot yields a different seed and (almost surely) a different ticket.
+        let seed2 = leader_seed(&[7u8; 32], 43);
+        assert_ne!(vrf_ticket(&leader.sign(&seed2)), vrf_ticket(&proof1));
+    }
+
+    #[test]
+    fn leader_threshold_scales_with_weight_and_excludes_zero() {
+        // Zero weight (or zero total) can never lead.
+        assert_eq!(leader_threshold(0, 1_000), 0);
+        assert_eq!(leader_threshold(500, 0), 0);
+        // A node with all the weight is eligible for every ticket; half the weight, ~half the space.
+        assert_eq!(leader_threshold(1_000, 1_000), u128::MAX / 1_000 * 1_000);
+        let half = leader_threshold(500, 1_000);
+        let full = leader_threshold(1_000, 1_000);
+        assert!(half < full && half >= full / 2 - 1, "cutoff is ~proportional to weight");
+        // A ticket below the cutoff leads; at/above does not.
+        assert!(ticket_value(&[0u8; 32]) < leader_threshold(1, 1_000), "the lowest ticket always leads if eligible");
+    }
+
+    #[test]
+    fn leader_election_is_weighted_over_many_slots() {
+        // Two nodes, 3:1 weight. Over many slots the heavier node wins ~3x as often. Pure-function
+        // check (no chain): each node signs each slot's seed and is eligible iff ticket < its cutoff.
+        let big = make_identity("le-big");
+        let small = make_identity("le-small");
+        let (w_big, w_small) = (3_000u128, 1_000u128);
+        let total = w_big + w_small;
+        let (mut big_wins, mut small_wins) = (0u32, 0u32);
+        for slot in 0..2_000u64 {
+            let seed = leader_seed(&[1u8; 32], slot);
+            if ticket_value(&vrf_ticket(&big.sign(&seed))) < leader_threshold(w_big, total) {
+                big_wins += 1;
+            }
+            if ticket_value(&vrf_ticket(&small.sign(&seed))) < leader_threshold(w_small, total) {
+                small_wins += 1;
+            }
+        }
+        // Expect ~1500 and ~500; assert the heavier node wins clearly more, with loose bounds.
+        assert!(big_wins > small_wins, "heavier node leads more often ({big_wins} vs {small_wins})");
+        assert!(big_wins > 1_000 && big_wins < 2_000, "big ~75% of slots: {big_wins}");
+        assert!(small_wins > 200 && small_wins < 800, "small ~25% of slots: {small_wins}");
     }
 
     #[test]
