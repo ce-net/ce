@@ -188,6 +188,12 @@ pub struct NodeStatusResponse {
     pub difficulty: u8,
     #[serde(with = "amount_str_i128")]
     pub balance: i128,
+    /// Credits in circulation (emitted minus burned), base units as a decimal string.
+    #[serde(with = "amount_str")]
+    pub circulating_supply: u128,
+    /// Credits destroyed by the settlement burn so far, base units as a decimal string.
+    #[serde(with = "amount_str")]
+    pub burned_total: u128,
 }
 
 // ----- POST /jobs/bid -----
@@ -414,6 +420,8 @@ async fn node_status(State(state): State<ApiState>) -> Response {
             height: snap.height,
             difficulty: snap.difficulty,
             balance: snap.balance,
+            circulating_supply: snap.circulating_supply,
+            burned_total: snap.burned_total,
         }),
     )
         .into_response()

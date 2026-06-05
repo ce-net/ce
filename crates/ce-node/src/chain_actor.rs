@@ -25,6 +25,10 @@ pub struct ChainStatusSnap {
     pub height: u64,
     pub difficulty: u8,
     pub balance: i128,
+    /// Credits in circulation: total emitted minus total burned (base units).
+    pub circulating_supply: u128,
+    /// Credits destroyed by the settlement burn so far (base units).
+    pub burned_total: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -143,7 +147,13 @@ impl ChainHandle {
     pub async fn chain_status(&self, node: NodeId) -> ChainStatusSnap {
         let (tx, rx) = oneshot::channel();
         let _ = self.0.send(ChainCmd::ChainStatus { node, reply: tx }).await;
-        rx.await.unwrap_or(ChainStatusSnap { height: 0, difficulty: 0, balance: 0 })
+        rx.await.unwrap_or(ChainStatusSnap {
+            height: 0,
+            difficulty: 0,
+            balance: 0,
+            circulating_supply: 0,
+            burned_total: 0,
+        })
     }
 
     pub async fn sync_snap(&self) -> SyncSnap {
@@ -279,6 +289,8 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
                     height: chain.height(),
                     difficulty: chain.difficulty,
                     balance: chain.balance(&node),
+                    circulating_supply: chain.circulating_supply(),
+                    burned_total: chain.burned_total(),
                 });
             }
             ChainCmd::SyncSnap { reply } => {

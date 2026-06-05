@@ -29,7 +29,9 @@ Node status snapshot.
   "node_id": "a3f2...64 hex chars",
   "height": 1042,
   "difficulty": 4,
-  "balance": 987000
+  "balance": "987000",
+  "circulating_supply": "1042000000000000000000",
+  "burned_total": "5000000000000000000"
 }
 ```
 
@@ -38,7 +40,15 @@ Node status snapshot.
 | `node_id` | string | 64-hex-char Ed25519 public key (= this node's identity) |
 | `height` | integer | Index of the tip block (0 = only genesis) |
 | `difficulty` | integer | Vestigial PoW field, always 0 in uptime-emission model |
-| `balance` | integer | This node's credit balance |
+| `balance` | string | This node's credit balance, base units (decimal string) |
+| `circulating_supply` | string | Total emitted minus total burned, base units (decimal string) |
+| `burned_total` | string | Credits destroyed by the settlement burn (see below), base units (decimal string) |
+
+**Settlement burn.** Every `JobSettle`, `Heartbeat`, and `ChannelClose` debits the payer/cell the
+full amount, credits the host `amount − burn`, and destroys the burn (`SETTLEMENT_BURN_BPS`, currently
+1.00%). This is the trust-economy Sybil defence: wash-trading reputation between identities you
+control costs real, unrecoverable capital per cycle. See `docs/consensus.md` and
+`docs/sybil-resistance.md`.
 
 ---
 

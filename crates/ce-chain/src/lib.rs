@@ -443,6 +443,32 @@ const EMISSION_BASE: u128 = 1_000 * CREDIT;
 /// Hard cap on total emitted supply: 21 billion credits, in base units (2.1 × 10^28).
 pub const SUPPLY_CAP: u128 = 21_000_000_000 * CREDIT;
 
+/// Protocol burn applied to every settlement (JobSettle, Heartbeat, ChannelClose), in basis points
+/// of the gross amount. The payer/cell is debited the full gross amount; the host receives
+/// `gross − burn`; the burn is destroyed (removed from circulation, credited to no one).
+///
+/// This is the keystone Sybil defence for the trust economy (docs/consensus.md Phase 0,
+/// docs/sybil-resistance.md finding E4): a wash trade between two identities the same attacker
+/// controls no longer nets to zero — every settlement cycle destroys `burn`, so manufacturing
+/// reputation/earned-history costs real capital that scales with the volume faked. Honest users pay
+/// the same burn as a flat marketplace take-rate.
+///
+/// Pre-launch tunable: higher = stronger anti-wash, but a heavier tax on honest settlements. The
+/// right value is an open mechanism-design question (docs/consensus.md §5). Consensus validation is
+/// unaffected — the burn is a deterministic function of the gross amount, applied identically by
+/// every node in `apply_block_to_cache`, and the payer's debit (the only side `append` balance-checks)
+/// is unchanged.
+pub const SETTLEMENT_BURN_BPS: u128 = 100; // 1.00%
+/// Basis-point denominator.
+const BPS_DENOM: u128 = 10_000;
+
+/// Credits destroyed by the protocol burn on a settlement of `gross` base units.
+/// Floor division: a settlement smaller than `BPS_DENOM / SETTLEMENT_BURN_BPS` base units burns 0
+/// (too small to be worth washing). The host receives `gross - settlement_burn(gross)`.
+pub fn settlement_burn(gross: u128) -> u128 {
+    gross.saturating_mul(SETTLEMENT_BURN_BPS) / BPS_DENOM
+}
+
 
 /// Per-node interaction history derived from the chain — the **reputation substrate**.
 /// CE does not score trust; it guarantees these immutable facts, and apps compute their own
@@ -510,6 +536,13 @@ pub struct Chain {
     #[serde(skip, default)]
     total_supply_cache: u128,
 
+    /// Cumulative credits destroyed by the settlement burn (base units). Rebuilt from available
+    /// blocks like `node_stats` — a pruned light node counts only post-checkpoint burns; archive
+    /// nodes are authoritative. Observational only (not consensus-critical): circulating supply =
+    /// `total_supply_cache - burned_total_cache`.
+    #[serde(skip, default)]
+    burned_total_cache: u128,
+
     /// Per-node interaction history (reputation substrate). O(1) lookup, built incrementally.
     #[serde(skip, default)]
     node_stats: std::collections::HashMap<NodeId, NodeStats>,
@@ -554,6 +587,7 @@ impl Chain {
             open_bids: std::collections::HashMap::new(),
             open_channels: std::collections::HashMap::new(),
             total_supply_cache: 0,
+            burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
             revoked: std::collections::HashSet::new(),
@@ -572,6 +606,9 @@ impl Chain {
         // and retained within the light-node prune window; archive nodes hold full state.
         self.open_channels.clear();
         self.total_supply_cache = 0;
+        // Rebuilt from available blocks (same prune caveat as node_stats); never seeded from
+        // checkpoint — it is observational, not consensus-critical.
+        self.burned_total_cache = 0;
         // node_stats is rebuilt from available blocks. A pruned light node therefore holds
         // only post-checkpoint reputation; full history lives on archive nodes (query one of
         // those for complete reputation). Acceptable for v0.
@@ -623,30 +660,41 @@ impl Chain {
                         self.total_supply_cache.saturating_add(*amount);
                 }
                 TxKind::JobSettle { job_id, host, payer, cost, .. } => {
+                    // Payer pays the full gross `cost`; the host receives `cost - burn`; the burn is
+                    // destroyed. `append` already balance-checked the payer for the full gross.
+                    let burn = settlement_burn(*cost);
+                    let net = (*cost).saturating_sub(burn);
                     *self.balances.entry(*payer).or_insert(0) -= *cost as i128;
-                    *self.balances.entry(*host).or_insert(0) += *cost as i128;
+                    *self.balances.entry(*host).or_insert(0) += net as i128;
+                    self.burned_total_cache = self.burned_total_cache.saturating_add(burn);
                     self.open_bids.remove(job_id);
                     let h = block.index;
-                    let (cost, host, payer) = (*cost, *host, *payer);
+                    let (cost, net, host, payer) = (*cost, net, *host, *payer);
                     let s = self.node_stat(&host, h);
                     s.jobs_hosted += 1;
-                    s.earned = s.earned.saturating_add(cost);
+                    // `earned` is the host's actual net gain (post-burn), so it stays consistent with
+                    // the balance change and reflects real, burned-and-paid work.
+                    s.earned = s.earned.saturating_add(net);
                     let s = self.node_stat(&payer, h);
                     s.jobs_paid += 1;
                     s.spent = s.spent.saturating_add(cost);
                 }
                 TxKind::Heartbeat { cell, host, amount, epoch } => {
+                    // Same burn as JobSettle: the cell pays gross `amount`, the host receives the net.
+                    let burn = settlement_burn(*amount);
+                    let net = (*amount).saturating_sub(burn);
                     *self.balances.entry(*cell).or_insert(0) -= *amount as i128;
-                    *self.balances.entry(*host).or_insert(0) += *amount as i128;
+                    *self.balances.entry(*host).or_insert(0) += net as i128;
+                    self.burned_total_cache = self.burned_total_cache.saturating_add(burn);
                     let e = self.heartbeat_max_epoch.entry((*cell, *host)).or_insert(0);
                     if *epoch >= *e {
                         *e = *epoch;
                     }
                     let h = block.index;
-                    let (amount, host, cell) = (*amount, *host, *cell);
+                    let (amount, net, host, cell) = (*amount, net, *host, *cell);
                     let s = self.node_stat(&host, h);
                     s.heartbeats_hosted += 1;
-                    s.earned = s.earned.saturating_add(amount);
+                    s.earned = s.earned.saturating_add(net);
                     let s = self.node_stat(&cell, h);
                     s.heartbeats_paid += 1;
                     s.spent = s.spent.saturating_add(amount);
@@ -664,13 +712,17 @@ impl Chain {
                 }
                 TxKind::ChannelClose { channel_id, cumulative, .. } => {
                     if let Some((payer, host, _cap, _exp)) = self.open_channels.remove(channel_id) {
+                        // Same burn as JobSettle: the payer pays gross `cumulative`, host gets the net.
+                        let burn = settlement_burn(*cumulative);
+                        let net = (*cumulative).saturating_sub(burn);
                         *self.balances.entry(payer).or_insert(0) -= *cumulative as i128;
-                        *self.balances.entry(host).or_insert(0) += *cumulative as i128;
+                        *self.balances.entry(host).or_insert(0) += net as i128;
+                        self.burned_total_cache = self.burned_total_cache.saturating_add(burn);
                         let h = block.index;
-                        let cumulative = *cumulative;
+                        let (cumulative, net) = (*cumulative, net);
                         let s = self.node_stat(&host, h);
                         s.jobs_hosted += 1;
-                        s.earned = s.earned.saturating_add(cumulative);
+                        s.earned = s.earned.saturating_add(net);
                         let s = self.node_stat(&payer, h);
                         s.jobs_paid += 1;
                         s.spent = s.spent.saturating_add(cumulative);
@@ -720,6 +772,17 @@ impl Chain {
     /// Resolve a claimed name to its owning NodeId (`None` if unclaimed).
     pub fn resolve_name(&self, name: &str) -> Option<NodeId> {
         self.names.get(name).copied()
+    }
+
+    /// Total credits destroyed by the settlement burn so far (base units). Observational; a pruned
+    /// light node counts only post-checkpoint burns (archive nodes are authoritative).
+    pub fn burned_total(&self) -> u128 {
+        self.burned_total_cache
+    }
+
+    /// Credits in circulation: total emitted minus total burned (base units).
+    pub fn circulating_supply(&self) -> u128 {
+        self.total_supply_cache.saturating_sub(self.burned_total_cache)
     }
 
     /// All claimed names: (name, owner). For listing/debugging.
@@ -1219,6 +1282,7 @@ impl Chain {
             open_bids: std::collections::HashMap::new(),
             open_channels: std::collections::HashMap::new(),
             total_supply_cache: 0,
+            burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
             revoked: std::collections::HashSet::new(),
@@ -1259,6 +1323,7 @@ impl Chain {
             open_bids: std::collections::HashMap::new(),
             open_channels: std::collections::HashMap::new(),
             total_supply_cache: 0,
+            burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
             names: std::collections::HashMap::new(),
             revoked: std::collections::HashSet::new(),
@@ -1710,9 +1775,14 @@ mod tests {
 
         // Host redeems a receipt for 600 of the 1000.
         assert!(append_with(&mut chain, &host, signed_channel_close(&host, &payer, chan, 600)));
-        assert_eq!(chain.balance(&payer.node_id()), before - 600, "only the redeemed 600 leaves the payer");
+        assert_eq!(chain.balance(&payer.node_id()), before - 600, "only the redeemed 600 leaves the payer (full gross)");
         assert_eq!(chain.locked_balance(&payer.node_id()), 0, "the rest unlocks on close");
-        assert_eq!(chain.node_history(&host.node_id()).earned, 600);
+        // The host receives the redeemed amount minus the protocol burn; the burn is destroyed.
+        // (host also mines these blocks, so its raw balance carries emission — `earned` does not,
+        // since mining never touches NodeStats; assert on `earned` + `burned_total` instead.)
+        let net = 600 - settlement_burn(600);
+        assert_eq!(chain.node_history(&host.node_id()).earned, net, "earned tracks net gain");
+        assert_eq!(chain.burned_total(), settlement_burn(600), "burn is recorded as destroyed");
     }
 
     fn signed_name_claim(claimer: &Identity, name: &str, node: NodeId) -> Tx {
@@ -1861,13 +1931,13 @@ mod tests {
 
         let hs = chain.node_history(&host.node_id());
         assert_eq!(hs.jobs_hosted, 1, "host settled one job");
-        assert_eq!(hs.earned, 600);
+        assert_eq!(hs.earned, 600 - settlement_burn(600), "host earns net-of-burn");
         assert_eq!(hs.jobs_paid, 0);
         assert!(hs.first_height >= 1 && hs.last_height >= hs.first_height);
 
         let ps = chain.node_history(&payer.node_id());
         assert_eq!(ps.jobs_paid, 1, "payer paid one job");
-        assert_eq!(ps.spent, 600);
+        assert_eq!(ps.spent, 600, "payer spends the full gross cost");
         assert_eq!(ps.jobs_hosted, 0);
 
         // A heartbeat cell -> host updates both sides.
@@ -2119,11 +2189,102 @@ mod tests {
         assert_eq!(
             chain.balance(&payer.node_id()),
             payer_before - cost as i128,
+            "payer is debited the full gross cost",
         );
         assert_eq!(
             chain.balance(&host.node_id()),
-            host_before + cost as i128 + Chain::emission_rate(chain.tip().index) as i128,
+            host_before + (cost - settlement_burn(cost)) as i128
+                + Chain::emission_rate(chain.tip().index) as i128,
+            "host receives cost net-of-burn, plus its mining emission",
         );
+    }
+
+    // Phase 0 — the settlement burn (docs/consensus.md, docs/sybil-resistance.md E4). The keystone
+    // Sybil defence for the trust economy: a wash trade between two identities the same attacker
+    // controls no longer nets to zero. Every settlement destroys the burn, so manufacturing
+    // earned-reputation costs real capital that scales with the volume faked.
+    #[test]
+    fn settlement_burn_makes_wash_trading_cost_capital() {
+        let attacker_payer = make_identity("wash-a");
+        let attacker_host = make_identity("wash-b");
+        // A neutral third party mines the blocks, so block emission never touches the attacker's
+        // two keys — isolating the wash settlement's effect on the attacker's combined wealth.
+        let neutral = make_identity("wash-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &attacker_payer, 2_000);
+
+        let job_id = [21u8; 32];
+        let bid = signed_job_bid(&attacker_payer, job_id, 1_000);
+        let r = signed_uptime_reward(&neutral, chain.tip().index + 1);
+        let mut b = chain.next_block(vec![r, bid], neutral.node_id());
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
+        b.seal(&neutral);
+        assert!(chain.append(b));
+
+        let combined_before =
+            chain.balance(&attacker_payer.node_id()) + chain.balance(&attacker_host.node_id());
+
+        // B settles the job A bid on — a pure wash between the attacker's own keys.
+        let cost = 500;
+        let settle = signed_job_settle(&attacker_host, &attacker_payer, job_id, cost);
+        let r = signed_uptime_reward(&neutral, chain.tip().index + 1);
+        let mut b = chain.next_block(vec![r, settle], neutral.node_id());
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
+        b.seal(&neutral);
+        assert!(chain.append(b));
+
+        let combined_after =
+            chain.balance(&attacker_payer.node_id()) + chain.balance(&attacker_host.node_id());
+
+        let burn = settlement_burn(cost);
+        assert!(burn > 0, "the burn must bite for this defence to hold");
+        assert_eq!(
+            combined_before - combined_after,
+            burn as i128,
+            "every wash cycle destroys exactly the burn from the attacker's combined holdings",
+        );
+        assert_eq!(chain.burned_total(), burn, "destroyed credits are tracked");
+        assert_eq!(chain.circulating_supply(), chain.total_supply() - burn);
+        // The reputation the attacker bought (net earned) cost real, unrecoverable capital to mint.
+        assert_eq!(chain.node_history(&attacker_host.node_id()).earned, cost - burn);
+    }
+
+    #[test]
+    fn settlement_burn_math() {
+        assert_eq!(settlement_burn(0), 0);
+        assert_eq!(settlement_burn(99), 0, "sub-threshold settlements floor to a 0 burn");
+        assert_eq!(settlement_burn(10_000), 10_000 * SETTLEMENT_BURN_BPS / BPS_DENOM);
+        assert_eq!(settlement_burn(CREDIT), CREDIT * SETTLEMENT_BURN_BPS / BPS_DENOM);
+        // The net/burn split never creates or loses a base unit.
+        for g in [0u128, 1, 99, 100, 500, 12_345, CREDIT, SUPPLY_CAP] {
+            assert_eq!((g - settlement_burn(g)) + settlement_burn(g), g);
+            assert!(settlement_burn(g) <= g);
+        }
+    }
+
+    #[test]
+    fn heartbeat_burns_too() {
+        let host = make_identity("hbb-host");
+        let cell = make_identity("hbb-cell");
+        let neutral = make_identity("hbb-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &cell, 1_000);
+        let host_before = chain.balance(&host.node_id());
+
+        let amount = 400;
+        let hb = signed_heartbeat(&host, cell.node_id(), amount, 0);
+        // Mined by a neutral party so emission doesn't perturb the host's balance.
+        assert!(append_with(&mut chain, &neutral, hb));
+
+        let burn = settlement_burn(amount);
+        assert!(burn > 0);
+        assert_eq!(
+            chain.balance(&host.node_id()),
+            host_before + (amount - burn) as i128,
+            "host receives the heartbeat net-of-burn",
+        );
+        assert_eq!(chain.burned_total(), burn);
+        assert_eq!(chain.node_history(&host.node_id()).earned, amount - burn);
     }
 
     #[test]
