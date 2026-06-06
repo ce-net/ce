@@ -265,10 +265,19 @@ signed checkpoint into the new genesis, so **no credits are lost and PoW miners 
   `bond` and `weight` surfaced on `/status`. **Not yet wired:** `W` does not yet drive block production
   or fork choice (Phase 3, the VRF + seal swap — the first real consensus change), and genesis
   bootstrap weight `max(genesis_grant·decay, W)` is Phase 5.
-- **Phase 3 — VRF leader election:** confirmed-depth seed, VRF prove/verify, weighted ticket
-  sampling, adaptive threshold via the repurposed 2016-block retarget; swap `Block::work()`.
-- **Phase 4 — Seal swap:** replace `meets_difficulty`/`expected_difficulty` with VRF + eligibility
-  verification; keep `try_reorg` and the double-spend accumulator untouched.
+- **Phase 3 — VRF leader election + seal swap: IMPLEMENTED** (`ce-chain`, branch
+  `phase0-settlement-burn`). PoW is gone. `leader_seed` (slot bound to a confirmed block),
+  `vrf_ticket`/`vrf_verify` (Ed25519-signature-as-VRF), `leader_threshold` (~1 leader/slot,
+  weight-proportional). `Block` gains `weight` + `vrf_proof`; `nonce`/`difficulty` are vestigial.
+  `append()` now checks slot-spacing (slot strictly increases → consensus-enforced block rate, killing
+  the cheap-51% pacing footgun), `block.weight == consensus_weight(miner)` (non-zero), and a valid VRF
+  proof below threshold; `Block::work()` returns the weight so the heaviest-weight suffix wins.
+  `try_reorg` carries `genesis_weights` into the candidate chain so fork weights are validated. A
+  bootstrap fallback (total weight 0 → accept seal+slot) keeps unconfigured/dev chains and the test
+  suite working; production sets `genesis_weights` so it never triggers. **Residual (v0):** seed is
+  parent-confirmed at `LOOKBACK=64` via `confirmed_seed`; the ce-node mining loop still produces via
+  the legacy path under the fallback (real-VRF mining-loop wiring + `genesis_weights` in `NodeConfig`
+  is the next small increment). The obsolete PoW difficulty/retarget tests were removed.
 - **Phase 5 — Independent genesis + threshold checkpoints:** assemble the multi-operator root set in
   ce-cap, add k-of-n threshold sig to `Checkpoint`, wire adoption-driven decay.
 - **Phase 6 — Shadow run (M0):** compute TWLE eligibility in parallel with canonical PoW on the live
