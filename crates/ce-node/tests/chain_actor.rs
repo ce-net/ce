@@ -74,6 +74,37 @@ fn build_chain_of(identity: &Identity, n: usize) -> (Chain, Vec<Block>) {
     (chain, blocks)
 }
 
+/// A genesis chain that grants each listed identity equal consensus weight (the network's chain
+/// spec). Needed so VRF blocks by those validators are eligible and carry weight for fork choice.
+fn genesis_with(grantees: &[&Identity]) -> Chain {
+    let mut c = Chain::genesis();
+    for g in grantees {
+        c.grant_genesis_weight(g.node_id(), 1_000_000);
+    }
+    c
+}
+
+/// Build `n` weighted VRF blocks on a clone of `base` mined by `identity` (which must be granted
+/// weight in `base`). Returns the blocks for replay/reorg into a matching-spec chain.
+fn build_weighted(base: &Chain, identity: &Identity, n: usize) -> Vec<Block> {
+    let mut chain = base.clone();
+    let mut blocks = vec![];
+    for _ in 0..n {
+        let next = chain.height() + 1;
+        let mut txs = vec![];
+        let emission = Chain::emission_rate(next);
+        if emission > 0 {
+            let kind = TxKind::UptimeReward { node: identity.node_id(), amount: emission, epoch: next };
+            let sig = identity.sign(&bincode::serialize(&kind).unwrap());
+            txs.push(Tx::new(kind, identity.node_id(), sig));
+        }
+        let b = chain.produce(identity, txs).expect("weighted block");
+        assert!(chain.append(b.clone()), "append failed during weighted chain construction");
+        blocks.push(b);
+    }
+    blocks
+}
+
 // ── basic correctness ────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -222,14 +253,16 @@ async fn actor_save_and_reload() {
 async fn actor_try_reorg_switches_to_longer_fork() {
     let id_a = make_identity("reorg-a");
     let id_b = make_identity("reorg-b");
+    // Equal-weight validators (shared chain spec) → fork choice is by cumulative weight, more wins.
+    let base = genesis_with(&[&id_a, &id_b]);
 
     // Fork A: 2 blocks (becomes our chain)
-    let (_, fork_a) = build_chain_of(&id_a, 2);
+    let fork_a = build_weighted(&base, &id_a, 2);
 
     // Fork B: 3 blocks (should win the reorg)
-    let (_, fork_b) = build_chain_of(&id_b, 3);
+    let fork_b = build_weighted(&base, &id_b, 3);
 
-    let handle = spawn_chain_actor(Chain::genesis());
+    let handle = spawn_chain_actor(base.clone());
     for b in fork_a {
         handle.append(b).await;
     }
@@ -512,18 +545,21 @@ async fn adversarial_concurrent_reorg_race_exactly_one_wins() {
     // The longer fork should win, and the chain must be consistent afterwards.
     let id_a = make_identity("reorg-race-a");
     let id_b = make_identity("reorg-race-b");
+    let id_ours = make_identity("reorg-race-ours");
+    // Shared chain spec granting all three validators equal weight, so longer forks carry more work.
+    let base = genesis_with(&[&id_a, &id_b, &id_ours]);
 
     // Our chain: 2 blocks
-    let (_, our_chain) = build_chain_of(&make_identity("reorg-race-ours"), 2);
-    let handle = Arc::new(spawn_chain_actor(Chain::genesis()));
+    let our_chain = build_weighted(&base, &id_ours, 2);
+    let handle = Arc::new(spawn_chain_actor(base.clone()));
     for b in our_chain {
         handle.append(b).await;
     }
 
     // Fork A: 4 blocks (should win)
-    let (_, fork_a) = build_chain_of(&id_a, 4);
+    let fork_a = build_weighted(&base, &id_a, 4);
     // Fork B: 3 blocks (should lose to fork_a, but may beat our original 2)
-    let (_, fork_b) = build_chain_of(&id_b, 3);
+    let fork_b = build_weighted(&base, &id_b, 3);
 
     let ha = handle.clone();
     let hb = handle.clone();

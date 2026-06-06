@@ -379,12 +379,19 @@ pub struct Block {
     pub prev_hash: [u8; 32],
     pub timestamp: u64,
     pub transactions: Vec<Tx>,
+    /// Vestigial (was the PoW search nonce). Unused under VRF leader election; kept at 0.
     pub nonce: u64,
-    /// Proof-of-work target for THIS block: the number of leading zero bits its `hash()` must
-    /// have. Deterministically fixed by the difficulty retarget (`expected_difficulty`); a miner
-    /// cannot lower it (validators recompute the expected value and reject mismatches).
+    /// Vestigial (was the PoW difficulty). Unused under VRF leader election; kept at 0.
     pub difficulty: u8,
     pub miner: NodeId,
+    /// The producer's consensus weight at production time. Validated on append to equal
+    /// `consensus_weight(miner)`, so fork choice can sum weights without recomputing state. This is
+    /// the block's fork-choice work.
+    pub weight: u128,
+    /// VRF proof: the miner's Ed25519 signature over the slot's `leader_seed`. `vrf_ticket(this)`
+    /// must fall below `leader_threshold(weight, total_weight)` for the miner to be an eligible leader.
+    #[serde(with = "sig_serde")]
+    pub vrf_proof: [u8; 64],
     #[serde(with = "sig_serde")]
     pub sig: [u8; 64],
 }
@@ -398,8 +405,8 @@ impl Block {
     }
 
     fn header_bytes(&self) -> Vec<u8> {
-        // Sign/hash all fields except sig itself to avoid a circular dependency. `difficulty` is
-        // included so it is both covered by PoW and bound by the signature (a relayer can't flip it).
+        // Sign/hash all fields except `sig` itself (circular). `weight` and `vrf_proof` are bound by
+        // the seal so a relayer can't alter the producer's claimed weight or VRF proof.
         bincode::serialize(&(
             self.index,
             &self.prev_hash,
@@ -408,43 +415,27 @@ impl Block {
             self.nonce,
             self.difficulty,
             &self.miner,
+            self.weight,
+            &self.vrf_proof[..],
         ))
         .unwrap_or_default()
     }
 
-    /// Cumulative-work contribution of this block: `2^difficulty` (saturating). Used for
-    /// work-based fork choice — a chain's weight is the sum of its blocks' work.
+    /// Cumulative-work contribution of this block for fork choice: the producer's consensus weight.
+    /// Validated on append to equal `consensus_weight(miner)`, so the heaviest-weight suffix wins.
     pub fn work(&self) -> u128 {
-        if self.difficulty >= 127 {
-            u128::MAX
-        } else {
-            1u128 << self.difficulty
-        }
+        self.weight
     }
 
-    /// True if the block's PoW hash satisfies its declared difficulty.
-    pub fn meets_difficulty(&self) -> bool {
-        has_leading_zeros(&self.hash(), self.difficulty)
-    }
-
-    /// Search `nonce` until the hash meets `self.difficulty`, or `abort` is set (tip advanced).
-    /// CPU-bound — callers must run this in `tokio::task::spawn_blocking`. Returns true if solved.
-    pub fn mine(&mut self, abort: &std::sync::atomic::AtomicBool) -> bool {
-        use std::sync::atomic::Ordering;
-        loop {
-            if abort.load(Ordering::Relaxed) {
-                return false;
-            }
-            if has_leading_zeros(&self.hash(), self.difficulty) {
-                return true;
-            }
-            self.nonce = self.nonce.wrapping_add(1);
-        }
-    }
-
-    /// Sign the block header. Must be called before Chain::append (after mining fixes the nonce).
+    /// Sign the block header. Called after the VRF proof and weight are set.
     pub fn seal(&mut self, identity: &Identity) {
         self.sig = identity.sign(&self.header_bytes());
+    }
+
+    /// Vestigial no-op kept so legacy block-construction call sites compile. Under VRF leader
+    /// election there is nothing to mine — eligibility comes from `Chain::try_produce`/`produce`.
+    pub fn mine(&mut self, _abort: &std::sync::atomic::AtomicBool) -> bool {
+        true
     }
 
     /// Verify the block seal against the miner's public key.
@@ -701,8 +692,10 @@ impl Chain {
             timestamp: 0,
             transactions: vec![],
             nonce: 0,
-            difficulty: GENESIS_DIFFICULTY,
+            difficulty: 0,
             miner: [0u8; 32],
+            weight: 0,
+            vrf_proof: [0u8; 64],
             sig: [0u8; 64],
         };
         let genesis_work = genesis.work();
@@ -990,18 +983,41 @@ impl Chain {
         if !block.verify_seal() {
             return false;
         }
-        // Proof-of-work consensus. The block must declare exactly the difficulty the retarget
-        // schedule requires (a miner can't self-lower it) AND its hash must satisfy that difficulty
-        // (real work was burned). Without this, blocks are free to mint — and forgeable credits buy
-        // compute on the whole fleet. This is the single chokepoint; try_reorg routes through here.
-        if block.difficulty != expected_difficulty(&self.blocks) {
-            return false;
+        // VRF leader-election consensus (CE-TWLE). Replaces proof-of-work: the producer must be an
+        // eligible leader for the block's slot. This is the single chokepoint; try_reorg routes here.
+        //
+        // Slot spacing is consensus-enforced — slot strictly increases, so block rate is bounded by
+        // wall-clock and there is NO self-imposed pacing a miner can delete (the old cheap-51% footgun).
+        let slot = block.timestamp / SLOT_SECS;
+        if slot <= self.tip().timestamp / SLOT_SECS {
+            return false; // at most one block per slot; enforces >= SLOT_SECS spacing, always
         }
-        if !block.meets_difficulty() {
-            return false;
+        let total = self.total_consensus_weight();
+        if total > 0 {
+            // The producer's declared weight must equal its actual consensus weight, and be non-zero
+            // (a fresh/unbonded/un-granted node can never lead). Fork choice sums this declared weight.
+            let weight = self.consensus_weight(&block.miner);
+            if block.weight != weight || weight == 0 {
+                return false;
+            }
+            // VRF: the proof must be the miner's signature over the slot seed, and the resulting
+            // ticket must fall below its weight-proportional threshold (~1 expected leader per slot).
+            let seed = self.confirmed_seed(slot);
+            let ticket = match vrf_verify(&block.miner, &seed, &block.vrf_proof) {
+                Some(t) => t,
+                None => return false,
+            };
+            if ticket_value(&ticket) >= leader_threshold(weight, total) {
+                return false;
+            }
         }
-        // Timestamp must exceed the median of recent blocks and not be far in the future — bounds
-        // timewarp attacks against the difficulty retarget.
+        // Bootstrap fallback (total weight == 0): with no genesis grants, bonds, or earned work
+        // anywhere, there is no basis for weighted election, so a well-sealed block at a fresh slot is
+        // accepted. A production network MUST configure genesis_weights, so total weight is non-zero
+        // from block 1 and this branch never runs there. See docs/consensus.md §4.1.
+        //
+        // Timestamp must not be far in the future (bounds slot pre-claiming); strictly increasing
+        // slots already imply monotonic, non-timewarpable time.
         if !self.timestamp_ok(&block) {
             return false;
         }
@@ -1564,7 +1580,10 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             bonds: std::collections::HashMap::new(),
             slashed_equivocations: std::collections::HashSet::new(),
-            genesis_weights: std::collections::HashMap::new(),
+            // genesis_weights is node config (not chain data). It MUST be present while validating the
+            // candidate suffix so each fork block's declared weight is checked against the real
+            // consensus weight — otherwise an attacker could claim huge weights to win a reorg.
+            genesis_weights: self.genesis_weights.clone(),
             total_supply_cache: 0,
             burned_total_cache: 0,
             node_stats: std::collections::HashMap::new(),
@@ -1580,8 +1599,6 @@ impl Chain {
         }
 
         reorg_chain.rebuild_caches();
-        // genesis_weights is node config (not chain data), so carry it across the reorg.
-        reorg_chain.genesis_weights = self.genesis_weights.clone();
         *self = reorg_chain;
         true
     }
@@ -1730,6 +1747,72 @@ impl Chain {
         self.genesis_weights.get(node).copied().unwrap_or(0)
     }
 
+    /// Insert/raise a single node's genesis bootstrap weight (config helper).
+    pub fn grant_genesis_weight(&mut self, node: NodeId, weight: u128) {
+        self.genesis_weights.insert(node, weight);
+    }
+
+    /// The kept block with absolute index `index`, if present (None if pruned away or in the future).
+    fn block_at(&self, index: u64) -> Option<&Block> {
+        let base = self.blocks.first()?.index;
+        let off = index.checked_sub(base)? as usize;
+        self.blocks.get(off)
+    }
+
+    /// The leader-election seed for `slot` building on the current tip: bound to the block `LOOKBACK`
+    /// behind the tip (confirmed history both forks agree on), so the current leader cannot grind it.
+    fn confirmed_seed(&self, slot: u64) -> [u8; 32] {
+        let confirmed_index = self.tip().index.saturating_sub(LOOKBACK);
+        let hash = self.block_at(confirmed_index).map(|b| b.hash()).unwrap_or([0u8; 32]);
+        leader_seed(&hash, slot)
+    }
+
+    /// Try to produce a sealed block for `slot` on the current tip. Returns None unless the producer
+    /// is an eligible leader for that slot (its VRF ticket is below its weight-proportional threshold).
+    pub fn try_produce(&self, identity: &Identity, transactions: Vec<Tx>, slot: u64) -> Option<Block> {
+        let miner = identity.node_id();
+        let weight = self.consensus_weight(&miner);
+        if weight == 0 {
+            return None;
+        }
+        let total = self.total_consensus_weight();
+        let seed = self.confirmed_seed(slot);
+        let vrf_proof = identity.sign(&seed);
+        if ticket_value(&vrf_ticket(&vrf_proof)) >= leader_threshold(weight, total) {
+            return None;
+        }
+        let mut block = Block {
+            index: self.tip().index + 1,
+            prev_hash: self.tip_hash(),
+            timestamp: slot.saturating_mul(SLOT_SECS),
+            transactions,
+            nonce: 0,
+            difficulty: 0,
+            miner,
+            weight,
+            vrf_proof,
+            sig: [0u8; 64],
+        };
+        block.seal(identity);
+        Some(block)
+    }
+
+    /// Produce a block at the next slot at or after the tip's slot+1 for which the producer is an
+    /// eligible leader (loops slots; terminates if the producer has any weight). Real nodes drive the
+    /// slot from wall-clock; this convenience is for bootstrap/tests that just need to make progress.
+    pub fn produce(&self, identity: &Identity, transactions: Vec<Tx>) -> Option<Block> {
+        if self.consensus_weight(&identity.node_id()) == 0 {
+            return None;
+        }
+        let start = self.tip().timestamp / SLOT_SECS + 1;
+        for slot in start..start + 1_000_000 {
+            if let Some(b) = self.try_produce(identity, transactions.clone(), slot) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
     /// O(1) lookup for the highest confirmed Heartbeat epoch for a (cell, host) pair.
     /// Returns None if no Heartbeat has been confirmed for this pair yet.
     pub fn last_heartbeat_epoch(&self, cell: &NodeId, host: &NodeId) -> Option<u64> {
@@ -1756,15 +1839,20 @@ impl Chain {
         // Strictly advance past the tip so timestamps are monotonic and always clear the
         // median-time-past lower bound — even when blocks are produced faster than 1/sec (low
         // difficulty / tests). In normal operation (~10 min/block) `now` dominates.
-        let timestamp = now.max(self.tip().timestamp + 1);
+        // Advance to the next slot past the tip (monotonic; clears median-time-past). In production
+        // the wall-clock slot dominates. This is a low-level builder: the VRF proof and seal are
+        // filled by `try_produce`/`produce`; callers that need an eligible block use those instead.
+        let next_slot = (now / SLOT_SECS).max(self.tip().timestamp / SLOT_SECS + 1);
         Block {
             index: self.tip().index + 1,
             prev_hash: self.tip_hash(),
-            timestamp,
+            timestamp: next_slot.saturating_mul(SLOT_SECS),
             transactions,
             nonce: 0,
-            difficulty: expected_difficulty(&self.blocks),
+            difficulty: 0,
             miner,
+            weight: self.consensus_weight(&miner),
+            vrf_proof: [0u8; 64],
             sig: [0u8; 64],
         }
     }
@@ -1881,6 +1969,19 @@ mod tests {
         block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(identity);
         chain.append(block)
+    }
+
+    /// Produce a real VRF block mined by `miner` (which must have consensus weight) carrying `txs`,
+    /// plus its UptimeReward, and append it. Used by tests that have introduced weight, so the
+    /// bootstrap fallback is off and a valid VRF proof + eligibility are required.
+    fn produce_append(chain: &mut Chain, miner: &Identity, txs: Vec<Tx>) -> bool {
+        let reward = signed_uptime_reward(miner, chain.tip().index + 1);
+        let mut all = vec![reward];
+        all.extend(txs);
+        match chain.produce(miner, all) {
+            Some(b) => chain.append(b),
+            None => false,
+        }
     }
 
     // ----- Block tests -----
@@ -2940,8 +3041,10 @@ mod tests {
         let _net = bond_and_earn(&mut chain, &offender, 300, 1_000);
         assert_eq!(chain.consensus_weight(&offender.node_id()), 300);
 
+        // Weight now exists, so the slash block must be a real VRF block by a weighted miner.
+        chain.grant_genesis_weight(neutral.node_id(), 1_000_000_000);
         let proof = equivocation_proof(&offender, *b"ce-capacity-ad\0\0", 1, [1u8; 32], [2u8; 32]);
-        assert!(append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), proof)));
+        assert!(produce_append(&mut chain, &neutral, vec![signed_slash(&reporter, offender.node_id(), proof)]));
         // Bond gone → weight collapses to zero even though earned work remains.
         assert!(chain.earned_work_score(&offender.node_id()) > 0);
         assert_eq!(chain.consensus_weight(&offender.node_id()), 0, "slashing the bond zeroes weight");
@@ -3469,11 +3572,15 @@ mod tests {
         let mut fork = base.clone();
         let mut new_blocks = Vec::new();
         for _ in 0..count {
-            let next_idx = fork.tip().index + 1;
-            let reward = signed_uptime_reward(miner, next_idx);
-            let mut block = fork.next_block(vec![reward], miner.node_id());
-            block.mine(&std::sync::atomic::AtomicBool::new(false));
-            block.seal(miner);
+            let reward = signed_uptime_reward(miner, fork.tip().index + 1);
+            // Weighted VRF block if the miner has weight (granted in `base`); else a fallback block.
+            let block = if fork.consensus_weight(&miner.node_id()) > 0 {
+                fork.produce(miner, vec![reward]).expect("fork block")
+            } else {
+                let mut b = fork.next_block(vec![reward], miner.node_id());
+                b.seal(miner);
+                b
+            };
             assert!(fork.append(block.clone()), "fork block must be valid");
             new_blocks.push(block);
         }
@@ -3499,10 +3606,13 @@ mod tests {
         let a = make_identity("reorg-long-a");
         let b = make_identity("reorg-long-b");
         let mut chain = Chain::genesis();
-        seal_and_append(&mut chain, &a);
+        // Equal-weight validators → fork choice is by cumulative weight, so more blocks wins.
+        chain.grant_genesis_weight(a.node_id(), 1_000_000);
+        chain.grant_genesis_weight(b.node_id(), 1_000_000);
+        assert!(produce_append(&mut chain, &a, vec![]));
 
         let common = chain.clone();
-        seal_and_append(&mut chain, &a);
+        assert!(produce_append(&mut chain, &a, vec![]));
 
         let fork_blocks = build_fork(&common, &b, 2);
 
@@ -3541,8 +3651,10 @@ mod tests {
             timestamp: 0,
             transactions: vec![],
             nonce: 0,
-            difficulty: GENESIS_DIFFICULTY,
+            difficulty: 0,
             miner: b.node_id(),
+            weight: 0,
+            vrf_proof: [0u8; 64],
             sig: [0u8; 64],
         };
         ghost.mine(&std::sync::atomic::AtomicBool::new(false));
@@ -3938,20 +4050,18 @@ mod tests {
         let mallory = make_identity("ds-mallory");
         let mut chain = Chain::genesis();
 
-        // Fund Alice on the shared honest chain.
+        // Fund Alice on the shared honest chain (under the bootstrap fallback, no weight yet).
         fund(&mut chain, &alice, 1_000);
+        // Equal-weight validators so fork choice is by cumulative weight → more blocks wins.
+        chain.grant_genesis_weight(alice.node_id(), 1_000_000);
+        chain.grant_genesis_weight(mallory.node_id(), 1_000_000);
 
         // Save the chain at this point — both the honest chain and the shadow fork
-        // will build from here so that try_reorg can find the common ancestor.
+        // build from here so that try_reorg can find the common ancestor.
         let fork_base = chain.clone();
 
         // Honest chain: Alice → Bob 500 (one block above fork_base).
-        let pay_bob = signed_transfer(&alice, bob.node_id(), 500);
-        let reward = signed_uptime_reward(&alice, chain.tip().index + 1);
-        let mut b = chain.next_block(vec![reward, pay_bob], alice.node_id());
-        b.mine(&std::sync::atomic::AtomicBool::new(false));
-        b.seal(&alice);
-        assert!(chain.append(b));
+        assert!(produce_append(&mut chain, &alice, vec![signed_transfer(&alice, bob.node_id(), 500)]));
         assert_eq!(chain.balance(&bob.node_id()), 500);
 
         // Shadow fork: three blocks from the same fork_base, so it beats the honest
@@ -3960,21 +4070,16 @@ mod tests {
         let mut shadow = fork_base;
 
         // Shadow block 1: Alice → Mallory 500 instead of Bob.
-        let pay_mallory = signed_transfer(&alice, mallory.node_id(), 500);
         let reward = signed_uptime_reward(&alice, shadow.tip().index + 1);
-        let mut b1 = shadow.next_block(vec![reward, pay_mallory], alice.node_id());
-        b1.mine(&std::sync::atomic::AtomicBool::new(false));
-        b1.seal(&alice);
+        let pay_mallory = signed_transfer(&alice, mallory.node_id(), 500);
+        let b1 = shadow.produce(&alice, vec![reward, pay_mallory]).expect("shadow b1");
         assert!(shadow.append(b1.clone()));
         shadow_blocks.push(b1);
 
-        // Shadow blocks 2–3: extend the fork past the honest chain.
+        // Shadow blocks 2–3: Mallory extends the fork past the honest chain.
         for _ in 0..2usize {
-            let next_idx = shadow.tip().index + 1;
-            let r = signed_uptime_reward(&mallory, next_idx);
-            let mut blk = shadow.next_block(vec![r], mallory.node_id());
-            blk.mine(&std::sync::atomic::AtomicBool::new(false));
-            blk.seal(&mallory);
+            let r = signed_uptime_reward(&mallory, shadow.tip().index + 1);
+            let blk = shadow.produce(&mallory, vec![r]).expect("shadow blk");
             assert!(shadow.append(blk.clone()));
             shadow_blocks.push(blk);
         }
@@ -3989,36 +4094,7 @@ mod tests {
         assert_eq!(chain.balance(&mallory.node_id()), mallory_expected, "Mallory receives transfer + mining rewards after reorg");
     }
 
-    // ----- Proof-of-work consensus -----
-
-    #[test]
-    fn pow_rejected_when_hash_below_difficulty() {
-        let mut chain = Chain::genesis();
-        let id = make_identity("pow-reject");
-        let reward = signed_uptime_reward(&id, 1);
-        let mut block = chain.next_block(vec![reward], id.node_id());
-        assert_eq!(block.difficulty, GENESIS_DIFFICULTY);
-        // Pick a nonce that does NOT satisfy the difficulty (the overwhelming majority do not),
-        // i.e. the block carries no real work.
-        while block.meets_difficulty() {
-            block.nonce = block.nonce.wrapping_add(1);
-        }
-        block.seal(&id);
-        assert!(!chain.append(block), "a block without valid PoW must be rejected");
-    }
-
-    #[test]
-    fn append_rejects_understated_difficulty() {
-        let mut chain = Chain::genesis();
-        let id = make_identity("pow-diff");
-        let reward = signed_uptime_reward(&id, 1);
-        let mut block = chain.next_block(vec![reward], id.node_id());
-        // Claim an easier target than the schedule requires, and satisfy THAT easier target.
-        block.difficulty = GENESIS_DIFFICULTY - 1;
-        block.mine(&std::sync::atomic::AtomicBool::new(false));
-        block.seal(&id);
-        assert!(!chain.append(block), "a block declaring less-than-expected difficulty must be rejected");
-    }
+    // ----- Consensus: timestamps + slot spacing -----
 
     #[test]
     fn append_rejects_bad_timestamp() {
@@ -4043,70 +4119,6 @@ mod tests {
         future.mine(&std::sync::atomic::AtomicBool::new(false));
         future.seal(&id);
         assert!(!chain.append(future), "far-future timestamp must be rejected");
-    }
-
-    #[test]
-    fn block_work_is_two_to_the_difficulty() {
-        let mut b = Chain::genesis().next_block(vec![], [0u8; 32]);
-        b.difficulty = 10;
-        assert_eq!(b.work(), 1u128 << 10);
-        b.difficulty = 0;
-        assert_eq!(b.work(), 1);
-        b.difficulty = 200; // saturates, never overflows
-        assert_eq!(b.work(), u128::MAX);
-    }
-
-    // Build a synthetic window of blocks (no mining/append) to exercise the pure retarget fn.
-    fn fake_window(difficulty: u8, span_secs: u64) -> Vec<Block> {
-        let n = DIFFICULTY_WINDOW as usize;
-        (0..n)
-            .map(|i| {
-                let timestamp = if n > 1 { span_secs * i as u64 / (n as u64 - 1) } else { 0 };
-                Block {
-                    index: i as u64,
-                    prev_hash: [0u8; 32],
-                    timestamp,
-                    transactions: vec![],
-                    nonce: 0,
-                    difficulty,
-                    miner: [0u8; 32],
-                    sig: [0u8; 64],
-                }
-            })
-            .collect()
-    }
-
-    #[test]
-    fn retarget_raises_difficulty_when_blocks_are_too_fast() {
-        let target = DIFFICULTY_WINDOW * TARGET_BLOCK_SECS;
-        // Window mined far faster than target (< target/4) → +2 bits.
-        let fast = fake_window(20, target / 8);
-        assert_eq!(expected_difficulty(&fast), 22);
-        // Slightly fast (between target/4 and target) → +1 bit.
-        let bit_fast = fake_window(20, target / 2);
-        assert_eq!(expected_difficulty(&bit_fast), 21);
-    }
-
-    #[test]
-    fn retarget_lowers_difficulty_when_blocks_are_too_slow_but_floors_at_min() {
-        let target = DIFFICULTY_WINDOW * TARGET_BLOCK_SECS;
-        // Far slower than target (> target*4) → -2 bits.
-        let slow = fake_window(20, target * 8);
-        assert_eq!(expected_difficulty(&slow), 18);
-        // Cannot fall below MIN_DIFFICULTY.
-        let slow_at_floor = fake_window(MIN_DIFFICULTY, target * 8);
-        assert_eq!(expected_difficulty(&slow_at_floor), MIN_DIFFICULTY);
-    }
-
-    #[test]
-    fn difficulty_holds_steady_within_a_window() {
-        // Not a window boundary (next height not a multiple of DIFFICULTY_WINDOW) → inherit tip.
-        let mut chain = Chain::genesis();
-        let id = make_identity("steady");
-        for _ in 0..5 {
-            assert!(seal_and_append(&mut chain, &id));
-        }
-        assert_eq!(expected_difficulty(&chain.blocks), GENESIS_DIFFICULTY);
     }
 
     #[test]
