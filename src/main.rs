@@ -307,7 +307,7 @@ enum Commands {
 enum WalletCommands {
     // ----- credit wallet (money: balance / history / send / live tail) -----
     //
-    // These operate on this node's CREDITS via the local HTTP API (through ce_rs::Wallet). They
+    // These operate on this node's CREDITS via the local HTTP API (direct reqwest). They
     // are distinct from the capability-wallet subcommands below (`add`/`ls`/`rm`), which manage
     // signed authority tokens — see `ce wallet cap`-style docs and PLAN/06-token-management.md.
     /// Show this node's credit balance breakdown (total / free / locked-in-channels / locked-in-bond).
@@ -570,12 +570,10 @@ fn api_client(token: &str) -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// Build a [`ce_rs::Wallet`] over the local node's HTTP API, authenticated with the node's
-/// `api.token`. Used by the credit-wallet CLI subtree (`ce wallet balance|history|send|watch`).
-fn ce_wallet(token: &str, api_port: u16) -> ce_rs::Wallet {
-    let base = format!("http://127.0.0.1:{api_port}");
-    let tok = (!token.is_empty()).then(|| token.to_string());
-    ce_rs::CeClient::with_token(base, tok).wallet()
+/// Base URL of the local node's HTTP API. The credit-wallet CLI subtree
+/// (`ce wallet balance|history|send|watch`) talks to it directly with [`api_client`].
+fn api_base(api_port: u16) -> String {
+    format!("http://127.0.0.1:{api_port}")
 }
 
 // ----- Capability wallet -----
@@ -1060,21 +1058,41 @@ async fn main() -> Result<()> {
         Commands::Wallet { command } => match command {
             // ----- credit wallet -----
             WalletCommands::Balance { api_port } => {
-                let wallet = ce_wallet(&api_token, api_port);
-                let b = wallet
-                    .balance()
+                // GET /status → total/free/locked_channels/locked_bond/bond, all decimal base-unit
+                // strings. Parse with parse_credits (string of base units → base units).
+                let client = api_client(&api_token);
+                let resp = client
+                    .get(format!("{}/status", api_base(api_port)))
+                    .send()
                     .await
                     .map_err(|e| anyhow!("could not read balance (is `ce start` running?): {e}"))?;
-                // total / free / locked(channels) / locked(bond) / bond — all from /status.
-                println!("total  : {} credits", format_credits(b.total.base()));
-                println!("free   : {} credits", format_credits(b.free.base()));
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("could not read balance ({status}): {text}"));
+                }
+                let s: serde_json::Value = resp.json().await?;
+                let base_field = |key: &str| -> i128 {
+                    s[key].as_str().and_then(|v| v.parse::<i128>().ok()).unwrap_or(0)
+                };
+                let total = base_field("balance");
+                let locked_channels = base_field("locked_channels");
+                let locked_bond = base_field("locked_bond");
+                let bond = base_field("bond");
+                // `free` may be absent on older nodes; derive a spendable estimate then.
+                let free = s["free"]
+                    .as_str()
+                    .and_then(|v| v.parse::<i128>().ok())
+                    .unwrap_or_else(|| (total - locked_channels - locked_bond).max(0));
+                println!("total  : {} credits", format_credits(total));
+                println!("free   : {} credits", format_credits(free));
                 println!(
                     "locked : {} credits  (channels {} · bond {})",
-                    format_credits(b.locked_channels.base() + b.locked_bond.base()),
-                    format_credits(b.locked_channels.base()),
-                    format_credits(b.locked_bond.base()),
+                    format_credits(locked_channels + locked_bond),
+                    format_credits(locked_channels),
+                    format_credits(locked_bond),
                 );
-                println!("bond   : {} credits", format_credits(b.bond.base()));
+                println!("bond   : {} credits", format_credits(bond));
             }
             WalletCommands::History { node, limit, before, api_port } => {
                 // Default to this node's own id (loaded locally — no API round-trip needed).
@@ -1085,39 +1103,49 @@ async fn main() -> Result<()> {
                         identity.node_id_hex()
                     }
                 };
-                let wallet = ce_wallet(&api_token, api_port);
-                let q = ce_rs::TxQuery { limit: Some(limit), before_height: before };
-                let txs = wallet
-                    .transactions(&node_id, q)
+                // GET /transactions/:node_id?limit=&before= → array of { height, kind, amount,
+                // counterparty, direction }; amount is a decimal base-unit string.
+                let mut url = format!("{}/transactions/{node_id}?limit={limit}", api_base(api_port));
+                if let Some(b) = before {
+                    url.push_str(&format!("&before={b}"));
+                }
+                let client = api_client(&api_token);
+                let resp = client
+                    .get(&url)
+                    .send()
                     .await
                     .map_err(|e| anyhow!("could not read history (is `ce start` running?): {e}"))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("could not read history ({status}): {text}"));
+                }
+                let txs: Vec<serde_json::Value> = resp.json().await?;
                 if txs.is_empty() {
                     println!("No transactions found for {}.", &node_id[..node_id.len().min(16)]);
                 } else {
                     println!("{:>8}  {:<14}  {:<4}  {:>16}  counterparty", "HEIGHT", "KIND", "DIR", "AMOUNT");
                     for t in &txs {
-                        let dir = match t.direction {
-                            ce_rs::Direction::In => "in",
-                            ce_rs::Direction::Out => "out",
-                            ce_rs::Direction::SelfTx => "self",
-                        };
-                        let cp = t
-                            .counterparty
-                            .as_deref()
+                        let height = t["height"].as_u64().unwrap_or(0);
+                        let kind = t["kind"].as_str().unwrap_or("?");
+                        let dir = t["direction"].as_str().unwrap_or("self");
+                        let cp = t["counterparty"]
+                            .as_str()
                             .map(|c| c[..c.len().min(16)].to_string())
                             .unwrap_or_else(|| "—".to_string());
-                        let amt = if t.amount.is_zero() {
+                        let amount = t["amount"].as_str().and_then(|v| v.parse::<i128>().ok()).unwrap_or(0);
+                        let amt = if amount == 0 {
                             "—".to_string()
                         } else {
-                            format_credits(t.amount.base())
+                            format_credits(amount)
                         };
-                        println!("{:>8}  {:<14}  {dir:<4}  {amt:>16}  {cp}", t.height, t.kind);
+                        println!("{height:>8}  {kind:<14}  {dir:<4}  {amt:>16}  {cp}");
                     }
                     // Pagination hint: oldest height returned is the cursor for the next page.
                     if let Some(oldest) = txs.last().filter(|_| txs.len() as u32 >= limit) {
+                        let oldest_height = oldest["height"].as_u64().unwrap_or(0);
                         println!(
-                            "\nLoad older: ce wallet history --node {node_id} --before {} --limit {limit}",
-                            oldest.height
+                            "\nLoad older: ce wallet history --node {node_id} --before {oldest_height} --limit {limit}"
                         );
                     }
                 }
@@ -1126,51 +1154,84 @@ async fn main() -> Result<()> {
                 if to.len() != 64 || !to.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err(anyhow!("recipient node id must be 64 hex chars"));
                 }
-                let amt = ce_rs::Amount::from_base(parse_credits(&amount)? as i128);
-                let wallet = ce_wallet(&api_token, api_port);
-                let tx_id = wallet
-                    .transfer(&to, amt)
+                // POST /transfer { to, amount } — amount is a decimal base-unit string. Returns tx_id.
+                let amount_base = parse_credits(&amount)?.to_string();
+                let body = serde_json::json!({ "to": to, "amount": amount_base });
+                let client = api_client(&api_token);
+                let resp = client
+                    .post(format!("{}/transfer", api_base(api_port)))
+                    .json(&body)
+                    .send()
                     .await
                     .map_err(|e| anyhow!("transfer failed: {e}"))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("transfer failed ({status}): {text}"));
+                }
+                let result: serde_json::Value = resp.json().await?;
                 println!("Sent {amount} credits to {}.", &to[..16]);
-                println!("tx_id: {tx_id}");
+                println!("tx_id: {}", result["tx_id"].as_str().unwrap_or("?"));
             }
             WalletCommands::Watch { api_port } => {
                 use futures_util::StreamExt;
                 let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
                 let self_id = identity.node_id_hex();
-                let wallet = ce_wallet(&api_token, api_port);
-                let stream = wallet
-                    .transactions_stream(&self_id)
+                // GET /transactions/stream is a Server-Sent Events stream of { id, origin, kind,
+                // amount } frames (amount is a decimal base-unit string). We enrich each frame to a
+                // wallet-relative view client-side: a tx whose `origin` is us is outbound (no
+                // counterparty shown), otherwise inbound from `origin`.
+                let client = api_client(&api_token);
+                let resp = client
+                    .get(format!("{}/transactions/stream", api_base(api_port)))
+                    .send()
                     .await
                     .map_err(|e| anyhow!("could not open tx stream (is `ce start` running?): {e}"))?;
-                let mut stream = std::pin::pin!(stream);
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("could not open tx stream ({status}): {text}"));
+                }
                 println!("Watching credit transactions for {} … (Ctrl-C to stop)", &self_id[..16]);
                 println!("{:<14}  {:<4}  {:>16}  counterparty", "KIND", "DIR", "AMOUNT");
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(t) => {
-                            let dir = match t.direction {
-                                ce_rs::Direction::In => "in",
-                                ce_rs::Direction::Out => "out",
-                                ce_rs::Direction::SelfTx => "self",
-                            };
-                            let cp = t
-                                .counterparty
-                                .as_deref()
-                                .map(|c| c[..c.len().min(16)].to_string())
-                                .unwrap_or_else(|| "—".to_string());
-                            let amt = if t.amount.is_zero() {
-                                "—".to_string()
-                            } else {
-                                format_credits(t.amount.base())
-                            };
-                            println!("{:<14}  {dir:<4}  {amt:>16}  {cp}", t.kind);
-                        }
+                // Minimal SSE parser: accumulate bytes, split on lines, handle `data: <json>` frames.
+                let mut stream = resp.bytes_stream();
+                let mut buf = String::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
                         Err(e) => {
                             eprintln!("stream error: {e}");
                             break;
                         }
+                    };
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    // Process every complete line; keep the trailing partial line in `buf`.
+                    while let Some(nl) = buf.find('\n') {
+                        let line = buf[..nl].trim_end_matches('\r').to_string();
+                        buf.drain(..=nl);
+                        let payload = match line.strip_prefix("data:") {
+                            Some(p) => p.trim(),
+                            None => continue, // ignore comments, `event:`, keep-alives, blank lines
+                        };
+                        let ev: serde_json::Value = match serde_json::from_str(payload) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let origin = ev["origin"].as_str().unwrap_or("");
+                        let kind = ev["kind"].as_str().unwrap_or("?");
+                        let (dir, cp) = if origin == self_id {
+                            ("out", "—".to_string())
+                        } else {
+                            ("in", origin[..origin.len().min(16)].to_string())
+                        };
+                        let amount = ev["amount"].as_str().and_then(|v| v.parse::<i128>().ok()).unwrap_or(0);
+                        let amt = if amount == 0 {
+                            "—".to_string()
+                        } else {
+                            format_credits(amount)
+                        };
+                        println!("{kind:<14}  {dir:<4}  {amt:>16}  {cp}");
                     }
                 }
             }
