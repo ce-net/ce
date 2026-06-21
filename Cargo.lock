@@ -605,13 +605,19 @@ dependencies = [
  "ce-chain",
  "ce-identity",
  "ce-node",
+ "ce-rs",
+ "chacha20poly1305",
  "clap",
  "directories",
  "dirs-next",
+ "futures-util",
  "hex",
+ "hkdf",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "tracing",
@@ -741,6 +747,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "toml",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "wat",
@@ -756,6 +763,22 @@ dependencies = [
  "criterion",
  "hex",
  "serde",
+ "sha2",
+]
+
+[[package]]
+name = "ce-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "directories",
+ "futures-core",
+ "futures-util",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 
@@ -2067,6 +2090,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3973,6 +3997,7 @@ dependencies = [
  "bytes",
  "encoding_rs",
  "futures-core",
+ "futures-util",
  "h2 0.4.14",
  "http 1.4.0",
  "http-body 1.0.1",
@@ -3987,6 +4012,8 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -3994,13 +4021,17 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5191,6 +5222,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "wasmparser"
 version = "0.219.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5505,6 +5549,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

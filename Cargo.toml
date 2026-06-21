@@ -28,6 +28,10 @@ ce-node = { path = "crates/ce-node" }
 ce-identity = { path = "crates/ce-identity" }
 ce-cap = { path = "crates/ce-cap" }
 ce-chain = { path = "crates/ce-chain" }
+# SDK reused by the credit-wallet CLI subtree (`ce wallet …`). A thin reqwest/serde client
+# over the node HTTP API; no libp2p. See crates/.. note: ce-rs lives in a sibling repo.
+ce-rs = { path = "../ce-rs" }
+futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
@@ -40,3 +44,7 @@ reqwest = { version = "0.12", features = ["json"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+rand = "0.8"

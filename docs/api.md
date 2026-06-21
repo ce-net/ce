@@ -6,6 +6,12 @@ All request and response bodies are JSON. All responses include a `Content-Type:
 
 **Credit amounts** (`bid`, `cost`, `amount`, `balance`, burn `amount`) are carried as decimal **strings** of base units, not JSON numbers — `1 credit = 10^18 base units`, and values routinely exceed JavaScript's 2^53 safe-integer limit, so a number would lose precision. Send e.g. `"bid": "1000000000000000000"` for 1 credit. Clients convert to/from human credit decimals.
 
+**Auth.** Mutating (non-GET) requests require `Authorization: Bearer <data_dir>/api.token`. Read-only GETs are open.
+
+**CORS.** Read-only GET and SSE endpoints send permissive CORS headers **only** for loopback origins (`http(s)://localhost`, `127.0.0.1`, `[::1]`, any port), so a browser dashboard served from `localhost` can fetch them. CORS is scoped to the `GET` method: mutating routes are never made cross-origin-reachable, and a hostile public web page cannot read this node's API from a victim's browser.
+
+**No key endpoint (by design).** There is deliberately **no** `/key/*` HTTP route. Identity-key backup and restore are TTY-only CLI actions (`ce key backup` / `ce key restore`); key material must never cross the API boundary (a network-reachable export would let any api.token holder exfiltrate the identity). A CI boundary gate fails the build if a `/key/*` route or a credit-minting endpoint is ever added.
+
 ---
 
 ## GET /health
@@ -33,7 +39,10 @@ Node status snapshot.
   "circulating_supply": "1042000000000000000000",
   "burned_total": "5000000000000000000",
   "bond": "0",
-  "weight": "0"
+  "weight": "0",
+  "free": "987000",
+  "locked_channels": "0",
+  "locked_bond": "0"
 }
 ```
 
@@ -47,6 +56,11 @@ Node status snapshot.
 | `burned_total` | string | Credits destroyed by the settlement burn (see below), base units (decimal string) |
 | `bond` | string | This node's active host bond, base units (decimal string) |
 | `weight` | string | This node's consensus weight = `min(bond, earned-work-score)`, base units (decimal string) |
+| `free` | string | Spendable balance = `balance` minus all locks (bids + channels + bond), clamped at 0, base units (decimal string) |
+| `locked_channels` | string | Credits locked in this node's open payment channels, base units (decimal string) |
+| `locked_bond` | string | Credits locked in this node's active bond (equals `bond`), base units (decimal string) |
+
+**Balance breakdown.** `free + locked_channels + locked_bond + (locked in open bids) == balance` once `balance` is non-negative. `free` is clamped at 0 so a transiently-negative balance during chain sync never shows a confusing negative spendable figure.
 
 **Settlement burn.** Every `JobSettle`, `Heartbeat`, and `ChannelClose` debits the payer/cell the
 full amount, credits the host `amount − burn`, and destroys the burn (`SETTLEMENT_BURN_BPS`, currently
@@ -270,12 +284,71 @@ incrementally as blocks apply. Amounts are base-unit strings.
   "earned": "7200000000000000000000",
   "spent": "900000000000000000000",
   "first_height": 41,
-  "last_height": 1180
+  "last_height": 1180,
+  "window_blocks": 259200,
+  "recent_earned": "1200000000000000000000",
+  "recent_spent": "300000000000000000000",
+  "window_partial": false
 }
 ```
 A node with no interactions returns all-zero fields (`first_height: 0`). Bad node id → `400`.
 Pruned light nodes hold only post-checkpoint history; query an **archive node** for the complete
 record.
+
+**Windowed slice (`window_*` / `recent_*`).** These expose a true time-windowed slice of the node's
+hosting income (`recent_earned`, post-burn) and consumption (`recent_spent`, gross) over the last
+`window_blocks` blocks (~30 days at 10 s/block). The cumulative `earned`/`spent` are all-time; the
+recent fields are what a torrent-style **share ratio** uses to weight recent over years-old
+contribution, so it computes a real windowed ratio rather than a recency proxy off `last_height`.
+This is an observational read-model walked from the blocks the node holds (like `burned_total`),
+**not** consensus and never part of any signed/hashed bytes. `window_partial` is `true` when the held
+blocks do not cover the whole window (a pruned/short chain undercounts) — query an archive node for
+the full slice.
+
+---
+
+## GET /transactions/:node_id
+
+A node's confirmed transactions as an **itemized, paginated list**, newest first. Complements the
+aggregate `GET /history/:node_id` (NodeStats) with the per-tx records a wallet/history view needs.
+
+**Privacy.** This returns only **public, on-chain** facts — every settlement and transfer leg is
+already world-readable to anyone holding the chain. It exposes nothing the ledger does not, for any
+node (not just self), and is not a private account statement. Pruned light nodes return only
+post-checkpoint transactions; query an **archive node** for the complete record.
+
+**Query parameters**
+
+| Param | Type | Description |
+|---|---|---|
+| `limit` | integer | Max items (default `100`, capped at `500`) |
+| `before` | integer | Exclude transactions at block height `>= before` — the cursor for the next (older) page |
+
+**Response** `200 OK` — a JSON array, newest first:
+```json
+[
+  {
+    "tx_id": "9f0e...64 hex",
+    "height": 1180,
+    "kind": "JobSettle",
+    "amount": "500000000000000000000",
+    "counterparty": "b1c2...64 hex",
+    "direction": "in"
+  }
+]
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `tx_id` | string | Content-addressed transaction id (64 hex) |
+| `height` | integer | Block height the tx was confirmed at |
+| `kind` | string | `Transfer`\|`UptimeReward`\|`JobBid`\|`JobSettle`\|`JobExpire`\|`Heartbeat`\|`ChannelOpen`\|`ChannelClose`\|`ChannelExpire`\|`NameClaim`\|`RevokeCapability`\|`HostBond`\|`HostUnbond`\|`SlashEquivocation` |
+| `amount` | string | Value moved by the tx, base units (decimal string); `"0"` for amount-less kinds |
+| `counterparty` | string? | The other party relative to the queried node (64 hex), when there is one |
+| `direction` | string | `"in"` (value to this node), `"out"` (value from this node), or `"self"` |
+
+**Pagination.** To page backwards, pass the lowest `height` you received as the next `before`. Bad
+node id → `400`.
 
 ---
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{header::AUTHORIZATION, Method, StatusCode},
     middleware::{self, Next},
     response::{
@@ -75,6 +75,23 @@ struct ErrorBody {
 
 fn err(code: StatusCode, msg: impl Into<String>) -> Response {
     (code, Json(ErrorBody { error: msg.into() })).into_response()
+}
+
+/// Is this `Origin` header a loopback origin? Accepts `http`/`https` schemes with host
+/// `localhost`, `127.0.0.1`, or `[::1]`, with an optional `:port`. Used to scope read-only CORS to
+/// the same machine so a hostile public page cannot read this node's API from a victim's browser.
+fn is_localhost_origin(origin: &str) -> bool {
+    let rest = match origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")) {
+        Some(r) => r,
+        None => return false,
+    };
+    // Drop an optional :port (but keep IPv6 brackets intact: "[::1]:8080" -> host "[::1]").
+    let host = if let Some(stripped) = rest.strip_prefix("[::1]") {
+        return stripped.is_empty() || stripped.starts_with(':');
+    } else {
+        rest.split(':').next().unwrap_or("")
+    };
+    host == "localhost" || host == "127.0.0.1"
 }
 
 /// Constant-time byte comparison (avoids timing oracles on the token check).
@@ -200,6 +217,15 @@ pub struct NodeStatusResponse {
     /// This node's consensus weight = min(bond, earned-work-score), base units as a decimal string.
     #[serde(with = "amount_str")]
     pub weight: u128,
+    /// Spendable balance (balance minus all locks, clamped at 0), base units as a decimal string.
+    #[serde(with = "amount_str")]
+    pub free: u128,
+    /// Credits locked in this node's open payment channels, base units as a decimal string.
+    #[serde(with = "amount_str")]
+    pub locked_channels: u128,
+    /// Credits locked in this node's active bond (== `bond`), base units as a decimal string.
+    #[serde(with = "amount_str")]
+    pub locked_bond: u128,
 }
 
 // ----- POST /jobs/bid -----
@@ -430,6 +456,9 @@ async fn node_status(State(state): State<ApiState>) -> Response {
             burned_total: snap.burned_total,
             bond: snap.bond,
             weight: snap.weight,
+            free: snap.free,
+            locked_channels: snap.locked_channels,
+            locked_bond: snap.locked_bond,
         }),
     )
         .into_response()
@@ -1190,6 +1219,19 @@ struct HistoryResponse {
     spent: u128,
     first_height: u64,
     last_height: u64,
+    // --- Windowed slice (share-ratio recency input) ---
+    // These are the recent-window facts a torrent-style share ratio needs so it computes a REAL
+    // ratio over recent volume, not a recency proxy off `last_height`. `recent_earned` is
+    // hosting income (post-burn) and `recent_spent` is consumption (gross) over the last
+    // `window_blocks` blocks. Observational read-model walked from blocks (like burned_total),
+    // never consensus. `window_partial` is true on a pruned/short chain that does not cover the
+    // whole window — query an archive node for the full slice.
+    window_blocks: u64,
+    #[serde(with = "amount_str")]
+    recent_earned: u128,
+    #[serde(with = "amount_str")]
+    recent_spent: u128,
+    window_partial: bool,
 }
 
 async fn get_history(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
@@ -1198,6 +1240,7 @@ async fn get_history(State(state): State<ApiState>, Path(id): Path<String>) -> R
         None => return err(StatusCode::BAD_REQUEST, "node_id must be 64 hex chars"),
     };
     let s = state.chain.node_history(node_id).await;
+    let w = state.chain.node_history_windowed(node_id, ce_chain::RATIO_WINDOW_BLOCKS).await;
     let resp = HistoryResponse {
         node_id: id,
         jobs_hosted: s.jobs_hosted,
@@ -1209,8 +1252,142 @@ async fn get_history(State(state): State<ApiState>, Path(id): Path<String>) -> R
         spent: s.spent,
         first_height: s.first_height,
         last_height: s.last_height,
+        window_blocks: w.window_blocks,
+        recent_earned: w.recent_earned,
+        recent_spent: w.recent_spent,
+        window_partial: w.partial,
     };
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+// ----- GET /transactions/:node_id -----
+//
+// Itemized, paginated read of a node's confirmed transactions from the chain. This complements the
+// aggregate `GET /history/:node_id` (NodeStats) with the per-tx list a wallet/history view needs.
+//
+// PRIVACY: this returns only PUBLIC, on-chain facts. Every settlement and transfer leg is already
+// world-readable to anyone holding the chain; this endpoint exposes nothing the ledger does not, for
+// any node, not just self. It is not a private statement. On a pruned light node only
+// post-checkpoint transactions are visible (archive nodes hold full history).
+
+/// Default and maximum page size for `GET /transactions/:node_id`.
+const TX_PAGE_DEFAULT: usize = 100;
+const TX_PAGE_MAX: usize = 500;
+
+#[derive(Debug, Deserialize)]
+struct TxQuery {
+    /// Max items to return (default 100, capped at 500).
+    limit: Option<usize>,
+    /// Exclude transactions at block height `>= before` — the cursor for the next (older) page.
+    before: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct TxRecord {
+    /// Content-addressed transaction id (64 hex).
+    tx_id: String,
+    /// Block height the tx was confirmed at.
+    height: u64,
+    /// Tx kind, e.g. Transfer | JobSettle | Heartbeat | ChannelClose | UptimeReward | ...
+    kind: String,
+    /// Amount moved relative to this tx, base units as a decimal string ("0" for amount-less kinds).
+    #[serde(with = "amount_str")]
+    amount: u128,
+    /// The other party in this tx relative to the queried node (64 hex), when there is one.
+    counterparty: Option<String>,
+    /// Value direction relative to the queried node: "in", "out", or "self".
+    direction: String,
+}
+
+/// Classify a tx relative to `node`: (kind label, amount, counterparty, direction).
+fn classify_tx(kind: &TxKind, node: &NodeId) -> (&'static str, u128, Option<NodeId>, &'static str) {
+    match kind {
+        TxKind::Transfer { from, to, amount } => {
+            let dir = if to == node && from == node {
+                "self"
+            } else if to == node {
+                "in"
+            } else {
+                "out"
+            };
+            let cp = if from == node { Some(*to) } else { Some(*from) };
+            ("Transfer", *amount, cp, dir)
+        }
+        TxKind::UptimeReward { amount, .. } => ("UptimeReward", *amount, None, "in"),
+        TxKind::JobBid { payer, bid, .. } => {
+            let dir = if payer == node { "out" } else { "self" };
+            ("JobBid", *bid, None, dir)
+        }
+        TxKind::JobSettle { host, payer, cost, .. } => {
+            let (dir, cp) = if host == node {
+                ("in", Some(*payer))
+            } else {
+                ("out", Some(*host))
+            };
+            ("JobSettle", *cost, cp, dir)
+        }
+        TxKind::JobExpire { .. } => ("JobExpire", 0, None, "self"),
+        TxKind::Heartbeat { cell, host, amount, .. } => {
+            let (dir, cp) = if host == node {
+                ("in", Some(*cell))
+            } else {
+                ("out", Some(*host))
+            };
+            ("Heartbeat", *amount, cp, dir)
+        }
+        TxKind::ChannelOpen { payer, host, capacity, .. } => {
+            let (dir, cp) = if payer == node {
+                ("out", Some(*host))
+            } else {
+                ("in", Some(*payer))
+            };
+            ("ChannelOpen", *capacity, cp, dir)
+        }
+        // payer/host are not in the ChannelClose tx; origin is the host (v0 close rule), so a match
+        // here means this node closed (received) the channel.
+        TxKind::ChannelClose { cumulative, .. } => ("ChannelClose", *cumulative, None, "in"),
+        TxKind::ChannelExpire { .. } => ("ChannelExpire", 0, None, "self"),
+        TxKind::NameClaim { .. } => ("NameClaim", 0, None, "self"),
+        TxKind::RevokeCapability { .. } => ("RevokeCapability", 0, None, "self"),
+        TxKind::HostBond { amount, .. } => ("HostBond", *amount, None, "self"),
+        TxKind::HostUnbond { .. } => ("HostUnbond", 0, None, "self"),
+        TxKind::SlashEquivocation { offender, reporter, .. } => {
+            let (dir, cp) = if reporter == node {
+                ("in", Some(*offender))
+            } else {
+                ("out", Some(*reporter))
+            };
+            ("SlashEquivocation", 0, cp, dir)
+        }
+    }
+}
+
+async fn get_transactions(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<TxQuery>,
+) -> Response {
+    let node_id: NodeId = match hex::decode(&id).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "node_id must be 64 hex chars"),
+    };
+    let limit = q.limit.unwrap_or(TX_PAGE_DEFAULT).clamp(1, TX_PAGE_MAX);
+    let rows = state.chain.transactions_for(node_id, q.before, limit).await;
+    let records: Vec<TxRecord> = rows
+        .into_iter()
+        .map(|(tx, height, tx_id)| {
+            let (kind, amount, cp, dir) = classify_tx(&tx.kind, &node_id);
+            TxRecord {
+                tx_id: hex::encode(tx_id),
+                height,
+                kind: kind.to_string(),
+                amount,
+                counterparty: cp.map(hex::encode),
+                direction: dir.to_string(),
+            }
+        })
+        .collect();
+    (StatusCode::OK, Json(records)).into_response()
 }
 
 // ----- Payment channels -----
@@ -1854,6 +2031,7 @@ pub async fn start(
         .route("/atlas", get(get_atlas))
         .route("/beacon", get(get_beacon))
         .route("/history/:node_id", get(get_history))
+        .route("/transactions/:node_id", get(get_transactions))
         .route("/channels", get(list_channels))
         .route("/channels/open", post(channel_open))
         .route("/channels/receipt", post(channel_receipt))
@@ -1887,6 +2065,22 @@ pub async fn start(
     // CSRF/SSRF, and (with the localhost bind) the network. Mesh-originated value ops are
     // unaffected — they arrive over the Noise-authenticated libp2p RPC path, not this HTTP API.
     let app = app.layer(middleware::from_fn_with_state(api_token.clone(), require_api_token));
+
+    // Read-only, localhost-scoped CORS so a browser dashboard served from http://localhost can fetch
+    // the GET/SSE read surfaces (status, history, transactions, atlas, beacon, streams). Scoped to
+    // GET only: mutating routes (POST/PUT/DELETE) are NOT made cross-origin-reachable — a browser
+    // preflight for a non-GET method receives no allow, and the api.token already gates writes. The
+    // origin predicate reflects only loopback origins (http(s)://localhost|127.0.0.1|[::1][:port]),
+    // so a hostile public web page cannot read this node's API from a victim's browser.
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_methods([Method::GET])
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _req| {
+            origin
+                .to_str()
+                .map(is_localhost_origin)
+                .unwrap_or(false)
+        }));
+    let app = app.layer(cors);
 
     let addr = format!("{api_bind}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -1940,4 +2134,78 @@ pub async fn start(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localhost_origins_accepted() {
+        for o in [
+            "http://localhost",
+            "http://localhost:8844",
+            "https://localhost:3000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:5173",
+            "http://[::1]",
+            "http://[::1]:8080",
+        ] {
+            assert!(is_localhost_origin(o), "should accept {o}");
+        }
+    }
+
+    #[test]
+    fn non_localhost_origins_rejected() {
+        for o in [
+            "http://evil.com",
+            "https://ce-net.com",
+            "http://127.0.0.1.evil.com",
+            "http://localhost.evil.com",
+            "ftp://localhost",
+            "localhost",
+            "",
+        ] {
+            assert!(!is_localhost_origin(o), "should reject {o}");
+        }
+    }
+
+    #[test]
+    fn classify_tx_direction_relative_to_node() {
+        let a: NodeId = [1u8; 32];
+        let b: NodeId = [2u8; 32];
+
+        // Transfer out: a pays b.
+        let (kind, amount, cp, dir) =
+            classify_tx(&TxKind::Transfer { from: a, to: b, amount: 500 }, &a);
+        assert_eq!((kind, amount, dir), ("Transfer", 500, "out"));
+        assert_eq!(cp, Some(b));
+
+        // Same Transfer, viewed by the recipient b: it is "in".
+        let (_, _, cp, dir) =
+            classify_tx(&TxKind::Transfer { from: a, to: b, amount: 500 }, &b);
+        assert_eq!(dir, "in");
+        assert_eq!(cp, Some(a));
+
+        // JobSettle: host earns -> "in"; payer pays -> "out".
+        let settle = TxKind::JobSettle {
+            job_id: [9u8; 32],
+            host: a,
+            payer: b,
+            cpu_ms: 0,
+            mem_mb: 0,
+            cost: 1_000,
+            payer_sig: [0u8; 64],
+        };
+        let (_, amount, cp, dir) = classify_tx(&settle, &a);
+        assert_eq!((amount, dir), (1_000, "in"));
+        assert_eq!(cp, Some(b));
+        let (_, _, _, dir) = classify_tx(&settle, &b);
+        assert_eq!(dir, "out");
+
+        // UptimeReward is always incoming, no counterparty.
+        let (kind, amount, cp, dir) =
+            classify_tx(&TxKind::UptimeReward { node: a, amount: 7, epoch: 1 }, &a);
+        assert_eq!((kind, amount, cp, dir), ("UptimeReward", 7, None, "in"));
+    }
 }

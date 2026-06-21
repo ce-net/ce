@@ -23,6 +23,7 @@ bincode = "1"
 directories = "5"
 dirs-next = "2"
 axum = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
 bollard = "0.17"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }

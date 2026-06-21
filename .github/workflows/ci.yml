@@ -33,6 +33,54 @@ jobs:
       - name: Unit + integration tests
         run: cargo test --workspace
 
+  # ── Boundary gates (every push / PR) ───────────────────────────────────────
+  # CE is primitives-only. These greps FAIL the build if a forbidden surface appears, so the
+  # boundary cannot erode silently. See ce/docs/primitives.md and ce/docs/api.md.
+  boundary:
+    name: Boundary gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GATE 1 — no HTTP /key/* route may ever exist. Key material must not cross the API boundary:
+      # a /key/export endpoint would let any holder of the api.token exfiltrate the node identity,
+      # turning a same-host file-permission problem into a network-reachable one. Key backup/restore
+      # is a deliberate, interactive, same-host CLI action only (see src/keybackup.rs).
+      - name: No HTTP /key/* route
+        run: |
+          if grep -REn 'route\(\s*"/key' crates/ ; then
+            echo "::error::Forbidden /key/* HTTP route found. Key material must never cross the API boundary — keep key backup/restore CLI-only (src/keybackup.rs)."
+            exit 1
+          fi
+          echo "OK: no /key/* HTTP route."
+
+      # GATE 2 — no credential-/credit-minting endpoint. Credits are minted ONLY by the consensus
+      # UptimeReward path inside ce-chain; there must be no HTTP route that mints, prints, grants, or
+      # tops up balances/credits out of thin air.
+      - name: No credential-/credit-minting endpoint
+        run: |
+          if grep -REn 'route\(\s*"/(mint|faucet|print|issue-credits|credits/(mint|grant)|balance/(add|set))' crates/ ; then
+            echo "::error::Forbidden credit-minting HTTP route found. Credits are minted only by consensus (UptimeReward); no endpoint may create credits."
+            exit 1
+          fi
+          echo "OK: no credit-minting endpoint."
+
+      # GATE 3 — the capability verifier (ce-cap) must never import ce-ratio. Authorization is the
+      # capability chain ALONE; share-ratio is app-tier policy that biases price/priority and must
+      # not leak into the hard authz path. Rule documented in ce/docs/primitives.md (Design
+      # invariants) and the ratio workstream's ce/docs/ratio.md.
+      - name: Capability verifier does not import ce-ratio
+        run: |
+          if grep -REn 'ce[_-]ratio' crates/ce-cap/ ; then
+            echo "::error::ce-cap (the capability verifier) must not depend on ce-ratio. Ratio is app-tier policy, never an authorization input."
+            exit 1
+          fi
+          if grep -En 'ce[_-]ratio' crates/ce-cap/Cargo.toml ; then
+            echo "::error::ce-cap/Cargo.toml must not declare a ce-ratio dependency."
+            exit 1
+          fi
+          echo "OK: ce-cap does not import ce-ratio."
+
   # ── Release builds (tag pushes only) ───────────────────────────────────────
 
   build:

@@ -25,6 +25,11 @@ pub const CHAIN_FORMAT_VERSION: u8 = 2;
 /// Minimum blocks to retain after a prune. Covers EXPIRY_BLOCKS + difficulty window.
 pub const PRUNE_KEEP_BLOCKS: u64 = 2880;
 
+/// Default share-ratio recency window (blocks). ~30 days at 10 s/block (259_200 blocks). Used by
+/// `Chain::node_history_windowed` and surfaced on `GET /history`. Note: a default light node keeps
+/// only `PRUNE_KEEP_BLOCKS` (~8 h), so its window is `partial`; archive nodes cover the full window.
+pub const RATIO_WINDOW_BLOCKS: u64 = 259_200;
+
 /// Number of blocks per archive segment. 1000 blocks ≈ 2.8 hours at 10 s/block.
 pub const SEGMENT_SIZE: u64 = 1000;
 
@@ -597,6 +602,52 @@ pub struct NodeStats {
     pub last_height: u64,
 }
 
+/// A time-windowed slice of a node's hosting/consuming volume over the last `window_blocks`
+/// blocks — the recent-window facts a torrent-style share-ratio uses to weight recent over old
+/// contribution. Observational only (a read-model walked from blocks, like `burned_total_cache`);
+/// never consensus, never signed. All amounts are base units. See `Chain::node_history_windowed`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WindowedStats {
+    /// Width of the window in blocks (the value the slice was computed over).
+    pub window_blocks: u64,
+    /// Credits earned hosting work within the window (post-burn, mirrors `NodeStats::earned`).
+    pub recent_earned: u128,
+    /// Credits spent consuming work within the window (gross, mirrors `NodeStats::spent`).
+    pub recent_spent: u128,
+    /// True when the held blocks do not fully cover the window (pruned light node / short chain),
+    /// so the slice undercounts and an archive node should be consulted for the full window.
+    pub partial: bool,
+    /// First-interaction height (carried from `NodeStats` for newcomer-grace classification).
+    pub first_height: u64,
+    /// Most-recent-interaction height (carried from `NodeStats` for the recency proxy).
+    pub last_height: u64,
+}
+
+/// Does this transaction name `node` in any of its participant roles? Used by
+/// `Chain::transactions_for` to select a node's confirmed history. `tx.origin` is always checked,
+/// plus every NodeId-typed field of the `TxKind`. Read of public chain facts only.
+pub fn tx_names_node(tx: &Tx, node: &NodeId) -> bool {
+    if &tx.origin == node {
+        return true;
+    }
+    match &tx.kind {
+        TxKind::Transfer { from, to, .. } => from == node || to == node,
+        TxKind::UptimeReward { node: n, .. } => n == node,
+        TxKind::JobBid { payer, .. } => payer == node,
+        TxKind::JobSettle { host, payer, .. } => host == node || payer == node,
+        TxKind::JobExpire { payer, .. } => payer == node,
+        TxKind::Heartbeat { cell, host, .. } => cell == node || host == node,
+        TxKind::ChannelOpen { payer, host, .. } => payer == node || host == node,
+        TxKind::ChannelClose { .. } => false, // payer/host not named in the tx; origin (host) covered above
+        TxKind::ChannelExpire { payer, .. } => payer == node,
+        TxKind::NameClaim { node: n, .. } => n == node,
+        TxKind::RevokeCapability { issuer, .. } => issuer == node,
+        TxKind::HostBond { host, .. } => host == node,
+        TxKind::HostUnbond { host } => host == node,
+        TxKind::SlashEquivocation { offender, reporter, .. } => offender == node || reporter == node,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chain {
     /// Blocks after the checkpoint (or all blocks if no checkpoint exists).
@@ -915,6 +966,112 @@ impl Chain {
     /// unknown node. O(1). Apps derive their own trust from these facts.
     pub fn node_history(&self, node: &NodeId) -> NodeStats {
         self.node_stats.get(node).cloned().unwrap_or_default()
+    }
+
+    /// Recent earned-as-host / spent-as-cell volume for a node over the last `WINDOW_BLOCKS`
+    /// blocks (base units). This is the *one* fact the cumulative `NodeStats` cannot provide: a
+    /// true time-windowed slice, which a torrent-style share-ratio needs to weight recent
+    /// contribution over years-old contribution. It is an **observational read-model** derived by
+    /// walking the blocks the node already holds — identical in kind to `burned_total_cache` — and
+    /// is NOT part of validation, fork choice, or any signed/hashed bytes. Computed on demand
+    /// (O(window) over kept blocks), so no extra always-on accumulator is carried in the hot path.
+    ///
+    /// `tip` is the height the window is anchored at (normally `self.height()`). Earned/spent use the
+    /// same post-burn (`earned`) / gross (`spent`) semantics as `NodeStats`. On a pruned light node
+    /// the walk only sees post-checkpoint blocks, so a short chain yields a partial window (the
+    /// caller should label results "partial" — archive nodes are authoritative).
+    pub fn node_history_windowed(&self, node: &NodeId, window_blocks: u64) -> WindowedStats {
+        let tip = self.height();
+        let lower = tip.saturating_sub(window_blocks);
+        let mut recent_earned: u128 = 0;
+        let mut recent_spent: u128 = 0;
+        // Walk only blocks inside the window; `blocks` is height-ordered.
+        for block in self.blocks.iter().filter(|b| b.index > lower) {
+            for tx in &block.transactions {
+                match &tx.kind {
+                    TxKind::JobSettle { host, payer, cost, .. } => {
+                        if host == node {
+                            recent_earned = recent_earned
+                                .saturating_add((*cost).saturating_sub(settlement_burn(*cost)));
+                        }
+                        if payer == node {
+                            recent_spent = recent_spent.saturating_add(*cost);
+                        }
+                    }
+                    TxKind::Heartbeat { cell, host, amount, .. } => {
+                        if host == node {
+                            recent_earned = recent_earned
+                                .saturating_add((*amount).saturating_sub(settlement_burn(*amount)));
+                        }
+                        if cell == node {
+                            recent_spent = recent_spent.saturating_add(*amount);
+                        }
+                    }
+                    // ChannelClose: settled volume mirrors JobSettle, but identifying payer/host
+                    // requires the (already-removed) open-channel record. We approximate by the
+                    // channel-close origin = host (v0 close rule), which credits the closer's earned
+                    // and, lacking the payer here, leaves payer-side spent to the cumulative figure.
+                    TxKind::ChannelClose { cumulative, .. } => {
+                        if &tx.origin == node {
+                            recent_earned = recent_earned.saturating_add(
+                                (*cumulative).saturating_sub(settlement_burn(*cumulative)),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let stats = self.node_history(node);
+        WindowedStats {
+            window_blocks,
+            recent_earned,
+            recent_spent,
+            // The window is "partial" (not fully covered by held blocks) when the chain's oldest
+            // kept block is newer than the window's lower bound — i.e. a pruned/short chain.
+            partial: self.blocks.first().map(|b| b.index).unwrap_or(0) > lower,
+            first_height: stats.first_height,
+            last_height: stats.last_height,
+        }
+    }
+
+    /// Confirmed transactions that name `node` as a participant — origin, or any role
+    /// (`from`/`to`/`payer`/`host`/`cell`/`node`/`issuer`/`offender`/`reporter`/`miner`). Newest
+    /// first, paginated: `before` excludes transactions at height `>= before` (cursor for the next
+    /// page; `None` starts at the tip), `limit` caps the page size. Returns `(tx, height, tx_id)`.
+    ///
+    /// PRIVACY: this is a read of *public, on-chain* facts — every settlement/transfer leg is already
+    /// world-readable to anyone with the chain. It exposes nothing the ledger does not. It is not a
+    /// private account statement; the same data is visible to every node. On a pruned light node only
+    /// post-checkpoint transactions are returned (archive nodes hold the full history).
+    ///
+    /// O(kept_blocks) walk from the tip; `limit` bounds the result, and the bounded walk stops once a
+    /// full page is collected, so a large chain does not force a full scan per page.
+    pub fn transactions_for(
+        &self,
+        node: &NodeId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Vec<(Tx, u64, [u8; 32])> {
+        let mut out: Vec<(Tx, u64, [u8; 32])> = Vec::new();
+        // Walk newest block first; within a block, newest tx first, so the page is strictly
+        // descending by (height, position).
+        for block in self.blocks.iter().rev() {
+            if let Some(before) = before {
+                if block.index >= before {
+                    continue;
+                }
+            }
+            for tx in block.transactions.iter().rev() {
+                if tx_names_node(tx, node) {
+                    out.push((tx.clone(), block.index, tx.id()));
+                    if out.len() >= limit {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// List open payment channels: (channel_id, payer, host, capacity, expiry_height).
@@ -2658,6 +2815,50 @@ mod tests {
                 + Chain::emission_rate(chain.tip().index) as i128,
             "host receives cost net-of-burn, plus its mining emission",
         );
+    }
+
+    #[test]
+    fn windowed_history_slices_recent_volume() {
+        let host = make_identity("win-host");
+        let payer = make_identity("win-payer");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 5_000);
+
+        // One settled job: host earns net-of-burn, payer spends gross.
+        let job_id = [9u8; 32];
+        let bid = signed_job_bid(&payer, job_id, 2_000);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, bid], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
+        block.seal(&host);
+        assert!(chain.append(block));
+
+        let cost = 1_000u128;
+        let settle = signed_job_settle(&host, &payer, job_id, cost);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, settle], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
+        block.seal(&host);
+        assert!(chain.append(block));
+
+        // A wide window covers the whole chain: recent figures equal the cumulative ones, and the
+        // window is not partial (genesis is still present).
+        let net = cost - settlement_burn(cost);
+        let hw = chain.node_history_windowed(&host.node_id(), RATIO_WINDOW_BLOCKS);
+        assert_eq!(hw.recent_earned, net, "host recent earned = settled cost net of burn");
+        assert_eq!(hw.recent_spent, 0, "host consumed nothing");
+        assert!(!hw.partial, "full window on an unpruned chain");
+        assert_eq!(hw.recent_earned, chain.node_history(&host.node_id()).earned);
+
+        let pw = chain.node_history_windowed(&payer.node_id(), RATIO_WINDOW_BLOCKS);
+        assert_eq!(pw.recent_spent, cost, "payer recent spent = gross cost");
+        assert_eq!(pw.recent_earned, 0);
+
+        // A window of 0 blocks excludes every settled block, so recent volume is zero — proving the
+        // slice is a real time window, not a recency alias of the cumulative total.
+        let zero = chain.node_history_windowed(&host.node_id(), 0);
+        assert_eq!(zero.recent_earned, 0);
+        assert_eq!(zero.recent_spent, 0);
     }
 
     // Phase 0 — the settlement burn (docs/consensus.md, docs/sybil-resistance.md E4). The keystone

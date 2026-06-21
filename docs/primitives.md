@@ -186,3 +186,11 @@ every app would otherwise reinvent → primitive.
 - Amounts cross JSON as strings (exceed 2^53).
 - `Mesh` is `!Sync`; mining is `spawn_blocking`; Docker is optional.
 - Capability actions are opaque strings; the verifier knows no app vocabulary.
+- **The capability verifier (`ce-cap`) never imports app-tier reputation/policy.** Authorization is
+  the signed, attenuating capability chain *alone*. Share-ratio / reputation are app-tier signals
+  that bias price and priority only — they must never become an input to the hard authz path. A
+  CI boundary gate fails the build if `ce-cap` ever depends on `ce-ratio`.
+- **Key material never crosses the API boundary.** There is no `/key/*` HTTP route and no
+  credit-/credential-minting endpoint; credits are minted only by the consensus `UptimeReward` path.
+  Identity-key backup/restore is a TTY-only CLI action (`ce key backup` / `ce key restore`). CI
+  boundary gates (`.github/workflows/ci.yml` → the `boundary` job) enforce both rules on every push.

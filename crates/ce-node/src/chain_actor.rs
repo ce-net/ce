@@ -11,7 +11,7 @@
 /// flooding sync requests can't OOM the node.
 
 use anyhow::Result;
-use ce_chain::{Block, Chain, NodeStats, Tx, TxKind};
+use ce_chain::{Block, Chain, NodeStats, Tx, TxKind, WindowedStats};
 use ce_identity::NodeId;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,6 +33,16 @@ pub struct ChainStatusSnap {
     pub bond: u128,
     /// This node's consensus weight = min(bond, earned-work-score) (base units).
     pub weight: u128,
+    /// Credits locked in this node's open payment channels (base units).
+    pub locked_channels: u128,
+    /// Credits locked in this node's active bond (base units). Equals `bond` (a bond is locked
+    /// while active), surfaced separately so the `locked` breakdown is explicit.
+    pub locked_bond: u128,
+    /// Spendable balance: `balance - locked_balance` (bids + channels + bond), clamped at 0 so a
+    /// transiently-negative balance during sync never shows as a confusing negative free figure
+    /// (base units). The invariant `free + locked_channels + locked_bond + locked_bids == balance`
+    /// holds once balance is non-negative.
+    pub free: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +61,16 @@ pub enum ChainCmd {
     LockedBalance { node: NodeId, reply: oneshot::Sender<u128> },
     /// Per-node interaction history (reputation substrate).
     NodeHistory { node: NodeId, reply: oneshot::Sender<NodeStats> },
+    /// Time-windowed slice of a node's hosting/consuming volume (share-ratio recency input).
+    NodeHistoryWindowed { node: NodeId, window_blocks: u64, reply: oneshot::Sender<WindowedStats> },
+    /// A node's confirmed transactions, newest first, paginated by (`before` height, `limit`).
+    #[allow(clippy::type_complexity)]
+    TransactionsFor {
+        node: NodeId,
+        before: Option<u64>,
+        limit: usize,
+        reply: oneshot::Sender<Vec<(Tx, u64, [u8; 32])>>,
+    },
     /// List open payment channels: (channel_id, payer, host, capacity, expiry_height).
     #[allow(clippy::type_complexity)]
     ListChannels { reply: oneshot::Sender<Vec<([u8; 32], NodeId, NodeId, u128, u64)>> },
@@ -109,6 +129,33 @@ impl ChainHandle {
         rx.await.unwrap_or_default()
     }
 
+    /// Time-windowed earned/spent slice for the share-ratio recency input.
+    pub async fn node_history_windowed(&self, node: NodeId, window_blocks: u64) -> WindowedStats {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .0
+            .send(ChainCmd::NodeHistoryWindowed { node, window_blocks, reply: tx })
+            .await;
+        rx.await.unwrap_or_default()
+    }
+
+    /// A node's confirmed transactions, newest first, paginated. `before` excludes heights `>=`
+    /// itself (page cursor); `limit` caps the page.
+    #[allow(clippy::type_complexity)]
+    pub async fn transactions_for(
+        &self,
+        node: NodeId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Vec<(Tx, u64, [u8; 32])> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .0
+            .send(ChainCmd::TransactionsFor { node, before, limit, reply: tx })
+            .await;
+        rx.await.unwrap_or_default()
+    }
+
     #[allow(clippy::type_complexity)]
     pub async fn list_channels(&self) -> Vec<([u8; 32], NodeId, NodeId, u128, u64)> {
         let (tx, rx) = oneshot::channel();
@@ -159,6 +206,9 @@ impl ChainHandle {
             burned_total: 0,
             bond: 0,
             weight: 0,
+            locked_channels: 0,
+            locked_bond: 0,
+            free: 0,
         })
     }
 
@@ -272,6 +322,12 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
             ChainCmd::NodeHistory { node, reply } => {
                 let _ = reply.send(chain.node_history(&node));
             }
+            ChainCmd::NodeHistoryWindowed { node, window_blocks, reply } => {
+                let _ = reply.send(chain.node_history_windowed(&node, window_blocks));
+            }
+            ChainCmd::TransactionsFor { node, before, limit, reply } => {
+                let _ = reply.send(chain.transactions_for(&node, before, limit));
+            }
             ChainCmd::ListChannels { reply } => {
                 let _ = reply.send(chain.list_channels());
             }
@@ -291,14 +347,30 @@ async fn chain_actor(mut chain: Chain, mut rx: mpsc::Receiver<ChainCmd>) {
                 let _ = reply.send(chain.difficulty);
             }
             ChainCmd::ChainStatus { node, reply } => {
+                let balance = chain.balance(&node);
+                let locked = chain.locked_balance(&node);
+                let bond = chain.bond_of(&node);
+                // Channel-locked = capacity in this node's open channels as payer.
+                let locked_channels: u128 = chain
+                    .list_channels()
+                    .into_iter()
+                    .filter(|(_, payer, _, _, _)| payer == &node)
+                    .map(|(_, _, _, capacity, _)| capacity)
+                    .fold(0u128, |a, b| a.saturating_add(b));
+                // Free = balance minus all locks; clamp at 0 so a transiently-negative balance during
+                // sync never reports a confusing negative free figure.
+                let free = (balance.max(0) as u128).saturating_sub(locked);
                 let _ = reply.send(ChainStatusSnap {
                     height: chain.height(),
                     difficulty: chain.difficulty,
-                    balance: chain.balance(&node),
+                    balance,
                     circulating_supply: chain.circulating_supply(),
                     burned_total: chain.burned_total(),
-                    bond: chain.bond_of(&node),
+                    bond,
                     weight: chain.consensus_weight(&node),
+                    locked_channels,
+                    locked_bond: bond,
+                    free,
                 });
             }
             ChainCmd::SyncSnap { reply } => {

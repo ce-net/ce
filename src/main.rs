@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
+mod keybackup;
+
 /// Fetch bootstrap peer multiaddrs from the ce-net.com relay or CE_BOOTSTRAP_URL override.
 /// Returns an empty vec on any error so startup is never blocked.
 async fn fetch_bootstrap_peers() -> Vec<String> {
@@ -104,10 +106,23 @@ enum Commands {
     Status,
     /// Print this node's ID.
     Id,
-    /// Manage the local capability wallet (alias -> node id + held capability token).
+    /// Back up or restore this node's identity key (TTY-only; never over HTTP).
     ///
-    /// Hold capabilities others issued you, so `ce tunnel`/`ce deploy <alias>` auto-attach them.
-    /// (Remote exec/sync are the `rdev` app, which has its own wallet.)
+    /// Losing <data_dir>/identity/node.key permanently loses this node's funds and name. `ce key
+    /// backup` writes a transcribable mnemonic and/or an encrypted keystore; `ce key restore`
+    /// rebuilds node.key from either. These run only in an interactive terminal and never expose key
+    /// material on the network — there is deliberately no HTTP /key route.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommands,
+    },
+    /// Manage your wallet: credits (money) and capabilities (authority).
+    ///
+    /// Credit half — money over the node HTTP API: `balance` (free/locked breakdown), `history`
+    /// (itemized tx list), `send` (transfer credits), `watch` (live tx tail).
+    /// Capability half — held authority tokens: `add`/`ls`/`rm` store capabilities others issued
+    /// you, so `ce tunnel`/`ce deploy <alias>` auto-attach them. (Remote exec/sync are the `rdev`
+    /// app, which has its own wallet.) See PLAN/06-token-management.md for the full split.
     Wallet {
         #[command(subcommand)]
         command: WalletCommands,
@@ -290,6 +305,50 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum WalletCommands {
+    // ----- credit wallet (money: balance / history / send / live tail) -----
+    //
+    // These operate on this node's CREDITS via the local HTTP API (through ce_rs::Wallet). They
+    // are distinct from the capability-wallet subcommands below (`add`/`ls`/`rm`), which manage
+    // signed authority tokens — see `ce wallet cap`-style docs and PLAN/06-token-management.md.
+    /// Show this node's credit balance breakdown (total / free / locked-in-channels / locked-in-bond).
+    Balance {
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// Show itemized credit transaction history (newest first), paginated.
+    ///
+    /// Example: ce wallet history --limit 20
+    History {
+        /// Node id whose history to show (default: this node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Max items to show (node caps at 500).
+        #[arg(long, default_value = "50")]
+        limit: u32,
+        /// Only show txs strictly below this block height (cursor for older pages).
+        #[arg(long)]
+        before: Option<u64>,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// Send credits to another node (alias of `ce fund`).
+    ///
+    /// Example: ce wallet send <node-id> 500
+    Send {
+        /// Recipient NodeId (64 hex chars).
+        to: String,
+        /// Credits to send (decimal allowed, e.g. 500 or 0.25).
+        amount: String,
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+    /// Live-tail confirmed credit transactions touching this node (SSE; Ctrl-C to stop).
+    Watch {
+        #[arg(long, default_value = "8844")]
+        api_port: u16,
+    },
+
+    // ----- capability wallet (authority: held capability tokens) -----
     /// Store (or replace) a capability you were issued, under a friendly alias.
     ///
     /// Example: ce wallet add desktop <desktop-node-id> --cap <token-from-ce-grant>
@@ -309,6 +368,39 @@ enum WalletCommands {
         /// Alias to remove.
         alias: String,
     },
+}
+
+#[derive(Subcommand)]
+enum KeyCommands {
+    /// Back up this node's identity key as a mnemonic and/or an encrypted keystore file.
+    ///
+    /// By default prints the CE mnemonic to the terminal (write it down OFFLINE). Add
+    /// `--out <file>` to also write an encrypted keystore (you will be prompted for a passphrase).
+    Backup {
+        /// Print the 33-word CE mnemonic to the terminal (default true if no --out is given).
+        #[arg(long)]
+        mnemonic: bool,
+        /// Also write an encrypted keystore JSON to this path (prompts for a passphrase).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Restore node.key from a mnemonic or an encrypted keystore file.
+    ///
+    /// Refuses to overwrite an existing node.key unless --force (it shows the current node id first
+    /// so you don't silently destroy a funded identity).
+    Restore {
+        /// Restore from a 33-word CE mnemonic (you will be prompted to type it).
+        #[arg(long)]
+        mnemonic: bool,
+        /// Restore from an encrypted keystore JSON written by `ce key backup --out`.
+        #[arg(long, value_name = "FILE")]
+        r#in: Option<PathBuf>,
+        /// Overwrite an existing node.key (destroys the current identity — be sure).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print this node's id and a short fingerprint (verify a backup without exposing the secret).
+    Fingerprint,
 }
 
 #[derive(Subcommand)]
@@ -476,6 +568,14 @@ fn api_client(token: &str) -> reqwest::Client {
         .default_headers(headers)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Build a [`ce_rs::Wallet`] over the local node's HTTP API, authenticated with the node's
+/// `api.token`. Used by the credit-wallet CLI subtree (`ce wallet balance|history|send|watch`).
+fn ce_wallet(token: &str, api_port: u16) -> ce_rs::Wallet {
+    let base = format!("http://127.0.0.1:{api_port}");
+    let tok = (!token.is_empty()).then(|| token.to_string());
+    ce_rs::CeClient::with_token(base, tok).wallet()
 }
 
 // ----- Capability wallet -----
@@ -850,7 +950,232 @@ async fn main() -> Result<()> {
             println!("libp2p id  : {peer_id}");
         }
 
+        Commands::Key { command } => {
+            let identity_dir = data_dir.join("identity");
+            match command {
+                KeyCommands::Backup { mnemonic, out } => {
+                    keybackup::require_tty()?;
+                    keybackup::print_banner("BACKUP");
+                    // Load the existing identity (or generate one if this is a fresh node).
+                    let identity = Identity::load_or_generate(&identity_dir)?;
+                    let seed = identity.secret_bytes();
+                    let node_id_hex = identity.node_id_hex();
+                    println!("node id : {node_id_hex}");
+
+                    // Default to printing the mnemonic when no keystore output was requested.
+                    let want_mnemonic = mnemonic || out.is_none();
+                    if want_mnemonic {
+                        if !keybackup::confirm(
+                            "Display the secret mnemonic on this terminal now?",
+                        )? {
+                            println!("Aborted — no mnemonic shown.");
+                        } else {
+                            let phrase = keybackup::seed_to_mnemonic(&seed);
+                            println!();
+                            println!("--- BEGIN CE MNEMONIC (33 words — write down OFFLINE) ---");
+                            println!("{phrase}");
+                            println!("--- END CE MNEMONIC ---");
+                            println!();
+                            println!(
+                                "Note: this is a CE-specific mnemonic — it re-imports only into \
+                                 `ce key restore`, not other wallets."
+                            );
+                        }
+                    }
+
+                    if let Some(path) = out {
+                        let pass = keybackup::prompt_passphrase("Choose a keystore passphrase")?;
+                        let confirm = keybackup::prompt_passphrase("Confirm passphrase")?;
+                        if pass != confirm {
+                            return Err(anyhow!("passphrases do not match — aborting"));
+                        }
+                        let ks = keybackup::encrypt_keystore(&seed, &node_id_hex, &pass)?;
+                        let json = serde_json::to_string_pretty(&ks)?;
+                        std::fs::write(&path, json)?;
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                        }
+                        println!("Encrypted keystore written to {}", path.display());
+                    }
+                }
+
+                KeyCommands::Restore { mnemonic, r#in, force } => {
+                    keybackup::require_tty()?;
+                    keybackup::print_banner("RESTORE");
+                    // Warn loudly if we are about to clobber a funded identity.
+                    let key_path = identity_dir.join("node.key");
+                    if key_path.exists() {
+                        let current = Identity::load_or_generate(&identity_dir)?;
+                        println!("current node id : {}", current.node_id_hex());
+                        if !force {
+                            return Err(anyhow!(
+                                "{} already exists — re-run with --force to overwrite the current \
+                                 identity (this destroys it)",
+                                key_path.display()
+                            ));
+                        }
+                        if !keybackup::confirm(
+                            "OVERWRITE the current identity above? This is irreversible.",
+                        )? {
+                            println!("Aborted — identity unchanged.");
+                            return Ok(());
+                        }
+                    }
+
+                    let seed = if let Some(path) = r#in {
+                        let json = std::fs::read_to_string(&path)?;
+                        let ks: keybackup::Keystore = serde_json::from_str(&json)
+                            .map_err(|_| anyhow!("not a valid CE keystore file"))?;
+                        println!("keystore node id : {}", ks.node_id);
+                        let pass = keybackup::prompt_passphrase("Keystore passphrase")?;
+                        keybackup::decrypt_keystore(&ks, &pass)?
+                    } else if mnemonic {
+                        let phrase = keybackup::prompt_passphrase(
+                            "Type the 33-word CE mnemonic (space-separated)",
+                        )?;
+                        keybackup::mnemonic_to_seed(&phrase)?
+                    } else {
+                        return Err(anyhow!(
+                            "specify a source: --mnemonic or --in <keystore-file>"
+                        ));
+                    };
+
+                    keybackup::write_node_key(&identity_dir, &seed, force)?;
+                    let restored = Identity::load_or_generate(&identity_dir)?;
+                    println!("Restored identity. node id : {}", restored.node_id_hex());
+                }
+
+                KeyCommands::Fingerprint => {
+                    let identity = Identity::load_or_generate(&identity_dir)?;
+                    let id_hex = identity.node_id_hex();
+                    println!("node id     : {id_hex}");
+                    // Short fingerprint: first 4 / last 4 of the node id, for at-a-glance verification.
+                    println!("fingerprint : {}…{}", &id_hex[..8], &id_hex[id_hex.len() - 8..]);
+                }
+            }
+        }
+
         Commands::Wallet { command } => match command {
+            // ----- credit wallet -----
+            WalletCommands::Balance { api_port } => {
+                let wallet = ce_wallet(&api_token, api_port);
+                let b = wallet
+                    .balance()
+                    .await
+                    .map_err(|e| anyhow!("could not read balance (is `ce start` running?): {e}"))?;
+                // total / free / locked(channels) / locked(bond) / bond — all from /status.
+                println!("total  : {} credits", format_credits(b.total.base()));
+                println!("free   : {} credits", format_credits(b.free.base()));
+                println!(
+                    "locked : {} credits  (channels {} · bond {})",
+                    format_credits(b.locked_channels.base() + b.locked_bond.base()),
+                    format_credits(b.locked_channels.base()),
+                    format_credits(b.locked_bond.base()),
+                );
+                println!("bond   : {} credits", format_credits(b.bond.base()));
+            }
+            WalletCommands::History { node, limit, before, api_port } => {
+                // Default to this node's own id (loaded locally — no API round-trip needed).
+                let node_id = match node {
+                    Some(n) => n,
+                    None => {
+                        let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
+                        identity.node_id_hex()
+                    }
+                };
+                let wallet = ce_wallet(&api_token, api_port);
+                let q = ce_rs::TxQuery { limit: Some(limit), before_height: before };
+                let txs = wallet
+                    .transactions(&node_id, q)
+                    .await
+                    .map_err(|e| anyhow!("could not read history (is `ce start` running?): {e}"))?;
+                if txs.is_empty() {
+                    println!("No transactions found for {}.", &node_id[..node_id.len().min(16)]);
+                } else {
+                    println!("{:>8}  {:<14}  {:<4}  {:>16}  counterparty", "HEIGHT", "KIND", "DIR", "AMOUNT");
+                    for t in &txs {
+                        let dir = match t.direction {
+                            ce_rs::Direction::In => "in",
+                            ce_rs::Direction::Out => "out",
+                            ce_rs::Direction::SelfTx => "self",
+                        };
+                        let cp = t
+                            .counterparty
+                            .as_deref()
+                            .map(|c| c[..c.len().min(16)].to_string())
+                            .unwrap_or_else(|| "—".to_string());
+                        let amt = if t.amount.is_zero() {
+                            "—".to_string()
+                        } else {
+                            format_credits(t.amount.base())
+                        };
+                        println!("{:>8}  {:<14}  {dir:<4}  {amt:>16}  {cp}", t.height, t.kind);
+                    }
+                    // Pagination hint: oldest height returned is the cursor for the next page.
+                    if let Some(oldest) = txs.last().filter(|_| txs.len() as u32 >= limit) {
+                        println!(
+                            "\nLoad older: ce wallet history --node {node_id} --before {} --limit {limit}",
+                            oldest.height
+                        );
+                    }
+                }
+            }
+            WalletCommands::Send { to, amount, api_port } => {
+                if to.len() != 64 || !to.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(anyhow!("recipient node id must be 64 hex chars"));
+                }
+                let amt = ce_rs::Amount::from_base(parse_credits(&amount)? as i128);
+                let wallet = ce_wallet(&api_token, api_port);
+                let tx_id = wallet
+                    .transfer(&to, amt)
+                    .await
+                    .map_err(|e| anyhow!("transfer failed: {e}"))?;
+                println!("Sent {amount} credits to {}.", &to[..16]);
+                println!("tx_id: {tx_id}");
+            }
+            WalletCommands::Watch { api_port } => {
+                use futures_util::StreamExt;
+                let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
+                let self_id = identity.node_id_hex();
+                let wallet = ce_wallet(&api_token, api_port);
+                let stream = wallet
+                    .transactions_stream(&self_id)
+                    .await
+                    .map_err(|e| anyhow!("could not open tx stream (is `ce start` running?): {e}"))?;
+                let mut stream = std::pin::pin!(stream);
+                println!("Watching credit transactions for {} … (Ctrl-C to stop)", &self_id[..16]);
+                println!("{:<14}  {:<4}  {:>16}  counterparty", "KIND", "DIR", "AMOUNT");
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(t) => {
+                            let dir = match t.direction {
+                                ce_rs::Direction::In => "in",
+                                ce_rs::Direction::Out => "out",
+                                ce_rs::Direction::SelfTx => "self",
+                            };
+                            let cp = t
+                                .counterparty
+                                .as_deref()
+                                .map(|c| c[..c.len().min(16)].to_string())
+                                .unwrap_or_else(|| "—".to_string());
+                            let amt = if t.amount.is_zero() {
+                                "—".to_string()
+                            } else {
+                                format_credits(t.amount.base())
+                            };
+                            println!("{:<14}  {dir:<4}  {amt:>16}  {cp}", t.kind);
+                        }
+                        Err(e) => {
+                            eprintln!("stream error: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // ----- capability wallet -----
             WalletCommands::Add { alias, node_id, cap } => {
                 if node_id.len() != 64 || !node_id.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err(anyhow!("node_id must be 64 hex chars"));
