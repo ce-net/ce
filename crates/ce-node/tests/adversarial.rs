@@ -394,3 +394,158 @@ async fn attack_job_bid_zero_balance() {
 
     assert_eq!(resp.status(), 402, "bid with zero balance must return 402");
 }
+
+// ---------------------------------------------------------------------------
+// HTTP API failure injection: a hostile or buggy client sends malformed input.
+// The node must answer with a clean, specific HTTP status — never panic, never
+// leak, never enqueue/escrow anything. One non-mining ephemeral node, no Docker.
+// ---------------------------------------------------------------------------
+
+/// Start one non-mining, isolated node and return (api_port, keep-alive node handle).
+async fn lone_node(label: &str) -> (u16, Node) {
+    let (p2p, api, _) = alloc_ports();
+    let node = Node::start(NodeConfig {
+        listen_port: p2p,
+        bootstrap_peers: vec![],
+        data_dir: tmpdir(label),
+        api_port: api,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(400)).await;
+    (api, node)
+}
+
+/// A mutating request with NO bearer token is rejected with 401 — auth is enforced before any work.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_rejects_missing_auth_token() {
+    let (api, _node) = lone_node("noauth").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api}/transfer")) // no bearer_auth
+        .json(&serde_json::json!({ "to": hex::encode([1u8; 32]), "amount": "1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "missing API token must be 401");
+}
+
+/// A mutating request with the WRONG bearer token is rejected with 401.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_rejects_wrong_auth_token() {
+    let (api, _node) = lone_node("wrongauth").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api}/transfer"))
+        .bearer_auth("not-the-real-token")
+        .json(&serde_json::json!({ "to": hex::encode([1u8; 32]), "amount": "1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "wrong API token must be 401");
+}
+
+/// A `/mesh-deploy` carrying a malformed capability grant token is rejected with 400 BEFORE any
+/// mesh RPC is attempted — the capability decoder degrades garbage to a clean error, not a panic.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_rejects_malformed_capability_grant() {
+    let (api, _node) = lone_node("badcap").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api}/mesh-deploy"))
+        .bearer_auth(TEST_API_TOKEN)
+        .json(&serde_json::json!({
+            "node_id": hex::encode([2u8; 32]),
+            "image": "alpine:latest",
+            "cpu_cores": 1,
+            "mem_mb": 64,
+            "duration_secs": 10,
+            "bid": "1",
+            "grant": "zz-not-valid-hex-or-bincode-@@"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "malformed capability grant must be 400");
+}
+
+/// A `/mesh-deploy` with a `node_id` that isn't 64 hex chars is rejected with 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_rejects_bad_node_id() {
+    let (api, _node) = lone_node("badnode").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api}/mesh-deploy"))
+        .bearer_auth(TEST_API_TOKEN)
+        .json(&serde_json::json!({
+            "node_id": "deadbeef", // too short
+            "image": "alpine:latest",
+            "cpu_cores": 1,
+            "mem_mb": 64,
+            "duration_secs": 10,
+            "bid": "1"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "non-64-hex node_id must be 400");
+}
+
+/// Querying a job id that was never created returns 404 — not a 500, not a panic.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_unknown_job_is_404() {
+    let (api, _node) = lone_node("nojob").await;
+    let resp = reqwest::get(format!("http://127.0.0.1:{api}/jobs/{}", hex::encode([0xab; 32])))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown job must be 404");
+}
+
+/// Resolving a name that was never claimed returns 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_unknown_name_is_404() {
+    let (api, _node) = lone_node("noname").await;
+    let resp = reqwest::get(format!("http://127.0.0.1:{api}/names/never-claimed-xyz"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown name must be 404");
+}
+
+/// A `/transfer` body with a non-numeric amount string is rejected (400/422), not silently coerced.
+/// Money never travels as a JSON number, so a malformed decimal string must be refused cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_rejects_non_numeric_amount() {
+    let (api, _node) = lone_node("badamt").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api}/transfer"))
+        .bearer_auth(TEST_API_TOKEN)
+        .json(&serde_json::json!({ "to": hex::encode([1u8; 32]), "amount": "not-a-number" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "non-numeric amount must be a 4xx client error, got {}",
+        resp.status(),
+    );
+}
+
+/// Settling an unknown job via the HTTP API returns 404 — a stranger cannot poke settlement state
+/// for a job that does not exist.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_settle_unknown_job_is_404() {
+    let (api, _node) = lone_node("settle404").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api}/jobs/{}/settle", hex::encode([0x11; 32])))
+        .bearer_auth(TEST_API_TOKEN)
+        .json(&serde_json::json!({ "cost": "1", "payer_sig": hex::encode([0u8; 64]) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "settling an unknown job must be 404");
+}

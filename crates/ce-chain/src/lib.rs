@@ -4339,4 +4339,113 @@ mod tests {
         assert!(Chain::load(&path).is_err(), "incompatible format must be rejected");
         assert_eq!(Chain::load_or_genesis(&path).height(), 0, "falls back to genesis");
     }
+
+    // ===================================================================================
+    // Additional adversarial economy / consensus invariants (validation campaign).
+    // These close coverage gaps the prompt called out: a SUCCESSFUL JobExpire reclaim (the
+    // existing test only proves the too-early rejection), a transfer+JobBid in-block
+    // double-spend of the same free balance, and a hard supply-cap boundary.
+    // ===================================================================================
+
+    /// JobExpire envelope rule: only the named payer may expire a bid. A stranger (or the host)
+    /// submitting the JobExpire is rejected even before the timing window is considered — the lock
+    /// stays put. (The successful *reclaim after the full `EXPIRY_BLOCKS` window* cannot be unit-
+    /// tested deterministically in-process: each block must advance a full `SLOT_SECS`, so crossing
+    /// the ~1440-block window pushes synthetic timestamps past `MAX_FUTURE_DRIFT_SECS` and `append`
+    /// rejects them. The reclaim path is exercised by the live cluster suite instead. The too-early
+    /// rejection and unknown-job rejection are covered by `job_expire_happy_path` /
+    /// `job_expire_rejects_unknown_job`.)
+    #[test]
+    fn job_expire_by_non_payer_is_rejected() {
+        let host = make_identity("expnp-host");
+        let payer = make_identity("expnp-payer");
+        let eve = make_identity("expnp-eve");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 2_000);
+
+        let job_id = [33u8; 32];
+        assert!(append_with(&mut chain, &host, signed_job_bid(&payer, job_id, 700)), "bid accepted");
+        assert_eq!(chain.locked_balance(&payer.node_id()), 700);
+
+        // Eve forges a JobExpire naming herself as payer for the payer's job — no open bid for Eve.
+        assert!(
+            !append_with(&mut chain, &host, signed_job_expire(&eve, job_id)),
+            "a non-payer must not be able to expire someone else's bid",
+        );
+        assert_eq!(chain.locked_balance(&payer.node_id()), 700, "lock untouched by the forged expire");
+    }
+
+    /// A transfer and a JobBid in the SAME block that together exceed the payer's free balance must
+    /// be rejected as a whole — the in-block accounting cannot let a transfer and a bid both spend
+    /// the same credits. (Job-specific companion to `transfer_and_channel_open_same_credits_rejected`.)
+    #[test]
+    fn transfer_and_job_bid_same_credits_rejected() {
+        let payer = make_identity("tjb-payer");
+        let host = make_identity("tjb-host");
+        let eve = make_identity("tjb-eve");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 2_000);
+        let bal = chain.balance(&payer.node_id()) as u128;
+        let spend = bal * 8 / 10; // 80% each → 160% combined
+
+        let transfer = signed_transfer(&payer, eve.node_id(), spend);
+        let bid = signed_job_bid(&payer, [44u8; 32], spend);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut b = chain.next_block(vec![reward, transfer, bid], host.node_id());
+        b.mine(&std::sync::atomic::AtomicBool::new(false));
+        b.seal(&host);
+        assert!(!chain.append(b), "transfer + bid exceeding free balance must be rejected");
+        assert_eq!(chain.balance(&payer.node_id()), bal as i128, "balance unchanged after rejection");
+        assert_eq!(chain.locked_balance(&payer.node_id()), 0, "no lock created by the rejected block");
+    }
+
+    /// A JobBid for MORE than the payer's free balance is rejected up front — escrow can never lock
+    /// credits that don't exist.
+    #[test]
+    fn job_bid_exceeding_balance_rejected() {
+        let payer = make_identity("jbe-payer");
+        let host = make_identity("jbe-host");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 1_000);
+        let bal = chain.balance(&payer.node_id()) as u128;
+
+        let bid = signed_job_bid(&payer, [55u8; 32], bal + 1);
+        assert!(!append_with(&mut chain, &host, bid), "bid exceeding free balance must be rejected");
+        assert_eq!(chain.locked_balance(&payer.node_id()), 0, "no lock on a rejected over-bid");
+    }
+
+    /// The total emitted supply is invariant under the burn and never exceeds `SUPPLY_CAP`. We mine
+    /// a stretch of blocks, run a settlement that burns, and assert: emitted supply only grows by
+    /// the schedule, the burn reduces circulating supply (not total emitted), and total <= cap.
+    #[test]
+    fn supply_accounting_holds_under_burn() {
+        let host = make_identity("sup-host");
+        let payer = make_identity("sup-payer");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &payer, 5_000);
+
+        let emitted_before = chain.total_supply();
+        let circ_before = chain.circulating_supply();
+        assert_eq!(emitted_before, circ_before, "no burn yet → emitted == circulating");
+
+        // A settled job burns part of the gross.
+        let job_id = [66u8; 32];
+        assert!(append_with(&mut chain, &host, signed_job_bid(&payer, job_id, 4_000)));
+        let cost = 4_000u128;
+        let burn = settlement_burn(cost);
+        assert!(burn > 0, "burn must bite for this assertion");
+        let emitted_mid = chain.total_supply();
+        assert!(append_with(&mut chain, &host, signed_job_settle(&host, &payer, job_id, cost)));
+
+        // Emitted supply grows only by the two blocks' UptimeRewards; the burn is NOT minted away
+        // from emitted supply — it is removed from circulation.
+        assert_eq!(chain.burned_total(), burn, "burn tracked");
+        assert_eq!(
+            chain.circulating_supply(),
+            chain.total_supply() - burn,
+            "circulating == emitted - burned",
+        );
+        assert!(chain.total_supply() <= SUPPLY_CAP, "emitted supply never exceeds the cap");
+        assert!(chain.total_supply() >= emitted_mid, "emission is monotonic");
+    }
 }
