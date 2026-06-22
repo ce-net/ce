@@ -989,6 +989,16 @@ async fn name_claim_resolves_after_mining() {
     let id = host_node_id(&dir);
 
     let client = reqwest::Client::new();
+    // Wait for the HTTP API to be listening before hitting it — on loaded CI runners the server
+    // may not accept connections the instant Node::start returns. (Was flaky: see task #27.)
+    for _ in 0..50 {
+        if let Ok(resp) = client.get(format!("http://127.0.0.1:{api}/health")).send().await {
+            if resp.status().is_success() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
     let r = client
         .post(format!("http://127.0.0.1:{api}/names/claim")).bearer_auth(TEST_API_TOKEN)
         .json(&serde_json::json!({ "name": "my-node" }))
@@ -1009,7 +1019,10 @@ async fn name_claim_resolves_after_mining() {
     let mut resolved = None;
     for _ in 0..20 {
         sleep(Duration::from_millis(700)).await;
-        let r = reqwest::get(format!("http://127.0.0.1:{api}/names/my-node")).await.unwrap();
+        let r = match reqwest::get(format!("http://127.0.0.1:{api}/names/my-node")).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
         if r.status() == 200 {
             let v: serde_json::Value = r.json().await.unwrap();
             resolved = v["node_id"].as_str().map(|s| s.to_string());
