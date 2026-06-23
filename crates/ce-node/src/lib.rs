@@ -56,6 +56,23 @@ pub struct PeerCapacity {
 /// Atlas: maps NodeId → latest capacity snapshot. Updated from incoming CEP-1 capacity signals.
 pub(crate) type Atlas = Arc<Mutex<HashMap<NodeId, PeerCapacity>>>;
 
+/// A smoothed round-trip-time edge to one peer — the ground-truth edges of the network graph
+/// (see `docs/compute-fabric.md`). Higher layers (the `ce-graph` SDK) build Vivaldi coordinates and
+/// topology on top; the node only carries this transport-intrinsic measurement.
+#[derive(Debug, Clone, Serialize)]
+pub struct RttStat {
+    /// Smoothed round-trip time in milliseconds (EWMA over samples).
+    pub rtt_ms: f64,
+    /// Number of samples folded into the estimate.
+    pub samples: u64,
+    /// Unix seconds of the most recent sample.
+    pub last_seen_secs: u64,
+}
+
+/// NetGraph: maps a connected peer (libp2p PeerId, hex string) → its latest smoothed RTT. The thin,
+/// transport-intrinsic latency primitive; coordinate embedding and graph assembly live in apps/SDK.
+pub(crate) type NetGraph = Arc<Mutex<HashMap<String, RttStat>>>;
+
 fn push_signal(ring: &mut VecDeque<CellSignal>, sig: CellSignal) {
     if ring.len() >= SIGNAL_RING_CAPACITY {
         ring.pop_front();
@@ -326,6 +343,7 @@ impl Node {
         let send_nonce = Arc::new(AtomicU64::new(0));
         let job_store: JobStore = Arc::new(Mutex::new(HashMap::new()));
         let atlas: Atlas = Arc::new(Mutex::new(HashMap::new()));
+        let netgraph: NetGraph = Arc::new(Mutex::new(HashMap::new()));
 
         let (bid_notify_tx, bid_notify_rx) = mpsc::channel::<Tx>(64);
         let (settle_notify_tx, settle_notify_rx) = mpsc::channel::<()>(16);
@@ -412,6 +430,7 @@ impl Node {
             let block_tx3 = block_tx.clone();
             let tx_tx3 = tx_tx.clone();
             let atlas2 = atlas.clone();
+            let netgraph2 = netgraph.clone();
             let data_dir2 = node.config.data_dir.clone();
             let docker2 = docker.clone();
             let prune_keep = node.config.prune_keep;
@@ -442,6 +461,7 @@ impl Node {
                     tx_tx3,
                     bid_notify_tx,
                     atlas2,
+                    netgraph2,
                     data_dir2,
                     docker2,
                     prune_keep,
@@ -526,6 +546,7 @@ impl Node {
             let pool2 = pool.clone();
             let data_dir2 = node.config.data_dir.clone();
             let atlas3 = atlas.clone();
+            let netgraph3 = netgraph.clone();
             let docker3 = docker.clone();
             let tunnel_control2 = tunnel_control.clone();
             let tls_seed = if node.config.tls { Some(identity.secret_bytes()) } else { None };
@@ -547,6 +568,7 @@ impl Node {
                     settle_notify_tx,
                     data_dir2,
                     atlas3,
+                    netgraph3,
                     docker3,
                     tls_seed,
                     app_inbox,
@@ -840,6 +862,7 @@ async fn mesh_event_loop(
     tx_tx: broadcast::Sender<Tx>,
     bid_notify_tx: mpsc::Sender<Tx>,
     atlas: Atlas,
+    netgraph: NetGraph,
     data_dir: PathBuf,
     docker: Option<Docker>,
     prune_keep: Option<u64>,
@@ -1145,6 +1168,19 @@ async fn mesh_event_loop(
                 }
             }
             MeshEvent::PeerDisconnected(peer) => info!("peer disconnected: {peer}"),
+            MeshEvent::Rtt { peer, rtt_ms } => {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                let mut g = netgraph.lock().await;
+                let e = g.entry(peer.to_string()).or_insert(RttStat {
+                    rtt_ms,
+                    samples: 0,
+                    last_seen_secs: now,
+                });
+                // EWMA (alpha = 0.2); the first sample seeds the estimate directly.
+                e.rtt_ms = if e.samples == 0 { rtt_ms } else { e.rtt_ms * 0.8 + rtt_ms * 0.2 };
+                e.samples += 1;
+                e.last_seen_secs = now;
+            }
             MeshEvent::IncomingRpc { from_peer, correlation_id, request } => {
                 if let RpcRequest::SegmentFetch { segment_id, .. } = &request {
                     let seg_id = *segment_id;

@@ -8,7 +8,7 @@ use libp2p::{
     autonat, dcutr,
     futures::StreamExt,
     gossipsub, identify, kad, mdns,
-    noise, relay, request_response,
+    noise, ping, relay, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
 };
@@ -18,6 +18,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+
+/// Vivaldi network coordinates — predicted RTT between any two nodes without an O(n^2) probe matrix.
+/// Pure + transport-free; the node updates the local coordinate from measured ping RTTs and carries
+/// it in the atlas so the `ce-graph` SDK can assemble global topology. See `docs/compute-fabric.md`.
+pub mod vivaldi;
 
 pub use ce_identity::NodeId as CeNodeId;
 pub use libp2p::PeerId as CePeerId;
@@ -356,6 +361,9 @@ pub enum MeshEvent {
     NewBlock(Block),
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
+    /// A round-trip-time sample to a connected peer, in milliseconds. The ground-truth edge of the
+    /// network graph; the node accumulates these per peer (see `docs/compute-fabric.md`).
+    Rtt { peer: PeerId, rtt_ms: f64 },
     PeerHeight { node_id: NodeId, height: u64, tip_hash: [u8; 32], oldest_block: u64 },
     /// A peer broadcast their archive segment manifest.
     PeerSegments { node_id: NodeId, held_segments: Vec<u64> },
@@ -398,6 +406,9 @@ struct CeBehaviour {
     mdns: mdns::tokio::Behaviour,
     autonat: autonat::Behaviour,
     dcutr: dcutr::Behaviour,
+    /// Periodic RTT probes to connected peers — the ground-truth edges of the network graph
+    /// (see `docs/compute-fabric.md`). RTT samples are forwarded to the node as [`MeshEvent::Rtt`].
+    ping: ping::Behaviour,
     relay_client: relay::client::Behaviour,
     relay_server: relay::Behaviour,
     /// /ce/rpc/1 — device-to-device exec and file sync, relay-routed.
@@ -656,6 +667,7 @@ impl Mesh {
                 let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
                 let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
                 let dcutr = dcutr::Behaviour::new(peer_id);
+                let ping = ping::Behaviour::new(ping::Config::new());
 
                 // /ce/rpc/1 — exec and sync between trusted devices.
                 // 10-minute timeout: exec may run a full cargo build or similar long task.
@@ -674,6 +686,7 @@ impl Mesh {
                     mdns,
                     autonat,
                     dcutr,
+                    ping,
                     relay_client,
                     relay_server: relay::Behaviour::new(peer_id, relay::Config::default()),
                     rpc,
@@ -1047,6 +1060,11 @@ fn decode_swarm_event(
         )) => {
             debug!("kademlia routing updated: {peer}");
             None
+        }
+        SwarmEvent::Behaviour(CeBehaviourEvent::Ping(
+            ping::Event { peer, result: Ok(rtt), .. },
+        )) => {
+            Some(MeshEvent::Rtt { peer, rtt_ms: rtt.as_secs_f64() * 1000.0 })
         }
         SwarmEvent::Behaviour(CeBehaviourEvent::RelayClient(ev)) => {
             debug!("relay client: {ev:?}");

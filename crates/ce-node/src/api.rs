@@ -28,8 +28,8 @@ use std::{
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
-    AppInbox, AppMessage, Atlas, CeJobStatus, ChainHandle, JobRecord, JobStore, PeerCapacity,
-    SignalRing, TxPool,
+    AppInbox, AppMessage, Atlas, CeJobStatus, ChainHandle, JobRecord, JobStore, NetGraph,
+    PeerCapacity, RttStat, SignalRing, TxPool,
 };
 
 /// Per-sender last-accepted timestamp (ms). Used to enforce strictly increasing
@@ -62,6 +62,8 @@ struct ApiState {
     data_dir: PathBuf,
     /// Peer capacity atlas updated by incoming capacity signals.
     atlas: Atlas,
+    /// Per-peer round-trip latency, the ground-truth edges of the network graph.
+    netgraph: NetGraph,
     /// libp2p listen port — used by GET /bootstrap to build multiaddrs.
     listen_port: u16,
     /// Stream control for opening outbound TCP tunnels over the mesh.
@@ -1187,6 +1189,28 @@ async fn get_atlas(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, Json(entries)).into_response()
 }
 
+// ----- GET /netgraph -----
+//
+// Raw latency edges measured from this node to its connected peers (libp2p ping RTT, smoothed).
+// The foundational network-graph primitive (see `docs/compute-fabric.md`); the `ce-graph` SDK
+// assembles Vivaldi coordinates and global topology on top of these per-node snapshots.
+
+#[derive(Debug, Serialize)]
+struct NetGraphEntry {
+    peer: String,
+    #[serde(flatten)]
+    rtt: RttStat,
+}
+
+async fn get_netgraph(State(state): State<ApiState>) -> Response {
+    let map = state.netgraph.lock().await;
+    let edges: Vec<NetGraphEntry> = map
+        .iter()
+        .map(|(peer, rtt)| NetGraphEntry { peer: peer.clone(), rtt: rtt.clone() })
+        .collect();
+    (StatusCode::OK, Json(edges)).into_response()
+}
+
 // ----- GET /beacon -----
 //
 // Verifiable public randomness from the PoW chain: the tip block hash is unpredictable
@@ -1976,6 +2000,7 @@ pub async fn start(
     settle_notify_tx: mpsc::Sender<()>,
     data_dir: PathBuf,
     atlas: Atlas,
+    netgraph: NetGraph,
     docker: Option<Docker>,
     // When set, serve the API over TLS with a cert keyed by this Ed25519 seed (the node
     // identity). Clients pin the cert against the node's NodeId. None = plain HTTP.
@@ -2008,6 +2033,7 @@ pub async fn start(
         settle_notify_tx,
         data_dir,
         atlas,
+        netgraph,
         listen_port,
         tunnel_control,
     };
@@ -2032,6 +2058,7 @@ pub async fn start(
         .route("/health", get(|| async { "ok" }))
         .route("/bootstrap", get(get_bootstrap))
         .route("/atlas", get(get_atlas))
+        .route("/netgraph", get(get_netgraph))
         .route("/beacon", get(get_beacon))
         .route("/history/:node_id", get(get_history))
         .route("/transactions/:node_id", get(get_transactions))

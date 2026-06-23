@@ -1,0 +1,16 @@
+[package]
+name = "ce-guard"
+version = "0.1.0"
+edition = "2024"
+description = "Content-free pre-execution screening seam: the Guardian trait, verdict, and request types. No AI, no policy, no category vocabulary — the brain lives in the ce-guardian app."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+ce-identity = { path = "../ce-identity" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+serde_json = "1"

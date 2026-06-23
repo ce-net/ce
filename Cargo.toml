@@ -4,6 +4,7 @@ members = [
     "crates/ce-cap",
     "crates/ce-tls",
     "crates/ce-runtime",
+    "crates/ce-guard",
     "crates/ce-wasm",
     "crates/ce-chain",
     "crates/ce-mesh",

@@ -50,6 +50,15 @@ impl Identity {
     pub fn secret_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
     }
+
+    /// Construct an identity directly from 32 raw secret-key bytes — no filesystem, no RNG.
+    /// Deterministic: the same seed always yields the same node id. Used by browser/mobile clients
+    /// and by golden-vector generation where the key must be fixed and reproducible.
+    pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(secret);
+        let verifying_key = signing_key.verifying_key();
+        Self { signing_key, verifying_key }
+    }
 }
 
 pub fn verify(node_id: &NodeId, data: &[u8], sig: &[u8; 64]) -> Result<()> {
