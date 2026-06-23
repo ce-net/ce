@@ -15,8 +15,7 @@ class Ce < Formula
       url "https://github.com/ce-net/ce/releases/download/v#{version}/ce-macos-arm64.tar.gz"
       sha256 "PLACEHOLDER_MACOS_ARM64"
     else
-      url "https://github.com/ce-net/ce/releases/download/v#{version}/ce-macos-amd64.tar.gz"
-      sha256 "PLACEHOLDER_MACOS_AMD64"
+      odie "ce ships no Intel-Mac binary. Build from source (cargo build --release) or run: curl -sSL https://ce-net.com/install.sh | bash"
     end
   end
 
