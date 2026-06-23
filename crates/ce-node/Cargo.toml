@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ce-identity = { path = "../ce-identity" }
 ce-cap = { path = "../ce-cap" }
+ce-guard = { path = "../ce-guard" }
 ce-chain = { path = "../ce-chain" }
 ce-mesh = { path = "../ce-mesh" }
 ce-container = { path = "../ce-container" }

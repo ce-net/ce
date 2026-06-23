@@ -309,6 +309,12 @@ impl Node {
             Err(e) => warn!("wasm runtime init: {e}"),
         }
 
+        // Pre-execution screening seam (ce-guard). No ce-guardian app is wired yet, so default to a
+        // logged pass-through: deploys keep working and the chokepoint is in place. A production node
+        // configures a real screener (the fail-closed DenyAllGuardian is the conservative default).
+        let guardian: Arc<dyn ce_guard::Guardian> = Arc::new(ce_guard::AllowAllGuardian);
+        warn!("guardian: no screener configured — passing all workloads (wire the ce-guardian app)");
+
         // Capability self-tags, computed once and shared by the capacity broadcast (what we
         // advertise) and both auth enforcement points (what grant selectors match against),
         // so the advertised set and the enforced set can never diverge.
@@ -441,6 +447,7 @@ impl Node {
             let accepted_roots2 = load_accepted_roots(&node.config.data_dir);
             let job_store_m = job_store.clone();
             let runtimes_m = runtimes.clone();
+            let guardian_m = guardian.clone();
             let data_price = node.config.data_price_per_byte;
             let data_served: DataServedLedger = Arc::new(Mutex::new(HashMap::new()));
             let app_inbox2 = app_inbox.clone();
@@ -472,6 +479,7 @@ impl Node {
                     accepted_roots2,
                     job_store_m,
                     runtimes_m,
+                    guardian_m,
                     data_price,
                     data_served,
                     app_inbox2,
@@ -873,6 +881,7 @@ async fn mesh_event_loop(
     accepted_roots: Vec<NodeId>,
     job_store: JobStore,
     runtimes: Vec<Arc<dyn Runtime>>,
+    guardian: Arc<dyn ce_guard::Guardian>,
     data_price_per_byte: u128,
     data_served: DataServedLedger,
     app_inbox: AppInbox,
@@ -1346,6 +1355,7 @@ async fn mesh_event_loop(
                         mesh_handle.clone(),
                         &self_tags,
                         &runtimes,
+                        &guardian,
                         job_store.clone(),
                         our_node_id,
                         chain.clone(),
@@ -1615,6 +1625,7 @@ async fn handle_incoming_rpc(
     mesh_handle: MeshHandle,
     self_tags: &[String],
     runtimes: &[Arc<dyn Runtime>],
+    guardian: &Arc<dyn ce_guard::Guardian>,
     job_store: JobStore,
     host_node_id: NodeId,
     chain: ChainHandle,
@@ -1727,6 +1738,48 @@ async fn handle_incoming_rpc(
                 Sha256::digest(bincode::serialize(&(ts as u64, payer, workload.required_tag())).unwrap_or_default())
                     .into();
             let deps = workload.content_deps();
+
+            // Pre-execution screening (ce-guard): refuse disallowed workloads before anything is
+            // staged or launched. The seam is content-free; banned-category policy lives in the
+            // ce-guardian app. A Deny ends the deploy here.
+            let guard_req = ce_guard::GuardRequest {
+                required_tag: workload.required_tag().to_string(),
+                artifact: match &workload {
+                    ce_runtime::Workload::Docker { image, .. } => {
+                        ce_guard::ArtifactRef::Docker { image: image.clone(), digest: None }
+                    }
+                    ce_runtime::Workload::Wasm { module_hash, .. } => {
+                        ce_guard::ArtifactRef::Wasm { module_hash: *module_hash }
+                    }
+                },
+                cmd_entry_args: match &workload {
+                    ce_runtime::Workload::Docker { cmd, .. } => cmd.clone(),
+                    ce_runtime::Workload::Wasm { entry, args, .. } => {
+                        let mut a = vec![entry.clone()];
+                        a.extend(args.iter().cloned());
+                        a
+                    }
+                },
+                env_keys: match &workload {
+                    ce_runtime::Workload::Docker { env, .. } => {
+                        env.iter().map(|(k, _)| k.clone()).collect()
+                    }
+                    ce_runtime::Workload::Wasm { .. } => vec![],
+                },
+                inputs: deps.clone(),
+                limits: ce_guard::Limits { cpu_cores, mem_mb, gpus: 0 },
+                payer: from_node,
+                job_id,
+                cap_chain: chain_bytes.clone().unwrap_or_default(),
+            };
+            if let ce_guard::GuardVerdict::Deny { reason, categories } =
+                guardian.screen(&guard_req).await
+            {
+                warn!("guardian denied job {}: {reason} {categories:?}", hex::encode(&job_id[..4]));
+                reject(format!("workload denied by guardian: {reason}"));
+                return;
+            }
+
             let stage_dir = data_dir.to_path_buf();
             let host_id = host_node_id;
             tokio::spawn(async move {

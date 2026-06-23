@@ -750,6 +750,7 @@ dependencies = [
  "ce-cap",
  "ce-chain",
  "ce-container",
+ "ce-guard",
  "ce-identity",
  "ce-mesh",
  "ce-protocol",
