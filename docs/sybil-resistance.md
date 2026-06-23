@@ -108,7 +108,7 @@ young-chain defense).
 |---|---------|-----|--------|
 | E1 | Sybil mining reward inflation | medium | partial |
 | E2 | Unverified capacity advertisement | high | disputed |
-| E3 | Unverified heartbeat billing (host fabricates amounts) | high | confirmed |
+| E3 | Unconsented heartbeat drain (host bills a cell with no bid) | high | **FIXED** |
 | E4 | Wash-traded reputation / unverified job work | low | partial |
 | E5 | Off-chain receipt reuse across host restart | medium | confirmed |
 | E6 | Heartbeat drains bid/channel/bond-locked funds (cross-type double-spend) | high | **FIXED** |
@@ -131,14 +131,24 @@ severity (one noted the payer still gates payment via co-signature, bounding los
 placement) — treat as **high** because it poisons scheduling decisions network-wide. Fix:
 bond-and-challenge capacity (see §4.1).
 
-**E3 — Unverified heartbeat billing.** `Heartbeat` carries an `amount` with no proof/metric field
-(`ce-chain/src/lib.rs:223`); validation checks only host signature, monotonic epoch, and cell
-balance (`:978-1010`). A malicious host bills arbitrary amounts up to the cell's free balance
-without any proof a container ran. Confirmed exploitable given a compromised/modified host node.
-The HTTP path is gated (a node only emits heartbeats for locally-`Running` jobs), so the live
-attack needs a modified node or direct mesh access — still in scope for a permissionless mesh.
-Fix: cap heartbeat amount to the on-chain agreed `price_per_interval`, and tie long-running
-billing to the verification dial (§4.2).
+**E3 — Unconsented heartbeat drain (FIXED).** Previously a `Heartbeat` was signed only by the host,
+with no cell co-signature and no on-chain bid linkage; validation checked only host signature,
+monotonic epoch, and cell balance. A malicious/modified host could bill any funded cell up to its
+**entire free balance** with no bid and no proof work ran — a direct credit-theft surface (the old
+`rogue_host_heartbeat_drains_cell_without_bid` test asserted this passed as a "KNOWN LIMITATION").
+
+**Fixed in `ce-chain`:** a `Heartbeat` now carries a `job_id` and is only valid against an OPEN
+`JobBid` whose `payer` equals the billed `cell` — i.e. the cell's own signed bid is the
+authorization. Cumulative heartbeat cost billed against a job is bounded by that bid's locked escrow
+(tracked in a `heartbeat_spent` cache); heartbeats draw the escrow down and the remainder unlocks on
+`JobSettle`/`JobExpire`, and `JobSettle.cost` is likewise bounded by the *remaining* escrow so a job
+cannot be double-charged. **Security property enforced: a host can never bill a cell beyond what that
+cell escrowed via a `JobBid` the payer signed.** The rogue test is flipped to assert rejection
+(regression), plus positive tests (`legit_heartbeat_within_open_bid_settles`,
+`heartbeat_bounded_by_bid_escrow`, `heartbeat_rejects_exceeding_escrow`) confirm legitimate
+long-running billing still settles within escrow. The residual, lower-severity gap is metering
+*accuracy within* a consented budget (over-billing for compute not delivered, up to the bid) — tie
+that to the verification dial (§4.2); it is no longer an unauthorized-billing hole.
 
 **E4 — Wash-traded reputation.** `JobSettle` validates the payer co-signature and `cost <= bid`
 but never verifies the host executed anything (`ce-chain/src/lib.rs:905`). One attacker runs
@@ -156,8 +166,10 @@ jobs.
 subtracted `locked_balance` (or in-block bids/bonds), unlike the transfer/bid/channel paths. A node
 could lock its whole balance in a `JobBid` and still have those same credits drained by a
 `Heartbeat`, leaving a negative free balance and double-spending the locked funds. Fixed in
-`ce-chain` (`apply`/validation): the heartbeat check now subtracts `locked_balance(cell)` plus the
-cell's in-block bids and bonds, with a regression test (`heartbeat_cannot_drain_locked_funds`).
+`ce-chain` (`apply`/validation): the heartbeat check subtracts `locked_balance(cell)` plus the
+cell's in-block bids and bonds. After the E3 fix, heartbeats bill against the bid escrow directly
+(locked, pre-consented funds), so this cross-type drain is doubly closed; the regression test is
+`heartbeat_bounded_by_bid_escrow` (formerly `heartbeat_cannot_drain_locked_funds`).
 
 **E5 — Off-chain receipt reuse across restart.** Payment-channel receipts sign only
 `(channel_id, host, cumulative)` with no per-channel served-state binding

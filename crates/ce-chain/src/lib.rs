@@ -222,10 +222,17 @@ pub enum TxKind {
     /// Job expiry: payer reclaims locked bid credits after EXPIRY_BLOCKS have elapsed
     /// without a matching JobSettle.
     JobExpire { job_id: [u8; 32], payer: NodeId },
-    /// Periodic heartbeat payment for a long-running cell.
-    /// Signed by the host; debits the cell's wallet and credits the host.
-    /// `epoch` must strictly increase per (cell, host) pair to prevent replay.
-    Heartbeat { cell: NodeId, host: NodeId, amount: u128, epoch: u64 },
+    /// Periodic heartbeat payment for a long-running cell. Signed by the host; debits the cell's
+    /// wallet and credits the host (net of the settlement burn). `epoch` must strictly increase per
+    /// (cell, host) pair to prevent replay.
+    ///
+    /// **Bid-gated (E3):** a heartbeat is only valid against an OPEN `JobBid` whose `job_id` it names
+    /// and whose `payer == cell` — i.e. the cell's own signed bid authorized the work. The cumulative
+    /// heartbeat cost billed against a job can NEVER exceed that job's locked bid escrow. This is the
+    /// consent + bound that stops a rogue host from draining a funded cell's free balance with
+    /// unconsented heartbeats. Heartbeats draw the escrow down; the remainder unlocks on
+    /// JobSettle/JobExpire.
+    Heartbeat { job_id: [u8; 32], cell: NodeId, host: NodeId, amount: u128, epoch: u64 },
     /// Open a unidirectional payment channel payer → host. Locks `capacity` base units of the
     /// payer's free balance (like a JobBid lock). Signed by the payer. See docs/payment-channels.md.
     ChannelOpen {
@@ -669,6 +676,12 @@ pub struct Chain {
     #[serde(skip, default)]
     heartbeat_max_epoch: std::collections::HashMap<(NodeId, NodeId), u64>,
 
+    /// Cumulative gross heartbeat cost billed against each open job (job_id → total amount). Bounds
+    /// heartbeats to the job's locked bid escrow (E3): a heartbeat is rejected if it would drive this
+    /// past the bid. The entry is removed when the job's bid is removed (JobSettle / JobExpire).
+    #[serde(skip, default)]
+    heartbeat_spent: std::collections::HashMap<[u8; 32], u128>,
+
     /// tx_id → (block.index, position-in-block-txs): O(1) tx lookup.
     #[serde(skip, default)]
     tx_index: std::collections::HashMap<[u8; 32], (u64, usize)>,
@@ -756,6 +769,7 @@ impl Chain {
             checkpoint: None,
             balances: std::collections::HashMap::new(),
             heartbeat_max_epoch: std::collections::HashMap::new(),
+            heartbeat_spent: std::collections::HashMap::new(),
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
             open_channels: std::collections::HashMap::new(),
@@ -847,6 +861,7 @@ impl Chain {
                     *self.balances.entry(*host).or_insert(0) += net as i128;
                     self.burned_total_cache = self.burned_total_cache.saturating_add(burn);
                     self.open_bids.remove(job_id);
+                    self.heartbeat_spent.remove(job_id);
                     let h = block.index;
                     let (cost, net, host, payer) = (*cost, net, *host, *payer);
                     let s = self.node_stat(&host, h);
@@ -858,13 +873,17 @@ impl Chain {
                     s.jobs_paid += 1;
                     s.spent = s.spent.saturating_add(cost);
                 }
-                TxKind::Heartbeat { cell, host, amount, epoch } => {
+                TxKind::Heartbeat { job_id, cell, host, amount, epoch } => {
                     // Same burn as JobSettle: the cell pays gross `amount`, the host receives the net.
                     let burn = settlement_burn(*amount);
                     let net = (*amount).saturating_sub(burn);
                     *self.balances.entry(*cell).or_insert(0) -= *amount as i128;
                     *self.balances.entry(*host).or_insert(0) += net as i128;
                     self.burned_total_cache = self.burned_total_cache.saturating_add(burn);
+                    // Draw the job's escrow down (E3): append() already verified an open bid for this
+                    // job with payer == cell and that cumulative spend stays within the bid.
+                    *self.heartbeat_spent.entry(*job_id).or_insert(0) =
+                        self.heartbeat_spent.get(job_id).copied().unwrap_or(0).saturating_add(*amount);
                     let e = self.heartbeat_max_epoch.entry((*cell, *host)).or_insert(0);
                     if *epoch >= *e {
                         *e = *epoch;
@@ -883,6 +902,7 @@ impl Chain {
                 }
                 TxKind::JobExpire { job_id, payer } => {
                     self.open_bids.remove(job_id);
+                    self.heartbeat_spent.remove(job_id);
                     let h = block.index;
                     self.node_stat(payer, h).expiries += 1;
                 }
@@ -1324,7 +1344,12 @@ impl Chain {
                 if bid_payer != payer {
                     return false;
                 }
-                if *cost > *bid_amount {
+                // Cost is bounded by the REMAINING escrow: the bid minus whatever heartbeats already
+                // billed against this job (E3). Without this, a host could heartbeat-drain a job to its
+                // bid AND still settle for the full bid — double-charging the payer.
+                let spent = self.heartbeat_spent.get(job_id).copied().unwrap_or(0);
+                let remaining = bid_amount.saturating_sub(spent);
+                if *cost > remaining {
                     return false;
                 }
                 // Balance check: chain balance minus accumulated debits in this block must cover cost.
@@ -1450,14 +1475,24 @@ impl Chain {
                 }
             }
         }
-        // Heartbeat rules.
+        // Heartbeat rules (E3 — consented, bid-bounded billing).
+        //
+        // A heartbeat is consensual, bounded credit movement: it may only bill against an OPEN
+        // `JobBid` that the *cell itself signed* (`payer == cell`), and the cumulative gross billed
+        // against that job can never exceed the bid's locked escrow. The bid is the payer's signed
+        // authorization to spend up to `bid`; heartbeats draw that escrow down, the rest unlocks on
+        // settle/expire. A heartbeat not linked to such an open bid — or one that would push
+        // cumulative spend past the bid — is rejected. This closes the rogue-host drain: a host can
+        // never bill a cell beyond what the cell escrowed via a bid it signed.
         {
             let mut in_block_epochs: std::collections::HashMap<(NodeId, NodeId), u64> =
                 std::collections::HashMap::new();
-            let mut heartbeat_debits: std::collections::HashMap<NodeId, u128> =
+            // Heartbeat gross already accumulated PER JOB within this block, so multiple heartbeats
+            // for one job in a single block are bounded together against the same escrow.
+            let mut in_block_job_hb: std::collections::HashMap<[u8; 32], u128> =
                 std::collections::HashMap::new();
             for tx in &block.transactions {
-                if let TxKind::Heartbeat { cell, host, amount, epoch } = &tx.kind {
+                if let TxKind::Heartbeat { job_id, cell, host, amount, epoch } = &tx.kind {
                     // Must be signed by the host.
                     if &tx.origin != host {
                         return false;
@@ -1480,38 +1515,30 @@ impl Chain {
                         }
                     }
                     in_block_epochs.insert((*cell, *host), *epoch);
-                    // The cell's FREE balance must cover the heartbeat: total balance minus already
-                    // locked credits (open bids, channel capacity, active bond) minus every other
-                    // in-block debit of the cell (transfers, prior heartbeats, new bids, new bonds).
-                    // Without subtracting locked_balance + in-block bids/bonds, a cell could lock
-                    // credits in a bid and still have them drained by a heartbeat — a cross-type
-                    // double-spend (same defence the transfer/bid/channel paths already apply).
-                    let prior_balance = self.balance(cell);
-                    let locked = self.locked_balance(cell) as i128;
-                    let hb_accumulated = *heartbeat_debits.get(cell).unwrap_or(&0) as i128;
-                    let transferred = *in_block_transfer.get(cell).unwrap_or(&0) as i128;
-                    let in_block_bids: u128 = block
-                        .transactions
-                        .iter()
-                        .filter_map(|t| match &t.kind {
-                            TxKind::JobBid { payer, bid, .. } if payer == cell => Some(*bid),
-                            _ => None,
-                        })
-                        .sum();
-                    let in_block_bonds: u128 = block
-                        .transactions
-                        .iter()
-                        .filter_map(|t| match &t.kind {
-                            TxKind::HostBond { host, amount, .. } if host == cell => Some(*amount),
-                            _ => None,
-                        })
-                        .sum();
-                    let committed =
-                        locked + hb_accumulated + transferred + (in_block_bids + in_block_bonds) as i128;
-                    if prior_balance - committed < *amount as i128 {
+                    // Bid linkage: the named job must be an OPEN bid whose payer is exactly the billed
+                    // cell — the cell's own signed authorization. (Confirmed bids only: a job runs many
+                    // blocks after its bid confirms, so a heartbeat never races its own bid in-block;
+                    // requiring confirmation keeps the escrow accounting unambiguous.)
+                    let (bid_payer, bid_amount, _) = match self.open_bids.get(job_id) {
+                        Some(entry) => entry,
+                        None => return false,
+                    };
+                    if bid_payer != cell {
                         return false;
                     }
-                    *heartbeat_debits.entry(*cell).or_insert(0) += amount;
+                    // Cumulative heartbeat gross (confirmed + earlier this block + this one) must stay
+                    // within the bid escrow. This is BOTH the consent bound and the funding guarantee:
+                    // the bid already locked `bid` of the cell's balance, so escrow funds are present.
+                    let confirmed = self.heartbeat_spent.get(job_id).copied().unwrap_or(0);
+                    let in_block = *in_block_job_hb.get(job_id).unwrap_or(&0);
+                    let cumulative = confirmed
+                        .saturating_add(in_block)
+                        .saturating_add(*amount);
+                    if cumulative > *bid_amount {
+                        return false;
+                    }
+                    *in_block_job_hb.entry(*job_id).or_insert(0) =
+                        in_block.saturating_add(*amount);
                 }
             }
         }
@@ -1732,6 +1759,7 @@ impl Chain {
             checkpoint: self.checkpoint.clone(),
             balances: std::collections::HashMap::new(),
             heartbeat_max_epoch: std::collections::HashMap::new(),
+            heartbeat_spent: std::collections::HashMap::new(),
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
             open_channels: std::collections::HashMap::new(),
@@ -1779,6 +1807,7 @@ impl Chain {
             checkpoint: self.checkpoint.clone(),
             balances: std::collections::HashMap::new(),
             heartbeat_max_epoch: std::collections::HashMap::new(),
+            heartbeat_spent: std::collections::HashMap::new(),
             tx_index: std::collections::HashMap::new(),
             open_bids: std::collections::HashMap::new(),
             open_channels: std::collections::HashMap::new(),
@@ -1817,11 +1846,17 @@ impl Chain {
     /// Free balance = `balance(node) - locked_balance(node)`.
     /// O(open_jobs) via the open_bids cache.
     pub fn locked_balance(&self, node: &NodeId) -> u128 {
+        // Remaining escrow per open bid = bid minus what heartbeats have already billed against it.
+        // Heartbeats draw the escrow down (the cell already paid out of total balance), so the still-
+        // locked portion shrinks as the job is billed; the rest unlocks on JobSettle / JobExpire.
         let in_bids: u128 = self
             .open_bids
-            .values()
-            .filter(|(payer, _, _)| payer == node)
-            .map(|(_, bid, _)| *bid)
+            .iter()
+            .filter(|(_, (payer, _, _))| payer == node)
+            .map(|(job_id, (_, bid, _))| {
+                let spent = self.heartbeat_spent.get(job_id).copied().unwrap_or(0);
+                bid.saturating_sub(spent)
+            })
             .sum();
         // Payment-channel capacity is also locked in the payer's balance until close/expire.
         let in_channels: u128 = self
@@ -2561,7 +2596,9 @@ mod tests {
         // A heartbeat cell -> host updates both sides.
         let cell = make_identity("hist-cell");
         fund(&mut chain, &cell, 2_000);
-        let hb = signed_heartbeat(&host, cell.node_id(), 50, 1);
+        let hb_job = [55u8; 32];
+        open_bid_for(&mut chain, &cell, &host, hb_job, 500);
+        let hb = signed_heartbeat(&host, hb_job, cell.node_id(), 50, 1);
         let r3 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut b = chain.next_block(vec![r3, hb], host.node_id());
         b.mine(&std::sync::atomic::AtomicBool::new(false));
@@ -2931,10 +2968,12 @@ mod tests {
         let neutral = make_identity("hbb-miner");
         let mut chain = Chain::genesis();
         fund(&mut chain, &cell, 1_000);
+        let job_id = [56u8; 32];
+        open_bid_for(&mut chain, &cell, &neutral, job_id, 500);
         let host_before = chain.balance(&host.node_id());
 
         let amount = 400;
-        let hb = signed_heartbeat(&host, cell.node_id(), amount, 0);
+        let hb = signed_heartbeat(&host, job_id, cell.node_id(), amount, 0);
         // Mined by a neutral party so emission doesn't perturb the host's balance.
         assert!(append_with(&mut chain, &neutral, hb));
 
@@ -2949,27 +2988,36 @@ mod tests {
         assert_eq!(chain.node_history(&host.node_id()).earned, amount - burn);
     }
 
-    // Cross-type double-spend: a node locks its whole balance in a bid, then a host tries to drain
-    // the same credits via a heartbeat. Locked funds are not free, so the heartbeat must be rejected.
+    // E3 bound: a host can bill a cell's escrow but never beyond it. The cell locks its whole balance
+    // in a bid it signed; the host may bill heartbeats UP TO that escrow (consensual, the cell
+    // authorized it), but a heartbeat that would push cumulative billing past the bid is rejected — so
+    // a host can never extract more than the cell escrowed, even when the cell has locked everything.
     #[test]
-    fn heartbeat_cannot_drain_locked_funds() {
+    fn heartbeat_bounded_by_bid_escrow() {
         let cell = make_identity("hb-lock-cell");
         let host = make_identity("hb-lock-host");
         let neutral = make_identity("hb-lock-miner");
         let mut chain = Chain::genesis();
-        fund(&mut chain, &cell, 1);
+        fund(&mut chain, &cell, 1_000);
         let bal = chain.balance(&cell.node_id()) as u128;
 
-        // Cell locks its entire balance in an open bid.
+        // Cell locks its entire balance in an open bid it signed.
         let job_id = [42u8; 32];
         assert!(append_with(&mut chain, &neutral, signed_job_bid(&cell, job_id, bal)));
         assert_eq!(chain.locked_balance(&cell.node_id()), bal);
 
-        // A heartbeat draining even 1 base unit must be rejected — no free balance remains.
-        let hb = signed_heartbeat(&host, cell.node_id(), 1, 0);
+        // The host bills the full escrow in one heartbeat — consensual, within the bid → accepted.
+        let hb = signed_heartbeat(&host, job_id, cell.node_id(), bal, 0);
+        assert!(append_with(&mut chain, &neutral, hb), "heartbeat within escrow is accepted");
+        assert_eq!(chain.balance(&cell.node_id()), 0, "cell paid exactly its escrow, no more");
+        assert_eq!(chain.locked_balance(&cell.node_id()), 0, "escrow fully consumed");
+
+        // Any further heartbeat would exceed the (now-zero) remaining escrow → rejected. The cell can
+        // never be billed beyond what it escrowed.
+        let hb2 = signed_heartbeat(&host, job_id, cell.node_id(), 1, 1);
         assert!(
-            !append_with(&mut chain, &neutral, hb),
-            "heartbeat must not drain bid-locked funds"
+            !append_with(&mut chain, &neutral, hb2),
+            "heartbeat past the consumed escrow must be rejected — no unconsented drain"
         );
     }
 
@@ -3574,11 +3622,34 @@ mod tests {
     }
 
 
-    fn signed_heartbeat(host: &Identity, cell_id: NodeId, amount: u128, epoch: u64) -> Tx {
-        let kind = TxKind::Heartbeat { cell: cell_id, host: host.node_id(), amount, epoch };
+    fn signed_heartbeat(
+        host: &Identity,
+        job_id: [u8; 32],
+        cell_id: NodeId,
+        amount: u128,
+        epoch: u64,
+    ) -> Tx {
+        let kind = TxKind::Heartbeat { job_id, cell: cell_id, host: host.node_id(), amount, epoch };
         let data = bincode::serialize(&kind).unwrap();
         let sig = host.sign(&data);
         Tx::new(kind, host.node_id(), sig)
+    }
+
+    /// Test helper: fund `cell`, then place and confirm a JobBid by `cell` for `bid` against `job_id`
+    /// (so heartbeats have an open escrow to bill against). `miner` seals the bid block.
+    fn open_bid_for(
+        chain: &mut Chain,
+        cell: &Identity,
+        miner: &Identity,
+        job_id: [u8; 32],
+        bid: u128,
+    ) {
+        let bid_tx = signed_job_bid(cell, job_id, bid);
+        let reward = signed_uptime_reward(miner, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, bid_tx], miner.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
+        block.seal(miner);
+        assert!(chain.append(block), "test setup: bid must confirm");
     }
 
     #[test]
@@ -3587,16 +3658,21 @@ mod tests {
         let cell = make_identity("hb-cell");
         let mut chain = Chain::genesis();
         fund(&mut chain, &cell, 1_000);
+        let job_id = [40u8; 32];
+        // E3: a heartbeat bills against the cell's own signed, open bid escrow.
+        open_bid_for(&mut chain, &cell, &host, job_id, 500);
         let before = chain.balance(&cell.node_id());
 
-        let hb = signed_heartbeat(&host, cell.node_id(), 100, 0);
+        let hb = signed_heartbeat(&host, job_id, cell.node_id(), 100, 0);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, hb], host.node_id());
         block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
-        assert!(chain.append(block), "valid heartbeat must be accepted");
+        assert!(chain.append(block), "valid heartbeat within open-bid escrow must be accepted");
         assert_eq!(chain.balance(&cell.node_id()), before - 100);
         assert_eq!(chain.last_heartbeat_epoch(&cell.node_id(), &host.node_id()), Some(0));
+        // The escrow has drawn down by the billed amount: 500 bid - 100 spent = 400 still locked.
+        assert_eq!(chain.locked_balance(&cell.node_id()), 400, "escrow draws down by billed heartbeat");
     }
 
     #[test]
@@ -3604,30 +3680,32 @@ mod tests {
         let host = make_identity("hb-replay-host");
         let cell = make_identity("hb-replay-cell");
         let mut chain = Chain::genesis();
-        fund(&mut chain, &cell, 1_000);
+        fund(&mut chain, &cell, 2_000);
+        let job_id = [41u8; 32];
+        open_bid_for(&mut chain, &cell, &host, job_id, 1_000);
 
-        let hb = signed_heartbeat(&host, cell.node_id(), 100, 5);
+        let hb = signed_heartbeat(&host, job_id, cell.node_id(), 100, 5);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, hb], host.node_id());
         block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
         assert!(chain.append(block));
 
-        let hb2 = signed_heartbeat(&host, cell.node_id(), 100, 5);
+        let hb2 = signed_heartbeat(&host, job_id, cell.node_id(), 100, 5);
         let reward2 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block2 = chain.next_block(vec![reward2, hb2], host.node_id());
         block2.mine(&std::sync::atomic::AtomicBool::new(false));
         block2.seal(&host);
         assert!(!chain.append(block2), "replayed heartbeat epoch must be rejected");
 
-        let hb3 = signed_heartbeat(&host, cell.node_id(), 100, 3);
+        let hb3 = signed_heartbeat(&host, job_id, cell.node_id(), 100, 3);
         let reward3 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block3 = chain.next_block(vec![reward3, hb3], host.node_id());
         block3.mine(&std::sync::atomic::AtomicBool::new(false));
         block3.seal(&host);
         assert!(!chain.append(block3), "earlier epoch must be rejected");
 
-        let hb4 = signed_heartbeat(&host, cell.node_id(), 100, 6);
+        let hb4 = signed_heartbeat(&host, job_id, cell.node_id(), 100, 6);
         let reward4 = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block4 = chain.next_block(vec![reward4, hb4], host.node_id());
         block4.mine(&std::sync::atomic::AtomicBool::new(false));
@@ -3636,17 +3714,39 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_rejects_insufficient_balance() {
+    fn heartbeat_rejects_exceeding_escrow() {
+        // E3: a heartbeat may bill at most the bid escrow. A single heartbeat over the bid, and a
+        // sequence whose cumulative spend would exceed it, are both rejected — the escrow is the hard
+        // ceiling on what a host can bill, and it is funded by the bid the cell signed.
         let host = make_identity("hb-poor-host");
         let cell = make_identity("hb-poor-cell");
         let mut chain = Chain::genesis();
+        fund(&mut chain, &cell, 1_000);
+        let job_id = [42u8; 32];
+        open_bid_for(&mut chain, &cell, &host, job_id, 300);
 
-        let hb = signed_heartbeat(&host, cell.node_id(), 100, 0);
+        // Single heartbeat over the bid escrow → rejected.
+        let hb = signed_heartbeat(&host, job_id, cell.node_id(), 400, 0);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, hb], host.node_id());
         block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
-        assert!(!chain.append(block), "heartbeat with insufficient cell balance must be rejected");
+        assert!(!chain.append(block), "heartbeat exceeding the bid escrow must be rejected");
+
+        // Bill 200 (within escrow) → accepted; then a 200 more would push cumulative to 400 > 300.
+        let hb_ok = signed_heartbeat(&host, job_id, cell.node_id(), 200, 0);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, hb_ok], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
+        block.seal(&host);
+        assert!(chain.append(block), "heartbeat within escrow must be accepted");
+
+        let hb_over = signed_heartbeat(&host, job_id, cell.node_id(), 200, 1);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, hb_over], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
+        block.seal(&host);
+        assert!(!chain.append(block), "cumulative heartbeats past the escrow must be rejected");
     }
 
     #[test]
@@ -3656,6 +3756,7 @@ mod tests {
         fund(&mut chain, &host, 1_000);
 
         let kind = TxKind::Heartbeat {
+            job_id: [43u8; 32],
             cell: host.node_id(),
             host: host.node_id(),
             amount: 100,
@@ -3680,6 +3781,7 @@ mod tests {
         fund(&mut chain, &cell, 1_000);
 
         let kind = TxKind::Heartbeat {
+            job_id: [44u8; 32],
             cell: cell.node_id(),
             host: host.node_id(),
             amount: 100,
@@ -3951,6 +4053,7 @@ mod tests {
         fund(&mut chain, &cell, 10_000);
 
         let kind = TxKind::Heartbeat {
+            job_id: [45u8; 32],
             cell: cell.node_id(),
             host: host.node_id(),
             amount: 100,
@@ -4108,31 +4211,34 @@ mod tests {
         assert_eq!(chain.balance(&alice.node_id()), bal as i128, "alice's balance must be unchanged");
     }
 
-    // Attack 10: Cross-type in-block double-spend — Transfer + Heartbeat.
-    // Bob (cell) transfers credits away while the host submits a heartbeat charging Bob for
-    // the same credits in one block. Before the fix the heartbeat balance check did not see
-    // the in-block transfer; now it does.
-    //
-    // One mined block funds bob with emission_rate(1) base units. A transfer and a heartbeat
-    // each for 80% of that balance sum to 160% — the block must be rejected.
+    // Attack 10: Transfer must not spend escrowed (bid-locked) credits.
+    // E3 changed heartbeat billing to draw against the cell's locked bid escrow, not its free
+    // balance — so a heartbeat and a free-balance transfer are NOT the same funds. The remaining
+    // double-spend surface to defend is that a transfer cannot reach into the LOCKED escrow. Bob
+    // opens a bid that locks most of his balance, then tries to transfer his FULL balance away in
+    // one block; the transfer must be rejected because the escrow is not free.
     #[test]
-    fn transfer_and_heartbeat_same_credits_rejected() {
+    fn transfer_cannot_spend_locked_escrow() {
         let host = make_identity("xth-host");
         let bob = make_identity("xth-bob");
         let eve = make_identity("xth-eve");
         let mut chain = Chain::genesis();
         fund(&mut chain, &bob, 500);
         let bal = chain.balance(&bob.node_id()) as u128;
-        let spend = bal * 8 / 10;
+        // Lock 80% of bob's balance in a bid escrow.
+        let bid = bal * 8 / 10;
+        let job_id = [46u8; 32];
+        open_bid_for(&mut chain, &bob, &host, job_id, bid);
 
-        let transfer = signed_transfer(&bob, eve.node_id(), spend);
-        let hb = signed_heartbeat(&host, bob.node_id(), spend, 1);
+        // Try to transfer bob's FULL balance — only `bal - bid` is free, so this must be rejected.
+        let transfer = signed_transfer(&bob, eve.node_id(), bal);
         let reward = signed_uptime_reward(&host, chain.tip().index + 1);
-        let mut block = chain.next_block(vec![reward, transfer, hb], host.node_id());
+        let mut block = chain.next_block(vec![reward, transfer], host.node_id());
         block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&host);
-        assert!(!chain.append(block), "transfer + heartbeat exceeding cell balance must be rejected");
+        assert!(!chain.append(block), "transfer spending locked escrow must be rejected");
         assert_eq!(chain.balance(&bob.node_id()), bal as i128, "bob's balance must be unchanged");
+        assert_eq!(chain.locked_balance(&bob.node_id()), bid, "escrow stays locked");
     }
 
     // Attack 11: Block-size bomb — adversary packs more than MAX_TXS_PER_BLOCK transactions.
@@ -4191,12 +4297,11 @@ mod tests {
         );
     }
 
-    // Attack 13: Rogue host drains a cell with a Heartbeat when no open bid exists.
-    // The chain currently accepts this — heartbeats are not yet bid-gated because the
-    // open_bids cache does not track which host accepted a given bid (only the payer).
-    // This test documents the known design limitation. A future upgrade should introduce
-    // a bid-acceptance tx that links a specific host to a job_id so heartbeats can be
-    // validated against it.
+    // Attack 13 (E3 regression): a rogue host CANNOT drain a cell with a Heartbeat unless that cell
+    // signed an open bid authorizing it. A heartbeat is now bid-gated: it must name an OPEN JobBid
+    // whose payer == the billed cell, and cumulative billing is bounded by that bid's escrow. Mallory
+    // has no such bid from Bob, so the heartbeat is rejected and Bob's balance is untouched. This was
+    // formerly a KNOWN LIMITATION (unconsented credit drain); it is now a hard rejection.
     #[test]
     fn rogue_host_heartbeat_drains_cell_without_bid() {
         let mallory = make_identity("rogue-mallory");
@@ -4205,14 +4310,63 @@ mod tests {
         fund(&mut chain, &bob, 1_000);
         let before = chain.balance(&bob.node_id());
 
-        let hb = signed_heartbeat(&mallory, bob.node_id(), 500, 1);
+        // No bid from Bob exists — Mallory invents a job_id and tries to bill Bob anyway.
+        let hb = signed_heartbeat(&mallory, [99u8; 32], bob.node_id(), 500, 1);
         let reward = signed_uptime_reward(&mallory, chain.tip().index + 1);
         let mut block = chain.next_block(vec![reward, hb], mallory.node_id());
         block.mine(&std::sync::atomic::AtomicBool::new(false));
         block.seal(&mallory);
-        // KNOWN LIMITATION: succeeds without a prior bid; bob is drained without consent.
-        assert!(chain.append(block), "rogue heartbeat accepted — known design limitation");
-        assert_eq!(chain.balance(&bob.node_id()), before - 500, "bob drained 500 base units by rogue host");
+        assert!(!chain.append(block), "rogue heartbeat with no cell-signed open bid must be rejected");
+        assert_eq!(chain.balance(&bob.node_id()), before, "bob must NOT be drained — no consent, no bid");
+    }
+
+    // E3 positive case: a legitimate heartbeat against a cell's OWN open bid still settles. Bob signs
+    // a bid (locking escrow); the host bills incremental heartbeats within that escrow; each is
+    // accepted, draws the escrow down, and pays the host net-of-burn. The long-running-cell billing
+    // flow is preserved for honest jobs.
+    #[test]
+    fn legit_heartbeat_within_open_bid_settles() {
+        let host = make_identity("legit-hb-host");
+        let bob = make_identity("legit-hb-cell");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &bob, 2_000);
+        let job_id = [98u8; 32];
+        open_bid_for(&mut chain, &bob, &host, job_id, 600);
+        let bob_before = chain.balance(&bob.node_id());
+        let host_before = chain.balance(&host.node_id());
+
+        // Three heartbeats of 200 each = 600 total, exactly the escrow.
+        for (i, epoch) in (0u64..3).enumerate() {
+            let hb = signed_heartbeat(&host, job_id, bob.node_id(), 200, epoch);
+            let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+            let mut block = chain.next_block(vec![reward, hb], host.node_id());
+            block.mine(&std::sync::atomic::AtomicBool::new(false));
+            block.seal(&host);
+            assert!(chain.append(block), "legit heartbeat {i} within escrow must be accepted");
+        }
+
+        // Bob paid the full 600 gross; the host received 600 net-of-burn (plus its mining emissions,
+        // which we account for separately by checking the cell side precisely).
+        assert_eq!(chain.balance(&bob.node_id()), bob_before - 600, "cell pays gross heartbeat total");
+        let net: u128 = (0..3).map(|_| 200u128 - settlement_burn(200)).sum();
+        // Host gained the heartbeat net plus three block emissions it mined.
+        let emissions: i128 = (1..=3)
+            .map(|k| Chain::emission_rate(chain.tip().index - 3 + k) as i128)
+            .sum();
+        assert_eq!(
+            chain.balance(&host.node_id()),
+            host_before + net as i128 + emissions,
+            "host receives heartbeat net-of-burn plus its mining emissions",
+        );
+        // Escrow fully consumed → nothing left locked.
+        assert_eq!(chain.locked_balance(&bob.node_id()), 0, "escrow fully drawn down by heartbeats");
+        // A fourth heartbeat would exceed the now-zero remaining escrow → rejected.
+        let hb = signed_heartbeat(&host, job_id, bob.node_id(), 1, 3);
+        let reward = signed_uptime_reward(&host, chain.tip().index + 1);
+        let mut block = chain.next_block(vec![reward, hb], host.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
+        block.seal(&host);
+        assert!(!chain.append(block), "heartbeat past a fully-consumed escrow must be rejected");
     }
 
     // Attack 14: Zero-amount transfer chain bloat.

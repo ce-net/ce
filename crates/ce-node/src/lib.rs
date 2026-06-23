@@ -2054,7 +2054,7 @@ async fn emit_heartbeats(
             current
         };
 
-        let kind = TxKind::Heartbeat { cell, host: identity.node_id(), amount, epoch };
+        let kind = TxKind::Heartbeat { job_id, cell, host: identity.node_id(), amount, epoch };
         let data = bincode::serialize(&kind).expect("serialize Heartbeat");
         let sig = identity.sign(&data);
         let tx = Tx::new(kind, identity.node_id(), sig);

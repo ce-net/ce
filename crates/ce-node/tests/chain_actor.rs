@@ -297,11 +297,38 @@ async fn actor_try_reorg_ignores_equal_or_shorter_fork() {
 async fn actor_heartbeat_epochs_scan() {
     let host = make_identity("hb-host");
     let cell = make_identity("hb-cell");
-    let raw = Chain::genesis();
+    let mut raw = Chain::genesis();
+    let job_id = [7u8; 32];
 
-    // Build a block with a heartbeat tx
-    // amount=0: cell starts with no balance; zero-cost heartbeat passes the balance check.
+    // E3: a heartbeat must bill against an OPEN bid the cell signed. The cell opens a zero-value bid
+    // (it has no balance; bid=0 escrow → a zero-cost heartbeat is still in-bounds), confirmed first.
+    let bid_kind = TxKind::JobBid {
+        job_id,
+        payer: cell.node_id(),
+        bid: 0,
+        image: "alpine:latest".into(),
+        cmd: vec![],
+        env: vec![],
+        cpu_cores: 1,
+        mem_mb: 64,
+        duration_secs: 30,
+    };
+    let bd = bincode::serialize(&bid_kind).unwrap();
+    let bs = cell.sign(&bd);
+    let bid_tx = Tx::new(bid_kind, cell.node_id(), bs);
+    let r0_kind = TxKind::UptimeReward { node: host.node_id(), amount: Chain::emission_rate(1), epoch: 1 };
+    let r0d = bincode::serialize(&r0_kind).unwrap();
+    let r0s = host.sign(&r0d);
+    let r0_tx = Tx::new(r0_kind, host.node_id(), r0s);
+    let mut bid_block = raw.next_block(vec![r0_tx, bid_tx], host.node_id());
+    bid_block.mine(&std::sync::atomic::AtomicBool::new(false));
+    bid_block.seal(&host);
+    assert!(raw.append(bid_block.clone()), "bid must confirm");
+
+    // Build a block with a heartbeat tx against the open bid.
+    // amount=0: cell has no balance; zero-cost heartbeat is within the (zero) escrow.
     let hb_kind = TxKind::Heartbeat {
+        job_id,
         cell: cell.node_id(),
         host: host.node_id(),
         amount: 0,
@@ -313,8 +340,8 @@ async fn actor_heartbeat_epochs_scan() {
 
     let reward_kind = TxKind::UptimeReward {
         node: host.node_id(),
-        amount: Chain::emission_rate(1),
-        epoch: 1,
+        amount: Chain::emission_rate(2),
+        epoch: 2,
     };
     let rd = bincode::serialize(&reward_kind).unwrap();
     let rs = host.sign(&rd);
@@ -325,6 +352,7 @@ async fn actor_heartbeat_epochs_scan() {
     block.seal(&host);
 
     let handle = spawn_chain_actor(Chain::genesis());
+    handle.append(bid_block).await;
     handle.append(block).await;
 
     let epochs = handle.heartbeat_epochs(host.node_id()).await;
