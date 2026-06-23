@@ -20,7 +20,8 @@
 //!
 //! Trap delivery is configured to be **recoverable on every platform**: a runaway module that
 //! exhausts its fuel (or its wall-clock deadline) returns a catchable `Err`, never aborts the host
-//! process. See [`engine_config`] for the Windows-specific reason backtrace capture is disabled.
+//! process. See [`engine_config`] for the Windows-specific reason signals-based trap delivery is
+//! disabled.
 
 use anyhow::{anyhow, Context, Result};
 use ce_runtime::{Handle, Limits, Runtime, Workload};
@@ -49,26 +50,35 @@ const WATCHDOG_TICK: Duration = Duration::from_secs(1);
 /// Build the wasmtime [`Config`] used for all CE execution. Centralized so every engine (runtime
 /// and tests) shares the exact same trap-handling configuration.
 ///
-/// Two settings are load-bearing for **safely** running untrusted modules:
+/// Three settings are load-bearing for **safely** running untrusted modules across every platform:
 ///
-/// 1. `wasm_backtrace(false)` — when a trap fires (notably **fuel exhaustion** on a runaway loop),
-///    wasmtime delivers it from an `out_of_gas` libcall via an unwind back to the host trampoline.
-///    Capturing a WASM backtrace on that path walks frames using native unwind info; on **Windows**
-///    a failure there panics *inside* an `extern "C"` libcall, which "cannot unwind" and **aborts
-///    the whole process** instead of returning a catchable `Err`. We don't need the backtrace
-///    (we log a plain trap), so disabling its capture removes the aborting path while the trap is
-///    still returned as `Err`. (See wasmtime `Config::wasm_backtrace`: disabling only drops the
-///    backtrace context from the error; the trap is still surfaced.)
+/// 1. `signals_based_traps(false)` — this is the cross-platform fix for the **Windows** abort. When
+///    enabled (the default), a trap (notably **fuel exhaustion** on a runaway loop) is delivered
+///    through host signal/SEH machinery and a stack unwind back to the host trampoline. On Windows
+///    a failure on that unwind path panics *inside* an `extern "C"` libcall, which "cannot unwind"
+///    and **aborts the whole process** ("panic in a function that cannot unwind") instead of
+///    returning a catchable `Err`. Disabling signals-based traps makes wasmtime emit explicit
+///    in-code checks and return traps without relying on signal-handler unwinding, so a fuel/epoch
+///    trap surfaces as a recoverable `Err` on every platform. The only cost is that linear-memory
+///    bounds become explicit checks rather than guard pages — acceptable for CE's bounded modules.
 ///
-/// 2. `epoch_interruption(true)` — arms the wall-clock watchdog (see [`run_with_watchdog`]). This is
+/// 2. `wasm_backtrace_max_frames(None)` — never attach a WASM backtrace to errors coming out of
+///    wasm. We don't need it (we log a plain trap), and not capturing it keeps the trap path free
+///    of native-unwind frame walking. (This is the modern replacement for the deprecated
+///    `wasm_backtrace(false)`; passing `None` disables backtrace context entirely.)
+///
+/// 3. `epoch_interruption(true)` — arms the wall-clock watchdog (see [`run_with_watchdog`]). This is
 ///    defense-in-depth on top of fuel: an untrusted module is bounded by both instruction count
 ///    *and* wall time, on every platform, regardless of any trap-delivery quirk.
 fn engine_config() -> Config {
     let mut config = Config::new();
     config.consume_fuel(true);
     config.epoch_interruption(true);
-    // See doc comment above: avoids the Windows "cannot unwind" abort on fuel/epoch traps.
-    config.wasm_backtrace(false);
+    // See doc comment above: explicit (non-signal) trap delivery avoids the Windows "cannot unwind"
+    // abort on fuel/epoch traps, surfacing them as recoverable `Err` on every platform.
+    config.signals_based_traps(false);
+    // Never attach a WASM backtrace to wasm errors (modern replacement for `wasm_backtrace(false)`).
+    config.wasm_backtrace_max_frames(None);
     config
 }
 
@@ -122,7 +132,8 @@ pub struct WasmRuntime {
 
 impl WasmRuntime {
     pub fn new(blobs_dir: PathBuf) -> Result<Self> {
-        let engine = Engine::new(&engine_config()).context("wasmtime engine")?;
+        let engine =
+            Engine::new(&engine_config()).map_err(anyhow::Error::from).context("wasmtime engine")?;
         Ok(Self { engine, blobs_dir })
     }
 
@@ -143,22 +154,27 @@ impl WasmRuntime {
 /// and `mem_mb` of linear memory. Returns the entry's i32 result. Synchronous + CPU-bound;
 /// callers run it on a blocking thread.
 pub fn execute(engine: &Engine, wasm: &[u8], entry: &str, fuel: u64, mem_mb: u64) -> Result<i32> {
-    let module = Module::new(engine, wasm).context("compile module")?;
+    let module =
+        Module::new(engine, wasm).map_err(anyhow::Error::from).context("compile module")?;
     let limits = StoreLimitsBuilder::new()
         .memory_size((mem_mb as usize).saturating_mul(1024 * 1024))
         .build();
     let mut store = Store::new(engine, limits);
     store.limiter(|l: &mut StoreLimits| l);
-    store.set_fuel(fuel).context("set fuel")?;
+    store.set_fuel(fuel).map_err(anyhow::Error::from).context("set fuel")?;
 
     // No imports — the module must be self-contained (the WASI path is `execute_command`).
     let linker: Linker<StoreLimits> = Linker::new(engine);
-    let instance = linker.instantiate(&mut store, &module).context("instantiate")?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(anyhow::Error::from)
+        .context("instantiate")?;
     let func = instance
         .get_typed_func::<(), i32>(&mut store, entry)
+        .map_err(anyhow::Error::from)
         .with_context(|| format!("export `{entry}` with signature () -> i32"))?;
     run_with_watchdog(engine, &mut store, |store| {
-        func.call(store, ()).context("wasm trap")
+        func.call(store, ()).map_err(anyhow::Error::from).context("wasm trap")
     })
 }
 
@@ -172,9 +188,9 @@ pub fn execute_command(
     mem_mb: u64,
     stdin: Vec<u8>,
 ) -> Result<(i32, Vec<u8>)> {
-    use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
-    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
     use wasmtime_wasi::WasiCtxBuilder;
+    use wasmtime_wasi::p1::{self, WasiP1Ctx};
+    use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 
     // Store data carries both the WASI context and the memory limiter.
     struct CmdState {
@@ -182,7 +198,8 @@ pub fn execute_command(
         limits: StoreLimits,
     }
 
-    let module = Module::new(engine, wasm).context("compile module")?;
+    let module =
+        Module::new(engine, wasm).map_err(anyhow::Error::from).context("compile module")?;
     // 16 MiB stdout cap — bounds a runaway writer; the produced output blob can't exceed it.
     let stdout = MemoryOutputPipe::new(16 * 1024 * 1024);
     let wasi = WasiCtxBuilder::new()
@@ -195,22 +212,29 @@ pub fn execute_command(
         .build();
     let mut store = Store::new(engine, CmdState { wasi, limits });
     store.limiter(|s: &mut CmdState| &mut s.limits);
-    store.set_fuel(fuel).context("set fuel")?;
+    store.set_fuel(fuel).map_err(anyhow::Error::from).context("set fuel")?;
 
     let mut linker: Linker<CmdState> = Linker::new(engine);
-    preview1::add_to_linker_sync(&mut linker, |s: &mut CmdState| &mut s.wasi)
+    p1::add_to_linker_sync(&mut linker, |s: &mut CmdState| &mut s.wasi)
+        .map_err(anyhow::Error::from)
         .context("add wasi to linker")?;
-    let instance = linker.instantiate(&mut store, &module).context("instantiate")?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(anyhow::Error::from)
+        .context("instantiate")?;
     let start = instance
         .get_typed_func::<(), ()>(&mut store, "_start")
+        .map_err(anyhow::Error::from)
         .context("export `_start` (WASI command)")?;
-    let call = run_with_watchdog(engine, &mut store, |store| Ok(start.call(store, ())));
+    let call = run_with_watchdog(engine, &mut store, |store| {
+        Ok(start.call(store, ()))
+    });
     let code = match call? {
         Ok(()) => 0,
         // A WASI command that calls proc_exit traps with I32Exit carrying the exit code.
         Err(e) => match e.downcast_ref::<wasmtime_wasi::I32Exit>() {
             Some(exit) => exit.0,
-            None => return Err(e).context("wasm trap"),
+            None => return Err(anyhow::Error::from(e)).context("wasm trap"),
         },
     };
     drop(store); // drop the module's stdout handle before reading the buffer
@@ -295,17 +319,14 @@ mod tests {
     }
 
     #[test]
-    // wasmtime fuel/epoch traps still abort on Windows ("cannot unwind"); tracked in task #26.
-    // The wall-clock watchdog in engine_config() bounds runaway WASM on every platform; this test
-    // exercises the fuel-trap path specifically, which only returns a clean Err on unix today.
-    #[cfg_attr(windows, ignore = "wasmtime fuel-trap aborts on Windows; see task #26")]
     fn runaway_module_runs_out_of_fuel() {
         // An infinite loop traps once fuel is exhausted — a runaway module can't run forever.
         // The trap MUST come back as a recoverable `Err` on every platform (it must never abort
         // the host process). This previously aborted on Windows ("panic in a function that cannot
-        // unwind") because the fuel trap captured a WASM backtrace, walking native unwind info from
-        // inside an `extern "C"` libcall; `engine_config()` now disables backtrace capture
-        // (`wasm_backtrace(false)`), and a wall-clock epoch watchdog backstops fuel regardless.
+        // unwind") because the fuel trap was delivered through signal/SEH-based unwinding into an
+        // `extern "C"` libcall; `engine_config()` now sets `signals_based_traps(false)` so traps
+        // are returned via explicit checks (and disables backtrace capture), and a wall-clock epoch
+        // watchdog backstops fuel regardless. Runs on all platforms to confirm the Windows fix.
         let wasm = wat::parse_str(r#"(module (func (export "entry") (result i32) (loop (br 0)) i32.const 0))"#).unwrap();
         let r = execute(&engine(), &wasm, "entry", 100_000, 16);
         assert!(r.is_err(), "infinite loop must trap on fuel exhaustion");
