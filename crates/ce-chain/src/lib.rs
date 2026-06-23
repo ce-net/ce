@@ -499,12 +499,15 @@ pub const SUPPLY_CAP: u128 = 21_000_000_000 * CREDIT;
 /// reputation/earned-history costs real capital that scales with the volume faked. Honest users pay
 /// the same burn as a flat marketplace take-rate.
 ///
-/// Pre-launch tunable: higher = stronger anti-wash, but a heavier tax on honest settlements. The
-/// right value is an open mechanism-design question (docs/consensus.md §5). Consensus validation is
-/// unaffected — the burn is a deterministic function of the gross amount, applied identically by
-/// every node in `apply_block_to_cache`, and the payer's debit (the only side `append` balance-checks)
-/// is unchanged.
-pub const SETTLEMENT_BURN_BPS: u128 = 100; // 1.00%
+/// Reward-spread design: set so the provider keeps **one fifth** of every settlement and the other
+/// four fifths are burned. The consumer pays the full gross; the host receives `gross - gross*4/5 =
+/// gross/5`. Contributing-to-consume is therefore a 5:1 ratio — donating idle compute earns back ~20%
+/// of its value in spendable credits — and wash trading is brutally unprofitable (every faked cycle
+/// destroys 80%). Strongly deflationary at volume; uptime emission is the offsetting knob.
+/// Consensus validation is unaffected — the burn is a deterministic function of the gross amount,
+/// applied identically by every node in `apply_block_to_cache`, and the payer's debit (the only side
+/// `append` balance-checks) is unchanged.
+pub const SETTLEMENT_BURN_BPS: u128 = 8000; // 80.00% — provider keeps 1/5 (reward spread)
 /// Basis-point denominator.
 const BPS_DENOM: u128 = 10_000;
 
@@ -2951,7 +2954,7 @@ mod tests {
     #[test]
     fn settlement_burn_math() {
         assert_eq!(settlement_burn(0), 0);
-        assert_eq!(settlement_burn(99), 0, "sub-threshold settlements floor to a 0 burn");
+        assert_eq!(settlement_burn(1), 0, "sub-threshold settlements floor to a 0 burn");
         assert_eq!(settlement_burn(10_000), 10_000 * SETTLEMENT_BURN_BPS / BPS_DENOM);
         assert_eq!(settlement_burn(CREDIT), CREDIT * SETTLEMENT_BURN_BPS / BPS_DENOM);
         // The net/burn split never creates or loses a base unit.
@@ -3276,8 +3279,9 @@ mod tests {
         // Bond below earned → weight is capped by the bond.
         let b = make_identity("w-b");
         let mut chain2 = Chain::genesis();
-        let net2 = bond_and_earn(&mut chain2, &b, 300, 1_000);
-        assert_eq!(net2, 1_000 - settlement_burn(1_000));
+        let net2 = bond_and_earn(&mut chain2, &b, 300, 5_000);
+        assert_eq!(net2, 5_000 - settlement_burn(5_000));
+        assert!(net2 > 300, "earned must exceed the bond for this case");
         assert_eq!(chain2.consensus_weight(&b.node_id()), 300, "capped by the bond");
     }
 
@@ -3287,7 +3291,7 @@ mod tests {
         let reporter = make_identity("w-slash-rep");
         let neutral = make_identity("w-slash-miner");
         let mut chain = Chain::genesis();
-        let _net = bond_and_earn(&mut chain, &offender, 300, 1_000);
+        let _net = bond_and_earn(&mut chain, &offender, 300, 5_000);
         assert_eq!(chain.consensus_weight(&offender.node_id()), 300);
 
         // Weight now exists, so the slash block must be a real VRF block by a weighted miner.
@@ -3335,7 +3339,8 @@ mod tests {
         // Earned/bonded weight above the grant wins; below it, the grant floors it.
         let a = make_identity("gw-max");
         let mut chain = Chain::genesis();
-        let net = bond_and_earn(&mut chain, &a, 5_000, 1_000); // earned-weight = net (<1000)
+        let net = bond_and_earn(&mut chain, &a, 5_000, 5_000); // earned-weight = net, above the 300 grant
+        assert!(net > 300, "earned must exceed the grant for this case");
         let mut grants = std::collections::HashMap::new();
         grants.insert(a.node_id(), 300u128); // grant below earned
         chain.set_genesis_weights(grants);
