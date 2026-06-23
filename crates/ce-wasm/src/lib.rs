@@ -765,10 +765,13 @@ mod tests {
 
     /// A fresh identity in a unique temp dir.
     fn test_identity() -> Identity {
+        // Unique, Windows-safe temp dir name: SystemTime's Debug output contains ':' and spaces,
+        // which are invalid in Windows paths — use a numeric atomic counter for uniqueness instead.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ce-wasm-id-{}-{:?}",
+            "ce-wasm-id-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Identity::load_or_generate(&dir).unwrap()
