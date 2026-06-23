@@ -1538,6 +1538,35 @@ async fn stage_blob(
     )
 }
 
+/// Enforce a deploy request against the leaf capability's resource ceilings. Each `Some(limit)` is
+/// a hard ceiling the request may not exceed; `None` means unlimited. Returns the rejection reason
+/// when any caveat is violated. Mirrors the `allowed_ports` enforcement done for tunnels: ce-cap
+/// authenticates and attenuates the `max_*` caveats but leaves their enforcement to the action that
+/// consumes the resources, which for deploy is here.
+fn deploy_within_caveats(
+    caveats: &ce_cap::Caveats,
+    cpu_cores: u32,
+    mem_mb: u64,
+    bid: u128,
+) -> Result<(), String> {
+    if let Some(max) = caveats.max_cpu {
+        if cpu_cores > max {
+            return Err(format!("deploy cpu_cores {cpu_cores} exceeds capability max_cpu {max}"));
+        }
+    }
+    if let Some(max) = caveats.max_mem_mb {
+        if mem_mb > u64::from(max) {
+            return Err(format!("deploy mem_mb {mem_mb} exceeds capability max_mem_mb {max}"));
+        }
+    }
+    if let Some(max) = caveats.max_credits {
+        if bid > u128::from(max) {
+            return Err(format!("deploy bid {bid} exceeds capability max_credits {max}"));
+        }
+    }
+    Ok(())
+}
+
 // ----- Incoming mesh RPC handler -----
 
 #[allow(clippy::too_many_arguments)]
@@ -1632,6 +1661,16 @@ async fn handle_incoming_rpc(
         RpcRequest::AppRequest { .. } => unreachable!("AppRequest handled in event loop"),
         RpcRequest::RelayReceipt { .. } => unreachable!("RelayReceipt handled in event loop"),
         RpcRequest::Deploy { workload, cpu_cores, mem_mb, duration_secs, bid, .. } => {
+            // Enforce the leaf capability's resource ceilings. ce-cap leaves `max_*` caveats for
+            // "whichever action consumes them" (mirrors the `allowed_ports` enforcement for tunnel
+            // above): deploy consumes cpu/mem/credits, so a request exceeding any `Some(limit)` is
+            // rejected. `None` means unlimited.
+            if let Some(leaf) = caps.last() {
+                if let Err(reason) = deploy_within_caveats(&leaf.cap.caveats, cpu_cores, mem_mb, bid) {
+                    reject(reason);
+                    return;
+                }
+            }
             // Decode the polymorphic workload (Docker | Wasm) and dispatch through the runtime
             // registry — the first runtime whose can_run matches its required tag.
             let workload: ce_runtime::Workload = match bincode::deserialize(&workload) {
@@ -1992,10 +2031,14 @@ async fn emit_heartbeats(
             continue;
         }
 
-        let cell_balance = chain.balance(cell).await;
+        // Gate on FREE balance (total minus funds locked by open bids/channels/bond), which is
+        // exactly what validators require when they append the Heartbeat. Screening on total
+        // balance would let a payer lock its funds so the host keeps broadcasting heartbeats that
+        // validators silently reject — the job runs but the host is never paid (free-compute leak).
+        let cell_balance = chain.balance(cell).await - chain.locked_balance(cell).await as i128;
         if cell_balance < amount as i128 {
             info!(
-                "cell {} insufficient balance ({cell_balance}) for heartbeat {amount}, \
+                "cell {} insufficient free balance ({cell_balance}) for heartbeat {amount}, \
                  terminating job {}",
                 hex::encode(&cell[..4]),
                 hex::encode(&job_id),
@@ -2242,6 +2285,33 @@ mod capability_tag_tests {
         assert_eq!(parsed.mem_mb, 16_384);
         assert_eq!(parsed.running_jobs, 2);
         assert_eq!(parsed.tags, vec!["gpu".to_string(), "linux".to_string(), "docker".to_string()]);
+    }
+
+    #[test]
+    fn deploy_caveats_reject_over_limit_and_accept_in_limit() {
+        // A deploy cap scoped to small ceilings must reject a job that exceeds any of them, and
+        // accept one within all of them (regression for H1: caveats were authenticated but never
+        // enforced at the Deploy consumption point).
+        let cv = ce_cap::Caveats {
+            max_cpu: Some(2),
+            max_mem_mb: Some(512),
+            max_credits: Some(100),
+            ..Default::default()
+        };
+
+        // Over each ceiling individually → rejected.
+        assert!(deploy_within_caveats(&cv, 64, 256, 50).is_err(), "cpu over the ceiling must reject");
+        assert!(deploy_within_caveats(&cv, 2, 256_000, 50).is_err(), "mem over the ceiling must reject");
+        assert!(deploy_within_caveats(&cv, 2, 256, 1_000).is_err(), "bid over the ceiling must reject");
+
+        // Exactly at every ceiling → accepted (ceilings are inclusive).
+        assert!(deploy_within_caveats(&cv, 2, 512, 100).is_ok(), "an at-limit deploy must be accepted");
+        // Comfortably within → accepted.
+        assert!(deploy_within_caveats(&cv, 1, 256, 50).is_ok(), "an in-limit deploy must be accepted");
+
+        // No ceilings (all None) → anything is accepted.
+        let unlimited = ce_cap::Caveats::default();
+        assert!(deploy_within_caveats(&unlimited, u32::MAX, u64::MAX, u128::MAX).is_ok());
     }
 }
 

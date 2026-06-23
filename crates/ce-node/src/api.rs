@@ -677,11 +677,14 @@ async fn transfer(State(state): State<ApiState>, Json(req): Json<TransferRequest
         return err(StatusCode::BAD_REQUEST, "amount must be > 0");
     }
     let from = state.identity.node_id();
-    let balance = state.chain.balance(from).await;
-    if balance < req.amount as i128 {
+    // Pre-screen on FREE balance (total minus funds locked by open bids/channels/bond) — the same
+    // quantity validators require when they append the Transfer (mirrors `channel_open`). Screening
+    // on total balance would 201-accept a transfer of locked funds that then never mines.
+    let free = state.chain.balance(from).await - state.chain.locked_balance(from).await as i128;
+    if free < req.amount as i128 {
         return err(
             StatusCode::PAYMENT_REQUIRED,
-            format!("balance {balance} insufficient for transfer {}", req.amount),
+            format!("free balance {free} insufficient for transfer {}", req.amount),
         );
     }
     let kind = ce_chain::TxKind::Transfer { from, to, amount: req.amount };

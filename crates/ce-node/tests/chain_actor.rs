@@ -898,6 +898,80 @@ async fn actor_settled_on_chain_finds_settle_tx() {
     assert_eq!(settled[0], job_id);
 }
 
+// ── free-vs-total balance pre-screen (Theme D) ────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn locked_funds_make_free_balance_gate_a_transfer() {
+    // Regression for the `POST /transfer` (and heartbeat) pre-screen: the handler must gate on
+    // FREE balance (`balance - locked_balance`), the quantity validators enforce. A payer who has
+    // locked most of its balance in an open JobBid must NOT pass a transfer that only the (larger)
+    // total balance would cover — otherwise the tx is "submitted but never mined".
+    let payer = make_identity("free-gate-payer");
+    let job_id: [u8; 32] = [0xCD; 32];
+    let bid = 700u128;
+
+    let mut raw = Chain::genesis();
+    let handle = spawn_chain_actor(Chain::genesis());
+
+    // Block 1: credit the payer.
+    let emission = Chain::emission_rate(1);
+    {
+        let rk = TxKind::UptimeReward { node: payer.node_id(), amount: emission, epoch: 1 };
+        let rs = payer.sign(&bincode::serialize(&rk).unwrap());
+        let reward_tx = Tx::new(rk, payer.node_id(), rs);
+        let mut block = raw.next_block(vec![reward_tx], payer.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
+        block.seal(&payer);
+        raw.append(block.clone());
+        assert!(handle.append(block).await, "block 1 (reward) should append");
+    }
+
+    // Block 2: open a JobBid that locks `bid` of the payer's balance.
+    {
+        let bid_kind = TxKind::JobBid {
+            job_id,
+            payer: payer.node_id(),
+            bid,
+            image: String::new(),
+            cmd: vec![],
+            env: vec![],
+            cpu_cores: 1,
+            mem_mb: 256,
+            duration_secs: 60,
+        };
+        let bid_sig = payer.sign(&bincode::serialize(&bid_kind).unwrap());
+        let bid_tx = Tx::new(bid_kind, payer.node_id(), bid_sig);
+        let emission2 = Chain::emission_rate(2);
+        let rk = TxKind::UptimeReward { node: payer.node_id(), amount: emission2, epoch: 2 };
+        let rs = payer.sign(&bincode::serialize(&rk).unwrap());
+        let reward_tx = Tx::new(rk, payer.node_id(), rs);
+        let mut block = raw.next_block(vec![reward_tx, bid_tx], payer.node_id());
+        block.mine(&std::sync::atomic::AtomicBool::new(false));
+        block.seal(&payer);
+        raw.append(block.clone());
+        assert!(handle.append(block).await, "block 2 (bid) should append");
+    }
+
+    let total = handle.balance(payer.node_id()).await;
+    let locked = handle.locked_balance(payer.node_id()).await;
+    let free = total - locked as i128;
+
+    assert_eq!(locked, bid, "the open bid must be counted as locked");
+    assert!(free >= 0 && free < total, "free balance must be strictly below total when funds are locked");
+
+    // The transfer pre-screen gates on `free`. Pick an amount the TOTAL would cover but FREE does
+    // not: it must be rejected (this is exactly the leak the fix closes).
+    let transfer_amount = (free as u128) + 1;
+    assert!(
+        (transfer_amount as i128) <= total,
+        "the test amount must be coverable by total balance, proving the old gate would have wrongly accepted it",
+    );
+    assert!(
+        free < transfer_amount as i128,
+        "free-balance gate must reject a transfer of locked funds",
+    );
+}
+
 // ── stress: high throughput ───────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]

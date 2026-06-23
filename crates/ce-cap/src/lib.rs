@@ -179,7 +179,7 @@ impl Caveats {
         if let Some(pp) = &parent.path_prefix {
             match &self.path_prefix {
                 Some(sp) => {
-                    if !sp.starts_with(pp.as_str()) {
+                    if !path_within(sp, pp) {
                         return false;
                     }
                 }
@@ -188,6 +188,16 @@ impl Caveats {
         }
         true
     }
+}
+
+/// Is path `child` contained within path `parent`, on a `/` boundary? A raw `starts_with` is
+/// wrong: `/home/userdata` is *not* within `/home/user`, even though it shares the textual prefix.
+/// Containment holds iff the parent is empty (unconfined), the paths are equal, or `child` lies
+/// strictly under `parent` as a path component. Trailing slashes are normalized first.
+fn path_within(child: &str, parent: &str) -> bool {
+    let child = child.trim_end_matches('/');
+    let parent = parent.trim_end_matches('/');
+    parent.is_empty() || child == parent || child.starts_with(&format!("{parent}/"))
 }
 
 /// `child <= parent` where `None` means "no limit". A parent with no limit accepts any child; a
@@ -793,6 +803,23 @@ mod tests {
         assert!(!Caveats { not_after: 500, max_cpu: Some(16), ..Default::default() }.is_narrower_or_equal(&parent));
         // unlimited cpu under a capped parent = broader
         assert!(!Caveats { not_after: 500, max_cpu: None, ..Default::default() }.is_narrower_or_equal(&parent));
+    }
+
+    #[test]
+    fn path_prefix_attenuation_is_boundary_aware() {
+        let parent = Caveats { path_prefix: Some("/home/user".into()), ..Default::default() };
+        // A sibling that merely shares the textual prefix is NOT within the parent.
+        let sibling = Caveats { path_prefix: Some("/home/userdata".into()), ..Default::default() };
+        assert!(!sibling.is_narrower_or_equal(&parent));
+        // A true sub-path IS within the parent.
+        let child = Caveats { path_prefix: Some("/home/user/docs".into()), ..Default::default() };
+        assert!(child.is_narrower_or_equal(&parent));
+        // Equal (modulo trailing slash) is within.
+        let equal = Caveats { path_prefix: Some("/home/user/".into()), ..Default::default() };
+        assert!(equal.is_narrower_or_equal(&parent));
+        // An unconfined child under a confined parent is broader.
+        let unconfined = Caveats { path_prefix: None, ..Default::default() };
+        assert!(!unconfined.is_narrower_or_equal(&parent));
     }
 
     #[test]
