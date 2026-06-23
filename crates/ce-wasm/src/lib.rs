@@ -16,7 +16,17 @@
 //! Either way execution is **fuel-metered** (instruction budget), **memory-capped** (linear memory
 //! limited), and **wall-clock-bounded** (an epoch watchdog interrupts a module that outlives its
 //! time budget — defense-in-depth on top of fuel, and platform-independent), so an untrusted module
-//! is bounded without a container. WASM is deterministic, which makes it ideal for `swarm verify`.
+//! is bounded without a container.
+//!
+//! Buffers are bounded end to end so an untrusted deploy cannot OOM the host or fill its disk:
+//! module bytes ([`MAX_MODULE_BYTES`]) and aggregate stdin ([`MAX_STDIN_BYTES`]) are size-checked
+//! before allocation, stdout is capped ([`MAX_STDOUT_BYTES`]) both in memory and at the disk write,
+//! and an untrusted module's stderr is routed to a bounded pipe — **never** the operator's log.
+//!
+//! Execution is **deterministic** (engine NaN-canonicalized, threads/relaxed-SIMD off — see
+//! [`engine_config`]): the pure-compute path is fully bit-reproducible, which is what makes it ideal
+//! for `swarm verify` (re-run the same module + input on another host, compare output CIDs). The
+//! WASI path is reproducible for modules that do not read the host clock/RNG.
 //!
 //! Trap delivery is configured to be **recoverable on every platform**: a runaway module that
 //! exhausts its fuel (or its wall-clock deadline) returns a catchable `Err`, never aborts the host
@@ -41,6 +51,30 @@ const FUEL_PER_CORE: u64 = 10_000_000_000;
 /// or any platform where a fuel trap is unreliable). Defense-in-depth: an untrusted module can
 /// never run the host indefinitely. Generous so legitimate compute finishes well within it.
 const MAX_WALL_CLOCK: Duration = Duration::from_secs(300);
+
+/// Hard ceiling on a content-addressed **module's** byte size, enforced in [`WasmRuntime::resolve`]
+/// **before** the module is fully read into host RAM. An untrusted deploy cannot make the host
+/// allocate an unbounded buffer just by pointing at a huge blob. 64 MiB is far larger than any
+/// real CE module yet small enough that thousands cannot exhaust host memory.
+const MAX_MODULE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Hard ceiling on the **aggregate** of all staged input blobs concatenated onto a WASI command's
+/// stdin. Inputs are summed and rejected **before** any concatenation, so a large multi-input deploy
+/// can never OOM the host before the module runs. 256 MiB bounds the worst case while leaving room
+/// for legitimate data-layer payloads.
+const MAX_STDIN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Hard ceiling on a WASI command's captured **stdout**, which becomes the published output blob.
+/// This is the single source of truth for the stdout pipe cap *and* the fail-closed guard before the
+/// disk write, so an untrusted module can never write an unbounded output blob to host disk. The
+/// in-memory pipe already truncates at this size; the disk-write guard rejects anything at/over it.
+const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Hard ceiling on a module's captured **stderr**. Untrusted `fd 2` is routed to a bounded in-memory
+/// pipe (never the operator's log stream — that would be ambient authority and a log-injection / log-
+/// flood vector), and is discarded after the run. A small cap suffices: stderr is diagnostic only and
+/// never published.
+const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 /// Epoch tick interval for the watchdog. Each tick increments the engine epoch; the store's epoch
 /// deadline is `MAX_WALL_CLOCK / WATCHDOG_TICK` ticks, so the module is interrupted within roughly
@@ -70,6 +104,26 @@ const WATCHDOG_TICK: Duration = Duration::from_secs(1);
 /// 3. `epoch_interruption(true)` — arms the wall-clock watchdog (see [`run_with_watchdog`]). This is
 ///    defense-in-depth on top of fuel: an untrusted module is bounded by both instruction count
 ///    *and* wall time, on every platform, regardless of any trap-delivery quirk.
+///
+/// And four settings make the **determinism** claim true, so the same module + input yields the
+/// same output bytes (hence the same output CID) on every host — the prerequisite for `swarm verify`
+/// cross-checking a result by re-running it elsewhere:
+///
+/// 4. `cranelift_nan_canonicalization(true)` — floating-point NaN bit patterns are otherwise
+///    architecture-dependent; canonicalizing them makes float results bit-identical across hosts.
+/// 5. threads off — shared memory + atomics admit data races and non-deterministic interleavings.
+///    The wasm-threads proposal is compiled out entirely: `ce-wasm` builds wasmtime with
+///    `default-features = false` (no `threads` feature), so threads are disabled at the crate level
+///    and cannot be re-enabled at runtime. (Hence no `wasm_threads(false)` call — the method does
+///    not even exist without the feature.)
+/// 6. `wasm_relaxed_simd(false)` + `relaxed_simd_deterministic(true)` — relaxed-SIMD instructions are
+///    explicitly allowed to differ per architecture. We disable the proposal entirely **and** pin the
+///    deterministic lowering, so even if a module slips one in it cannot diverge across hosts.
+///
+/// Note: this pins the **engine**. The pure-compute path (empty linker) is then fully reproducible.
+/// The WASI command path still links `clock_time_get`/`random_get` (preview1), so a module that reads
+/// the clock or RNG can still observe host-specific values — bit-reproducible verification applies to
+/// modules that do not call those. De-linking them is left to the capability-gated host ABI (P2).
 fn engine_config() -> Config {
     let mut config = Config::new();
     config.consume_fuel(true);
@@ -79,6 +133,13 @@ fn engine_config() -> Config {
     config.signals_based_traps(false);
     // Never attach a WASM backtrace to wasm errors (modern replacement for `wasm_backtrace(false)`).
     config.wasm_backtrace_max_frames(None);
+    // Determinism: pin float NaN canonicalization and remove the nondeterministic feature surface so
+    // the same module + input is bit-reproducible across hosts (see doc comment, points 4–6).
+    // The wasm-threads proposal is already compiled out (no `threads` crate feature), so there is no
+    // runtime `wasm_threads` toggle to call — threads cannot be enabled.
+    config.cranelift_nan_canonicalization(true);
+    config.wasm_relaxed_simd(false);
+    config.relaxed_simd_deterministic(true);
     config
 }
 
@@ -138,10 +199,23 @@ impl WasmRuntime {
     }
 
     /// Resolve a content-addressed module from the blob store, verifying its hash.
+    ///
+    /// The blob's on-disk size is checked against [`MAX_MODULE_BYTES`] **before** it is read into
+    /// memory, so a deploy pointing at an oversized blob is rejected without allocating it (host-RAM
+    /// DoS defense). This guards modules and staged inputs alike (both resolve through here).
     fn resolve(&self, module_hash: &[u8; 32]) -> Result<Vec<u8>> {
         let path = self.blobs_dir.join(hex::encode(module_hash));
+        let len = std::fs::metadata(&path)
+            .with_context(|| format!("blob {} not in store", hex::encode(&module_hash[..4])))?
+            .len();
+        if len > MAX_MODULE_BYTES {
+            return Err(anyhow!(
+                "blob {} is {len} bytes, exceeds {MAX_MODULE_BYTES}-byte cap",
+                hex::encode(&module_hash[..4])
+            ));
+        }
         let bytes = std::fs::read(&path)
-            .with_context(|| format!("module {} not in blob store", hex::encode(&module_hash[..4])))?;
+            .with_context(|| format!("blob {} not in store", hex::encode(&module_hash[..4])))?;
         let got: [u8; 32] = Sha256::digest(&bytes).into();
         if &got != module_hash {
             return Err(anyhow!("blob hash mismatch for {}", hex::encode(&module_hash[..4])));
@@ -200,12 +274,17 @@ pub fn execute_command(
 
     let module =
         Module::new(engine, wasm).map_err(anyhow::Error::from).context("compile module")?;
-    // 16 MiB stdout cap — bounds a runaway writer; the produced output blob can't exceed it.
-    let stdout = MemoryOutputPipe::new(16 * 1024 * 1024);
+    // stdout cap — bounds a runaway writer; the produced output blob can't exceed `MAX_STDOUT_BYTES`.
+    let stdout = MemoryOutputPipe::new(MAX_STDOUT_BYTES);
+    // stderr is routed to a SEPARATE bounded in-memory pipe and discarded after the run. It is NEVER
+    // inherited onto the host's stderr/log stream: an untrusted module's fd 2 must not be able to
+    // inject ANSI/log lines or flood the operator's logs (ambient authority). The cap bounds the
+    // buffer; we never read it back.
+    let stderr = MemoryOutputPipe::new(MAX_STDERR_BYTES);
     let wasi = WasiCtxBuilder::new()
         .stdin(MemoryInputPipe::new(stdin))
         .stdout(stdout.clone())
-        .inherit_stderr()
+        .stderr(stderr)
         .build_p1();
     let limits = StoreLimitsBuilder::new()
         .memory_size((mem_mb as usize).saturating_mul(1024 * 1024))
@@ -274,7 +353,23 @@ impl Runtime for WasmRuntime {
 
         // WASI command (I/O) path: concatenate the staged input blobs onto stdin, run to
         // completion, and publish stdout to the blob store — returning the output CID.
-        let mut stdin = Vec::new();
+        //
+        // Aggregate-stdin cap: sum the staged input sizes and reject BEFORE concatenating anything
+        // into host RAM, so a large multi-input deploy can never OOM the host before the module runs.
+        // (Each blob is also individually bounded by `resolve`'s `MAX_MODULE_BYTES` check.)
+        let mut total_stdin: u64 = 0;
+        for cid in &inputs {
+            let len = std::fs::metadata(self.blobs_dir.join(hex::encode(cid)))
+                .with_context(|| format!("input {} not staged in blob store", hex::encode(&cid[..4])))?
+                .len();
+            total_stdin = total_stdin.saturating_add(len);
+            if total_stdin > MAX_STDIN_BYTES {
+                return Err(anyhow!(
+                    "aggregate stdin {total_stdin} bytes exceeds {MAX_STDIN_BYTES}-byte cap"
+                ));
+            }
+        }
+        let mut stdin = Vec::with_capacity(total_stdin as usize);
         for cid in &inputs {
             let bytes = self.resolve(cid).with_context(|| {
                 format!("input {} not staged in blob store", hex::encode(&cid[..4]))
@@ -288,6 +383,16 @@ impl Runtime for WasmRuntime {
         .context("wasm command task panicked")??;
         tracing::info!("wasm command job {} exited {code} ({} bytes out)", hex::encode(&job_id[..4]), out.len());
 
+        // Fail closed if the output somehow exceeds the cap before it ever touches disk. The stdout
+        // pipe is already bounded at `MAX_STDOUT_BYTES`, so this is belt-and-suspenders: a single
+        // centralized constant gates both the in-memory pipe and the disk write (output-blob quota),
+        // so an untrusted module can never write an unbounded blob to the host's disk.
+        if out.len() > MAX_STDOUT_BYTES {
+            return Err(anyhow!(
+                "wasm output {} bytes exceeds {MAX_STDOUT_BYTES}-byte cap",
+                out.len()
+            ));
+        }
         // Publish the output to the content-addressed store (same keying as the data layer).
         let cid: [u8; 32] = Sha256::digest(&out).into();
         let hex_cid = hex::encode(cid);
@@ -373,5 +478,112 @@ mod tests {
         let rt = WasmRuntime::new(dir.clone()).unwrap();
         assert_eq!(rt.resolve(&hash).unwrap(), wasm, "correct hash resolves");
         assert!(rt.resolve(&[9u8; 32]).is_err(), "unknown hash errors");
+    }
+
+    /// A WASI command that writes its whole stdin to stderr (fd 2) and exits cleanly. Used to prove
+    /// the host never inherits an untrusted module's stderr.
+    const STDERR_WRITER_WAT: &str = r#"(module
+        (import "wasi_snapshot_preview1" "fd_read"  (func $read  (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (func (export "_start")
+            ;; read iovec @0 -> {buf=64, len=256}; nread @8
+            (i32.store (i32.const 0) (i32.const 64))
+            (i32.store (i32.const 4) (i32.const 256))
+            (drop (call $read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8)))
+            ;; write iovec @16 -> {buf=64, len=nread} to fd 2 (stderr)
+            (i32.store (i32.const 16) (i32.const 64))
+            (i32.store (i32.const 20) (i32.load (i32.const 8)))
+            (drop (call $write (i32.const 2) (i32.const 16) (i32.const 1) (i32.const 24)))))"#;
+
+    #[test]
+    fn stderr_is_not_inherited_to_host() {
+        // A module that writes to stderr must run cleanly with EMPTY stdout (we route stderr to a
+        // bounded, discarded pipe — never the host log). The exit code is 0 and nothing leaks into
+        // the published stdout blob. If stderr were inherited this would still pass functionally, but
+        // the bytes would hit the operator's log; the guarantee under test is that stdout (the only
+        // captured/published surface) stays empty and the run is unaffected.
+        let wasm = wat::parse_str(STDERR_WRITER_WAT).unwrap();
+        let (code, out) =
+            execute_command(&engine(), &wasm, 1_000_000_000, 16, b"leak-me".to_vec()).unwrap();
+        assert_eq!(code, 0, "clean exit");
+        assert!(out.is_empty(), "stderr output must NOT appear on captured stdout");
+    }
+
+    #[test]
+    fn oversized_module_rejected_before_alloc() {
+        // A blob larger than MAX_MODULE_BYTES is rejected by `resolve` on its on-disk size, before it
+        // is ever read into RAM — so an oversized deploy cannot OOM the host.
+        let dir = std::env::temp_dir().join(format!("ce-wasm-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // We can't cheaply write 64 MiB; instead point a hash at a blob and assert the size gate
+        // triggers using a sparse file of the right length.
+        let hash = [3u8; 32];
+        let path = dir.join(hex::encode(hash));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_MODULE_BYTES + 1).unwrap();
+        drop(f);
+        let rt = WasmRuntime::new(dir.clone()).unwrap();
+        let err = rt.resolve(&hash).unwrap_err().to_string();
+        assert!(err.contains("exceeds"), "oversized module must be rejected: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_aggregate_stdin_rejected_before_alloc() {
+        // Two sparse input blobs whose sizes sum past MAX_STDIN_BYTES must be rejected by `launch`
+        // before any concatenation into host RAM. Each blob individually is under MAX_MODULE_BYTES,
+        // so only the AGGREGATE cap can catch this.
+        let dir = std::env::temp_dir().join(format!("ce-wasm-stdin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A trivial _start module is enough; we never reach execution.
+        let module = wat::parse_str(r#"(module (func (export "_start")))"#).unwrap();
+        let mod_hash: [u8; 32] = Sha256::digest(&module).into();
+        std::fs::write(dir.join(hex::encode(mod_hash)), &module).unwrap();
+
+        // Each input is half of MAX_STDIN_BYTES + 1, so together they exceed the cap but each is far
+        // under MAX_MODULE_BYTES would-be limit (they are < 64 MiB? no — they are 128 MiB each).
+        // Use sparse files; only metadata().len() is consulted before rejection.
+        let chunk = MAX_STDIN_BYTES / 2 + 1;
+        let mut inputs = Vec::new();
+        for i in 0..2u8 {
+            let cid = [10u8 + i; 32];
+            let f = std::fs::File::create(dir.join(hex::encode(cid))).unwrap();
+            f.set_len(chunk).unwrap();
+            drop(f);
+            inputs.push(cid);
+        }
+        let rt = WasmRuntime::new(dir.clone()).unwrap();
+        let workload = Workload::Wasm {
+            module_hash: mod_hash,
+            entry: "_start".into(),
+            inputs,
+            args: vec![],
+        };
+        let limits = Limits { cpu_cores: 1, mem_mb: 16 };
+        let rt2 = &rt;
+        let res = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { rt2.launch(&workload, &limits, [0u8; 32]).await });
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("aggregate stdin"), "oversized aggregate stdin must be rejected: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deterministic_config_yields_identical_output_cid() {
+        // The same module + input must produce the same output bytes (hence the same output CID) on
+        // every run, with a fresh engine each time — the property `swarm verify` relies on.
+        let wasm = wat::parse_str(ECHO_WAT).unwrap();
+        let run = || {
+            let (_code, out) =
+                execute_command(&engine(), &wasm, 1_000_000_000, 16, b"determinism".to_vec()).unwrap();
+            let cid: [u8; 32] = Sha256::digest(&out).into();
+            cid
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(a, b, "same module + input must yield identical output CID across runs");
     }
 }

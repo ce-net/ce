@@ -98,8 +98,12 @@ findings (see [sybil-resistance.md](sybil-resistance.md) §3):
 - **Unverified capacity ads** — `CellSignal` capacity values (`cpu`, `mem_mb`, `tag:gpu`) are signed
   but never checked for truth; a Sybil advertises capacity it doesn't have and wins JobBids it can't
   serve (the io.net April-2024 fake-GPU pattern). (E2)
-- **Unverified heartbeat billing** — `Heartbeat.amount` has no proof field; a modified host bills
-  arbitrary amounts up to the cell's balance with no proof a container ran. (E3)
+- **Unverified heartbeat billing** — `Heartbeat.amount` carries no proof-of-work-done metric, so a
+  host can still over-bill *within* a job for compute it didn't deliver. The **unconsented drain** is,
+  however, closed (E3, FIXED): a `Heartbeat` must now name an OPEN `JobBid` whose `payer` equals the
+  billed cell, and cumulative heartbeat cost per job is bounded by that bid's locked escrow — so a host
+  can never bill a cell beyond what the cell itself escrowed via a bid it signed. The residual gap is
+  metering accuracy *inside* a consented budget, not unauthorized billing. (E3)
 - **Wash-traded reputation** — `JobSettle` never verifies host work, so payer+host identities owned
   by one attacker self-deal to fabricate `/history` reputation (the EigenTrust self-promotion
   problem). (E4)
