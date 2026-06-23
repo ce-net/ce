@@ -257,6 +257,33 @@ impl NodeConfig {
     }
 }
 
+/// The node's implementation of the capability-gated WASM host ABI ([`ce_wasm::host_abi::HostServices`]).
+/// `log` goes to the node's tracing stream; blob read/write are wired to the same content-addressed
+/// blob store directory the WASM runtime already resolves modules from (`<data_dir>/blobs`, keyed by
+/// hex sha256), so a module can publish and fetch blobs through the host without any new RPC.
+struct NodeWasmHost {
+    blobs_dir: PathBuf,
+}
+
+impl ce_wasm::host_abi::HostServices for NodeWasmHost {
+    fn blob_read(&self, cid: &str) -> Option<Vec<u8>> {
+        // Verify the on-disk bytes hash to the requested CID (content addressing) before returning.
+        let bytes = std::fs::read(self.blobs_dir.join(cid)).ok()?;
+        let got = hex::encode(Sha256::digest(&bytes));
+        if got == cid { Some(bytes) } else { None }
+    }
+    fn blob_write(&self, bytes: &[u8]) -> String {
+        let cid = hex::encode(Sha256::digest(bytes));
+        let _ = std::fs::create_dir_all(&self.blobs_dir);
+        // Best-effort persist; the CID is returned regardless so the guest gets a stable address.
+        let _ = std::fs::write(self.blobs_dir.join(&cid), bytes);
+        cid
+    }
+    fn log(&self, msg: &str) {
+        tracing::info!("wasm host-log: {msg}");
+    }
+}
+
 // ----- Node -----
 
 pub struct Node {
@@ -301,10 +328,31 @@ impl Node {
             }
         }
         // WASM runs everywhere (no external daemon), so every node offers it. Modules are
-        // resolved from the content-addressed blob store under the data dir.
+        // resolved from the content-addressed blob store under the data dir. The runtime is given
+        // the capability-gated CE host ABI (P2): WASM modules may reach the host log and the blob
+        // store, gated per-call by a node-self-issued capability granting `ce:log`, `ce:blob.read`,
+        // and `ce:blob.write`. The chain roots at the node's own identity, so it verifies without
+        // any external trust configuration; tighter per-job scoping can replace it later.
         let blobs_dir = config.data_dir.join("blobs");
         let _ = std::fs::create_dir_all(&blobs_dir);
-        match ce_wasm::WasmRuntime::new(blobs_dir) {
+        let host_services: Arc<dyn ce_wasm::host_abi::HostServices> =
+            Arc::new(NodeWasmHost { blobs_dir: blobs_dir.clone() });
+        let host_cap = {
+            let cap = ce_cap::SignedCapability::issue(
+                identity.as_ref(),
+                identity.node_id(),
+                vec!["ce:log".to_string(), "ce:blob.read".to_string(), "ce:blob.write".to_string()],
+                ce_cap::Resource::Any,
+                ce_cap::Caveats::default(),
+                0,
+                None,
+            );
+            ce_wasm::host_abi::HostCapability {
+                node_id: identity.node_id(),
+                chain: Arc::new(vec![cap]),
+            }
+        };
+        match ce_wasm::WasmRuntime::with_host(blobs_dir, host_services, host_cap) {
             Ok(rt) => runtimes.push(Arc::new(rt)),
             Err(e) => warn!("wasm runtime init: {e}"),
         }
