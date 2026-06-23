@@ -22,13 +22,11 @@ get_sha() {
 
 SHA_LINUX_AMD64=$(get_sha "ce-linux-amd64.tar.gz")
 SHA_LINUX_ARM64=$(get_sha "ce-linux-arm64.tar.gz")
-SHA_MACOS_AMD64=$(get_sha "ce-macos-amd64.tar.gz")
 SHA_MACOS_ARM64=$(get_sha "ce-macos-arm64.tar.gz")
 SHA_WINDOWS=$(get_sha "ce-windows-amd64.zip")
 
 echo "linux-amd64:   ${SHA_LINUX_AMD64}"
 echo "linux-arm64:   ${SHA_LINUX_ARM64}"
-echo "macos-amd64:   ${SHA_MACOS_AMD64}"
 echo "macos-arm64:   ${SHA_MACOS_ARM64}"
 echo "windows-amd64: ${SHA_WINDOWS}"
 
@@ -39,7 +37,6 @@ update_formula() {
   sed -i.bak \
     -e "s|version \".*\"|version \"${VERSION}\"|" \
     -e "s|PLACEHOLDER_MACOS_ARM64|${SHA_MACOS_ARM64}|" \
-    -e "s|PLACEHOLDER_MACOS_AMD64|${SHA_MACOS_AMD64}|" \
     -e "s|PLACEHOLDER_LINUX_ARM64|${SHA_LINUX_ARM64}|" \
     -e "s|PLACEHOLDER_LINUX_AMD64|${SHA_LINUX_AMD64}|" \
     "${FORMULA}"

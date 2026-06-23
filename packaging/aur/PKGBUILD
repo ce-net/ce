@@ -12,8 +12,8 @@ conflicts=('ce')
 source_x86_64=("ce::https://github.com/ce-net/ce/releases/download/v${pkgver}/ce-linux-amd64.tar.gz")
 source_aarch64=("ce::https://github.com/ce-net/ce/releases/download/v${pkgver}/ce-linux-arm64.tar.gz")
 # Update sha256sums after each release (see sha256sums.txt in GitHub release assets)
-sha256sums_x86_64=('SKIP')
-sha256sums_aarch64=('SKIP')
+sha256sums_x86_64=('7611ebefde6ec1f2935f90ddd2661cbb0f58b63247a8ff268a1572790f302b46')
+sha256sums_aarch64=('d02e7f089e909bb4694b843dc3e293501e6116230e67e15902ee560afaad0b42')
 
 package() {
     install -Dm755 "${srcdir}/ce" "${pkgdir}/usr/bin/ce"

@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/ce-net/ce/releases/download/v0.1.0/ce-windows-amd64.zip",
-            "hash": "PLACEHOLDER"
+            "hash": "8b2064e46ffacca054d51c4f312eb9e5c89104fdec6d35c3199fc2474a6b42a3"
         }
     },
     "bin": "ce.exe",
