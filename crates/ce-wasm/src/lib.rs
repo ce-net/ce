@@ -33,8 +33,11 @@
 //! process. See [`engine_config`] for the Windows-specific reason signals-based trap delivery is
 //! disabled.
 
+pub mod host_abi;
+
 use anyhow::{anyhow, Context, Result};
 use ce_runtime::{Handle, Limits, Runtime, Workload};
+use host_abi::{HostCapability, HostCtx, HostServices, HostState};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -189,13 +192,32 @@ pub struct WasmRuntime {
     engine: Engine,
     /// Directory of content-addressed blobs: `<blobs_dir>/<hex(sha256)>` holds module bytes.
     blobs_dir: PathBuf,
+    /// Capability-gated CE host ABI, when the node has provisioned it. `None` preserves the
+    /// original pure-compute / plain-WASI behavior exactly (no `ce` host imports registered). When
+    /// `Some`, modules may call the `ce` host functions, still gated per-call by the capability.
+    host: Option<(Arc<dyn HostServices>, HostCapability)>,
 }
 
 impl WasmRuntime {
+    /// A runtime with **no** CE host ABI: the original behavior (empty-linker pure compute, or
+    /// plain WASI). Modules importing `ce_*` host functions fail to instantiate.
     pub fn new(blobs_dir: PathBuf) -> Result<Self> {
         let engine =
             Engine::new(&engine_config()).map_err(anyhow::Error::from).context("wasmtime engine")?;
-        Ok(Self { engine, blobs_dir })
+        Ok(Self { engine, blobs_dir, host: None })
+    }
+
+    /// A runtime that exposes the capability-gated CE host ABI. `host` backs the `ce_*` host
+    /// functions; `cap` is the verified capability chain whose abilities (`ce:log`, `ce:blob.read`,
+    /// `ce:blob.write`) gate each call. A module without host services can never reach CE primitives.
+    pub fn with_host(
+        blobs_dir: PathBuf,
+        host: Arc<dyn HostServices>,
+        cap: HostCapability,
+    ) -> Result<Self> {
+        let engine =
+            Engine::new(&engine_config()).map_err(anyhow::Error::from).context("wasmtime engine")?;
+        Ok(Self { engine, blobs_dir, host: Some((host, cap)) })
     }
 
     /// Resolve a content-addressed module from the blob store, verifying its hash.
@@ -320,6 +342,121 @@ pub fn execute_command(
     Ok((code, stdout.contents().to_vec()))
 }
 
+/// Run a module's exported `entry` (`() -> i32`) with the capability-gated CE host ABI available.
+///
+/// Identical bounds to [`execute`] (fuel, memory, watchdog), but the `"ce"` host imports are
+/// registered, gated by the supplied [`HostCapability`] and backed by [`HostServices`]. A module
+/// that imports `ce_log`/`ce_blob_read`/`ce_blob_write` instantiates only on this path; on the
+/// plain [`execute`] path (empty linker) it fails to instantiate — so host access is strictly
+/// opt-in. The entry must export `() -> i32`.
+pub fn execute_with_host(
+    engine: &Engine,
+    wasm: &[u8],
+    entry: &str,
+    fuel: u64,
+    mem_mb: u64,
+    host: Arc<dyn HostServices>,
+    cap: HostCapability,
+) -> Result<i32> {
+    let module =
+        Module::new(engine, wasm).map_err(anyhow::Error::from).context("compile module")?;
+    let limits = StoreLimitsBuilder::new()
+        .memory_size((mem_mb as usize).saturating_mul(1024 * 1024))
+        .build();
+    let mut store = Store::new(
+        engine,
+        HostState { limits, host_ctx: HostCtx { host, cap }, wasi: None },
+    );
+    store.limiter(|s: &mut HostState| &mut s.limits);
+    store.set_fuel(fuel).map_err(anyhow::Error::from).context("set fuel")?;
+    // Arm a non-zero epoch deadline before instantiation: the engine has `epoch_interruption(true)`,
+    // and a store's deadline defaults to 0 (interrupt on the first check), which can trap during
+    // instantiation of a module with active memory initializers. `run_with_watchdog` resets this to
+    // the real wall-clock budget before the call. (The no-host paths instantiate trivial modules and
+    // don't hit this; the host paths run richer modules with data segments.)
+    store.set_epoch_deadline(u64::MAX);
+
+    let mut linker: Linker<HostState> = Linker::new(engine);
+    host_abi::register(&mut linker).context("register host ABI")?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(anyhow::Error::from)
+        .context("instantiate")?;
+    let func = instance
+        .get_typed_func::<(), i32>(&mut store, entry)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("export `{entry}` with signature () -> i32"))?;
+    run_with_watchdog(engine, &mut store, |store| {
+        func.call(store, ()).map_err(anyhow::Error::from).context("wasm trap")
+    })
+}
+
+/// Run a WASI command (`_start`) with both the WASI preview1 surface and the capability-gated CE
+/// host ABI available. stdin/stdout marshalling matches [`execute_command`]; the `"ce"` host
+/// imports are additionally registered and gated by `cap`/`host`.
+pub fn execute_command_with_host(
+    engine: &Engine,
+    wasm: &[u8],
+    fuel: u64,
+    mem_mb: u64,
+    stdin: Vec<u8>,
+    host: Arc<dyn HostServices>,
+    cap: HostCapability,
+) -> Result<(i32, Vec<u8>)> {
+    use wasmtime_wasi::WasiCtxBuilder;
+    use wasmtime_wasi::p1;
+    use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+
+    let module =
+        Module::new(engine, wasm).map_err(anyhow::Error::from).context("compile module")?;
+    let stdout = MemoryOutputPipe::new(MAX_STDOUT_BYTES);
+    let stderr = MemoryOutputPipe::new(MAX_STDERR_BYTES);
+    let wasi = WasiCtxBuilder::new()
+        .stdin(MemoryInputPipe::new(stdin))
+        .stdout(stdout.clone())
+        .stderr(stderr)
+        .build_p1();
+    let limits = StoreLimitsBuilder::new()
+        .memory_size((mem_mb as usize).saturating_mul(1024 * 1024))
+        .build();
+    let mut store = Store::new(
+        engine,
+        HostState { limits, host_ctx: HostCtx { host, cap }, wasi: Some(wasi) },
+    );
+    store.limiter(|s: &mut HostState| &mut s.limits);
+    store.set_fuel(fuel).map_err(anyhow::Error::from).context("set fuel")?;
+    // See `execute_with_host`: arm a non-zero epoch deadline before instantiation; the watchdog
+    // resets it to the wall-clock budget for the call.
+    store.set_epoch_deadline(u64::MAX);
+
+    let mut linker: Linker<HostState> = Linker::new(engine);
+    // WASI accessor unwraps the Some(wasi) installed above; this path always sets it.
+    p1::add_to_linker_sync(&mut linker, |s: &mut HostState| {
+        s.wasi.as_mut().expect("WASI ctx present on the command path")
+    })
+    .map_err(anyhow::Error::from)
+    .context("add wasi to linker")?;
+    host_abi::register(&mut linker).context("register host ABI")?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(anyhow::Error::from)
+        .context("instantiate")?;
+    let start = instance
+        .get_typed_func::<(), ()>(&mut store, "_start")
+        .map_err(anyhow::Error::from)
+        .context("export `_start` (WASI command)")?;
+    let call = run_with_watchdog(engine, &mut store, |store| Ok(start.call(store, ())));
+    let code = match call? {
+        Ok(()) => 0,
+        Err(e) => match e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+            Some(exit) => exit.0,
+            None => return Err(anyhow::Error::from(e)).context("wasm trap"),
+        },
+    };
+    drop(store);
+    Ok((code, stdout.contents().to_vec()))
+}
+
 #[async_trait::async_trait]
 impl Runtime for WasmRuntime {
     fn tag(&self) -> &'static str {
@@ -341,12 +478,22 @@ impl Runtime for WasmRuntime {
         let fuel = (limits.cpu_cores.max(1) as u64).saturating_mul(FUEL_PER_CORE);
         let mem_mb = limits.mem_mb;
         let handle = Handle(hex::encode(job_id));
+        // When the node provisioned the CE host ABI, run on the host-enabled path (the `ce` imports
+        // are registered, gated per call by the capability). Otherwise keep the original paths
+        // (empty linker / plain WASI) byte-for-byte.
+        let host = self.host.clone();
 
         if entry != "_start" {
             // Self-contained `() -> i32` path: detached, no captured output.
-            tokio::task::spawn_blocking(move || match execute(&engine, &wasm, &entry, fuel, mem_mb) {
-                Ok(code) => tracing::info!("wasm job {} exited {code}", hex::encode(&job_id[..4])),
-                Err(e) => tracing::warn!("wasm job {} failed: {e}", hex::encode(&job_id[..4])),
+            tokio::task::spawn_blocking(move || {
+                let r = match host {
+                    Some((h, cap)) => execute_with_host(&engine, &wasm, &entry, fuel, mem_mb, h, cap),
+                    None => execute(&engine, &wasm, &entry, fuel, mem_mb),
+                };
+                match r {
+                    Ok(code) => tracing::info!("wasm job {} exited {code}", hex::encode(&job_id[..4])),
+                    Err(e) => tracing::warn!("wasm job {} failed: {e}", hex::encode(&job_id[..4])),
+                }
             });
             return Ok((handle, None));
         }
@@ -376,8 +523,9 @@ impl Runtime for WasmRuntime {
             })?;
             stdin.extend_from_slice(&bytes);
         }
-        let (code, out) = tokio::task::spawn_blocking(move || {
-            execute_command(&engine, &wasm, fuel, mem_mb, stdin)
+        let (code, out) = tokio::task::spawn_blocking(move || match host {
+            Some((h, cap)) => execute_command_with_host(&engine, &wasm, fuel, mem_mb, stdin, h, cap),
+            None => execute_command(&engine, &wasm, fuel, mem_mb, stdin),
         })
         .await
         .context("wasm command task panicked")??;
@@ -585,5 +733,165 @@ mod tests {
         let a = run();
         let b = run();
         assert_eq!(a, b, "same module + input must yield identical output CID across runs");
+    }
+
+    // ---- P2: capability-gated host ABI ----
+
+    use ce_cap::{Caveats, Resource, SignedCapability};
+    use ce_identity::Identity;
+    use host_abi::{HostCapability, HostServices, HOST_CALL_FUEL};
+    use std::sync::Mutex;
+
+    /// An in-memory [`HostServices`] that records logged lines and stores blobs keyed by hex sha256.
+    #[derive(Default)]
+    struct TestHost {
+        logs: Mutex<Vec<String>>,
+        blobs: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    impl HostServices for TestHost {
+        fn blob_read(&self, cid: &str) -> Option<Vec<u8>> {
+            self.blobs.lock().unwrap().get(cid).cloned()
+        }
+        fn blob_write(&self, bytes: &[u8]) -> String {
+            let cid = hex::encode(Sha256::digest(bytes));
+            self.blobs.lock().unwrap().insert(cid.clone(), bytes.to_vec());
+            cid
+        }
+        fn log(&self, msg: &str) {
+            self.logs.lock().unwrap().push(msg.to_string());
+        }
+    }
+
+    /// A fresh identity in a unique temp dir.
+    fn test_identity() -> Identity {
+        // Unique, Windows-safe temp dir name: SystemTime's Debug output contains ':' and spaces,
+        // which are invalid in Windows paths — use a numeric atomic counter for uniqueness instead.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ce-wasm-id-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Identity::load_or_generate(&dir).unwrap()
+    }
+
+    /// A node-self-issued [`HostCapability`] granting `abilities`.
+    fn host_cap(node: &Identity, abilities: &[&str]) -> HostCapability {
+        let cap = SignedCapability::issue(
+            node,
+            node.node_id(),
+            abilities.iter().map(|a| a.to_string()).collect(),
+            Resource::Any,
+            Caveats::default(),
+            1,
+            None,
+        );
+        HostCapability { node_id: node.node_id(), chain: Arc::new(vec![cap]) }
+    }
+
+    /// Module that calls `ce_log` on a fixed in-memory string and returns 0.
+    const LOG_WAT: &str = r#"(module
+        (import "ce" "ce_log" (func $log (param i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 64) "hi from wasm")
+        (func (export "entry") (result i32)
+            (call $log (i32.const 64) (i32.const 12))
+            (i32.const 0)))"#;
+
+    /// Module that writes 4 bytes ("blob") via `ce_blob_write` and returns the host's return code
+    /// (bytes of CID written, or negative error).
+    const BLOB_WRITE_WAT: &str = r#"(module
+        (import "ce" "ce_blob_write" (func $write (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 64) "blob")
+        (func (export "entry") (result i32)
+            ;; payload @64 len 4; out cid buffer @128 cap 128
+            (call $write (i32.const 64) (i32.const 4) (i32.const 128) (i32.const 128))))"#;
+
+    #[test]
+    fn host_log_with_capability_succeeds() {
+        // (a) a guest that calls ce_log under a granting capability succeeds and the host sees it.
+        let node = test_identity();
+        let host = Arc::new(TestHost::default());
+        let cap = host_cap(&node, &[host_abi::ABILITY_LOG]);
+        let wasm = wat::parse_str(LOG_WAT).unwrap();
+        let code = execute_with_host(&engine(), &wasm, "entry", 1_000_000, 16, host.clone(), cap)
+            .expect("ce_log under a granting capability must succeed");
+        assert_eq!(code, 0);
+        assert_eq!(host.logs.lock().unwrap().as_slice(), &["hi from wasm".to_string()]);
+    }
+
+    #[test]
+    fn host_log_without_capability_traps() {
+        // ce_log has no error return, so a missing ability must TRAP (Err), not silently no-op.
+        let node = test_identity();
+        let host = Arc::new(TestHost::default());
+        let cap = host_cap(&node, &[host_abi::ABILITY_BLOB_READ]); // grants something else
+        let wasm = wat::parse_str(LOG_WAT).unwrap();
+        let r = execute_with_host(&engine(), &wasm, "entry", 1_000_000, 16, host.clone(), cap);
+        assert!(r.is_err(), "ce_log without ce:log must trap");
+        assert!(host.logs.lock().unwrap().is_empty(), "nothing must be logged");
+    }
+
+    #[test]
+    fn host_blob_write_without_capability_is_rejected() {
+        // (b) a module calling ce_blob_write without "ce:blob.write" gets the negative error code
+        // and nothing is stored.
+        let node = test_identity();
+        let host = Arc::new(TestHost::default());
+        let cap = host_cap(&node, &[host_abi::ABILITY_LOG]); // does NOT grant blob.write
+        let wasm = wat::parse_str(BLOB_WRITE_WAT).unwrap();
+        let code = execute_with_host(&engine(), &wasm, "entry", 1_000_000, 16, host.clone(), cap)
+            .expect("the host fn returns an error code, not a trap, for blob write");
+        assert_eq!(code, host_abi::ERR_NO_CAP, "denied write must return ERR_NO_CAP");
+        assert!(host.blobs.lock().unwrap().is_empty(), "nothing must be stored");
+    }
+
+    #[test]
+    fn host_blob_write_with_capability_returns_cid() {
+        // (c) with the ability, ce_blob_write succeeds, stores the bytes, and returns the CID length.
+        let node = test_identity();
+        let host = Arc::new(TestHost::default());
+        let cap = host_cap(&node, &[host_abi::ABILITY_BLOB_WRITE]);
+        let wasm = wat::parse_str(BLOB_WRITE_WAT).unwrap();
+        let code = execute_with_host(&engine(), &wasm, "entry", 1_000_000, 16, host.clone(), cap)
+            .expect("granted blob write succeeds");
+        // A hex sha256 CID is 64 chars; the host returns the number of CID bytes written.
+        assert_eq!(code, 64, "returns the CID byte length");
+        let expected = hex::encode(Sha256::digest(b"blob"));
+        assert_eq!(host.blobs.lock().unwrap().get(&expected).map(|v| v.as_slice()), Some(&b"blob"[..]));
+    }
+
+    #[test]
+    fn host_call_consumes_fuel() {
+        // (d) a host call deducts at least HOST_CALL_FUEL beyond the few instructions it runs.
+        // Run the log module with exactly HOST_CALL_FUEL - 1 fuel: the host call cannot pay its gas
+        // and traps, proving the host call is charged.
+        let node = test_identity();
+        let host = Arc::new(TestHost::default());
+        let cap = host_cap(&node, &[host_abi::ABILITY_LOG]);
+        let wasm = wat::parse_str(LOG_WAT).unwrap();
+        let r = execute_with_host(
+            &engine(),
+            &wasm,
+            "entry",
+            HOST_CALL_FUEL - 1,
+            16,
+            host.clone(),
+            cap,
+        );
+        assert!(r.is_err(), "a host call with insufficient fuel must trap (gas charged)");
+        assert!(host.logs.lock().unwrap().is_empty(), "the underpaid call must not run");
+    }
+
+    #[test]
+    fn host_abi_module_fails_on_pure_compute_path() {
+        // The pure-compute path (no host services) registers no `ce` imports, so a module importing
+        // them fails to instantiate — host access is strictly opt-in.
+        let wasm = wat::parse_str(LOG_WAT).unwrap();
+        let r = execute(&engine(), &wasm, "entry", 1_000_000, 16);
+        assert!(r.is_err(), "a module importing `ce` host fns must not instantiate without host services");
     }
 }

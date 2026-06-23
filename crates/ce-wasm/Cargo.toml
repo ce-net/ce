@@ -6,6 +6,8 @@ description = "WebAssembly execution backend for CE: a wasmtime-based Runtime, f
 
 [dependencies]
 ce-runtime = { path = "../ce-runtime" }
+ce-cap = { path = "../ce-cap" }
+ce-identity = { path = "../ce-identity" }
 anyhow = "1"
 async-trait = "0.1"
 sha2 = "0.10"
