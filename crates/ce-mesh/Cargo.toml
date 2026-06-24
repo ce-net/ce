@@ -17,3 +17,8 @@ anyhow = "1"
 async-trait = "0.1"
 tracing = "0.1"
 futures = "0.3"
+# Sybil-security P7 (placement_beacon): a VETTED Wesolowski/Pietrzak VDF crate. TODO(P7): enable a
+# real crate (e.g. `vdf = "0.1"`, class-group based) once it builds cleanly here; until then
+# placement_beacon ships a clearly-marked `PlaceholderVdf` behind the `Vdf` trait — never a
+# hand-rolled VDF. Left commented so the scaffold builds without heavy C deps (task crypto rule).
+# vdf = "0.1"

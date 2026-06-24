@@ -5,6 +5,15 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ---- Sybil-security phases P4-P9 (PLAN/compute-donation-sybil-security.md) ----
+// Each phase owns its own module; lib.rs carries only the thin TxKind variants + dispatch arms
+// that call into these, so six implementers fill disjoint files without colliding here.
+pub mod bond_gate; // P4 — design 2(a): bond gate, sizing+floor, per-job slice-lock.
+pub mod capacity_audit; // P6 — design 2(c): continuous job-bound capacity audits + FaultFee.
+pub mod held_escrow; // P8 — design 2(d)/2(e): held escrow + MeritRank substrate.
+pub mod lineage; // P9 — design 2(f)/2(b2): bond-funding lineage + earned-accounting.
+pub mod verification; // P7 — design 2(c)/2(b2)/2(d): verify dial + verification slashing.
+
 /// Difficulty adjustment window (blocks).
 pub const DIFFICULTY_WINDOW: u64 = 2016;
 /// Target inter-block time in seconds.
@@ -282,6 +291,35 @@ pub enum TxKind {
     /// bond: the reporter receives `SLASH_REPORTER_BPS`, the remainder is destroyed. Idempotent per
     /// `(offender, domain, epoch)`.
     SlashEquivocation { offender: NodeId, reporter: NodeId, proof: EquivocationProof },
+
+    // ---- Sybil-security phases P4-P9 (PLAN/compute-donation-sybil-security.md) ----
+    // NOTE: these are appended at the END of the enum so existing bincode tag indices (0..=N for
+    // the variants above) are unchanged — old chain files still decode. Each new variant carries a
+    // doc comment citing its phase + design section. Validation lives in the per-phase module; the
+    // append()/apply_block_to_cache dispatch arms are thin and call into those modules.
+    /// P6 — design 2(c). A host publishes (or refreshes) its advertised capacity for an epoch.
+    /// Bond-gated (P4): the host must hold `bond >= required_bond(capacity_units)`. Signed by the
+    /// host (origin == host). The per-epoch claim is equivocation-bindable so two conflicting ads
+    /// for one epoch are slashable. Validated by `capacity_audit::validate_capacity_ad`.
+    CapacityAd { host: NodeId, capacity_units: u64, epoch: u64 },
+    /// P6 — design 2(c). A host's answer to an outstanding beacon-seeded, job-session-bound
+    /// capacity challenge for `epoch`. On-chain ABSENCE of this (after >=3-relay multi-epoch
+    /// confirmation) is what `SlashCapacityChallenge` proves. Signed by the host.
+    /// Validated by `capacity_audit::validate_challenge_response`.
+    ChallengeResponse { host: NodeId, epoch: u64, response_hash: [u8; 32] },
+    /// P6 — design 2(c)/2(d) slash class 2. Charge a self-healing `FaultFee = 1/32 bond` for a
+    /// provable missed capacity challenge (NOT confiscation). Submitted by the reporter
+    /// (origin == reporter). Validated/sized by `capacity_audit::validate_capacity_slash`.
+    SlashCapacityChallenge { offender: NodeId, reporter: NodeId, epoch: u64 },
+    /// P7 — design 2(c). A host commits the result hash of a completed job so a later fraud proof /
+    /// referee re-execution can be checked against it. Signed by the host (origin == host).
+    /// Validated by `verification::validate_job_result`.
+    JobResult { job_id: [u8; 32], host: NodeId, result_hash: [u8; 32] },
+    /// P7 — design 2(c)/2(d) slash class 3. Slash a host whose result diverged from a REFEREE
+    /// RE-EXECUTION (never a peer-vote minority) and outside the signed NAO band. Reward is
+    /// MULTI-WINNER + forced-error and dominated by burn (>=90%). Submitted by the reporter.
+    /// Validated/sized by `verification::validate_verification_slash`.
+    SlashVerificationFault { offender: NodeId, reporter: NodeId, job_id: [u8; 32] },
 }
 
 /// Validate a claimable name: 3–32 chars, lowercase ascii letters/digits/hyphen, not starting or
@@ -655,6 +693,16 @@ pub fn tx_names_node(tx: &Tx, node: &NodeId) -> bool {
         TxKind::HostBond { host, .. } => host == node,
         TxKind::HostUnbond { host } => host == node,
         TxKind::SlashEquivocation { offender, reporter, .. } => offender == node || reporter == node,
+        // Sybil-security P4-P9 variants.
+        TxKind::CapacityAd { host, .. } => host == node,
+        TxKind::ChallengeResponse { host, .. } => host == node,
+        TxKind::SlashCapacityChallenge { offender, reporter, .. } => {
+            offender == node || reporter == node
+        }
+        TxKind::JobResult { host, .. } => host == node,
+        TxKind::SlashVerificationFault { offender, reporter, .. } => {
+            offender == node || reporter == node
+        }
     }
 }
 
@@ -970,6 +1018,21 @@ impl Chain {
                     }
                     self.slashed_equivocations.insert((*offender, proof.domain, proof.epoch));
                 }
+                // ---- Sybil-security phases P4-P9 (apply-side state mutation) ----
+                // Scaffold: these arms are intentionally no-ops on cache state. Each phase's
+                // implementer wires the real bookkeeping here (capacity claims, challenge records,
+                // FaultFee/slash routing, held-balance ledger) by calling into its module:
+                //   CapacityAd/ChallengeResponse -> capacity_audit (P6)
+                //   SlashCapacityChallenge       -> capacity_audit::validate_capacity_slash (P6)
+                //   JobResult                    -> verification (P7)
+                //   SlashVerificationFault       -> verification::validate_verification_slash (P7)
+                // Held-escrow withholding/forfeiture (held_escrow, P8) and lineage earned-accounting
+                // (lineage, P9) hook the JobSettle/Heartbeat/HostBond arms above — see those modules.
+                TxKind::CapacityAd { .. } => { /* TODO(P6): record claim */ }
+                TxKind::ChallengeResponse { .. } => { /* TODO(P6): record response */ }
+                TxKind::SlashCapacityChallenge { .. } => { /* TODO(P6): charge FaultFee + burn */ }
+                TxKind::JobResult { .. } => { /* TODO(P7): record committed result hash */ }
+                TxKind::SlashVerificationFault { .. } => { /* TODO(P7): slash + multi-winner reward */ }
             }
             self.tx_index.insert(tx.id(), (block.index, pos));
         }

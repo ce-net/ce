@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 /// Pure + transport-free; the node updates the local coordinate from measured ping RTTs and carries
 /// it in the atlas so the `ce-graph` SDK can assemble global topology. See `docs/compute-fabric.md`.
 pub mod vivaldi;
+// Sybil-security phases (PLAN/compute-donation-sybil-security.md).
+pub mod net_hardening; // P5 — design 3 net / 6 Phase 5: libp2p hardening, eclipse/disappearance.
+pub mod placement_beacon; // P7 — design 2(b): mandatory VDF + windowed + commit-reveal placement.
 
 pub use ce_identity::NodeId as CeNodeId;
 pub use libp2p::PeerId as CePeerId;

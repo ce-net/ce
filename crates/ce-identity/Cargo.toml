@@ -9,6 +9,10 @@ rand = "0.8"
 hex = "0.4"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+# Sybil-security P9: harden the signature-as-VRF (today SHA256(Ed25519-sig)) to RFC 9381 ECVRF.
+# TODO(P9): enable a vetted ECVRF crate (e.g. `schnorrkel` for sr25519 VRF, or a RFC-9381 ECVRF
+# impl) and expose a clean `Vrf` trait. Left commented so the scaffold builds; never hand-roll.
+# schnorrkel = "0.11"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
