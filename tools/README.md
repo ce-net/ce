@@ -1,17 +1,17 @@
 # Dev tools
 
-## `cebuild` — build/test/run a repo on a remote CE node
+## `ce-build` — build/test/run a repo on a remote CE node
 
-Dev laptops run out of disk and RAM; the mesh has nodes that don't. `cebuild` offloads cargo work
+Dev laptops run out of disk and RAM; the mesh has nodes that don't. `ce-build` offloads cargo work
 onto a CE node (the Hetzner relay by default) in a sandboxed `rust` container, instead of melting
 the laptop. Run it from the workspace root (`~/ce-net`):
 
 ```sh
-ce/tools/cebuild <repo-path> [cargo subcommand + args...]   # default: test
+ce/tools/ce-build <repo-path> [cargo subcommand + args...]   # default: test
 
-ce/tools/cebuild ce-ratio test
-ce/tools/cebuild web/ce-hub test
-ce/tools/cebuild ce-watch "build --locked"
+ce/tools/ce-build ce-ratio test
+ce/tools/ce-build web/ce-hub test
+ce/tools/ce-build ce-watch "build --locked"
 ```
 
 - **Workspace-aware:** if the repo's `Cargo.toml` has `path = "../sibling"` deps, the sibling is
@@ -30,7 +30,7 @@ The relay has 53 GB and Docker. Light crates (apps, SDKs, `ce-hub`, `ce-watch`) 
 comfortably; the heavy `ce` node (RAM-hungry wasmtime/cranelift) still wants CI or a bigger box.
 
 ### Roadmap: make it CE-native
-`cebuild` currently uses raw SSH + Docker. The proper dogfood is `ce exec <node> --image rust --
+`ce-build` currently uses raw SSH + Docker. The proper dogfood is `ce exec <node> --image rust --
 cargo build` over the mesh — that needs the laptop→node **capability grant** set up and `ce exec`
-to mount synced source. Wiring `cebuild` through `ce sync` + `ce exec` (so it's CE-on-CE, not SSH)
+to mount synced source. Wiring `ce-build` through `ce sync` + `ce exec` (so it's CE-on-CE, not SSH)
 is the next step.
