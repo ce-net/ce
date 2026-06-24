@@ -5,8 +5,10 @@
 # heavy or disk-hungry cargo work onto a CE node (the Hetzner relay by default) instead of melting
 # the laptop. It dogfoods the idea CE sells — run work on someone else's machine.
 #
-# Handles sibling path-dependencies: if the repo's Cargo.toml references `path = "../foo"`, foo is
-# synced alongside it so the relative layout resolves on the remote (one level deep).
+# Workspace-tree mirroring: the workspace root is the nearest ancestor holding CLAUDE.md (e.g.
+# ~/ce-net). The repo and every `path = "../…"` dependency (at ANY depth — `../ce-rs`,
+# `../../ce-rs`) are synced to the node at their real position relative to that root, so the
+# relative layout in Cargo.toml resolves identically on the remote.
 #
 # Usage:
 #   tools/ce-build <repo-path> [cargo subcommand + args...]      # default: test
@@ -19,9 +21,9 @@
 #   CE_BUILD_IMAGE  rust docker image              (default: rust:1-bookworm — has gcc/build-essential)
 #
 # Persistent state on the node (so builds are incremental and deps aren't re-downloaded):
-#   /root/ce-build/cargo-registry   shared cargo registry cache
-#   /root/ce-build/ws/<name>        synced source (target repo + any path-dep siblings)
-#   /root/ce-build/target-<name>    per-target persistent target dir
+#   /root/ce-build/cargo-registry    shared cargo registry cache
+#   /root/ce-build/ws/<rel-path>     synced source mirror (repo + path-dep crates at workspace paths)
+#   /root/ce-build/target-<name>     per-repo persistent target dir
 #
 # Exit code is the cargo exit code, so this composes in scripts and CI.
 set -euo pipefail
@@ -35,36 +37,50 @@ CARGO_ARGS="${*:-test}"
 
 [ -f "$REPO/Cargo.toml" ] || { echo "ce-build: $REPO has no Cargo.toml" >&2; exit 2; }
 REPO_ABS="$(cd "$REPO" && pwd)"
-PARENT="$(dirname "$REPO_ABS")"
 NAME="$(basename "$REPO_ABS")"
+
+# Workspace root = nearest ancestor holding CLAUDE.md (the ~/ce-net marker); fallback to repo parent.
+WS_ROOT="$REPO_ABS"
+while [ "$WS_ROOT" != "/" ] && [ ! -f "$WS_ROOT/CLAUDE.md" ]; do WS_ROOT="$(dirname "$WS_ROOT")"; done
+[ -f "$WS_ROOT/CLAUDE.md" ] || WS_ROOT="$(dirname "$REPO_ABS")"
+REPO_REL="${REPO_ABS#"$WS_ROOT"/}"
+
 WS="/root/ce-build/ws"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
 RSYNC_EXCL=(--exclude 'target' --exclude 'target-*' --exclude .git --exclude node_modules --exclude dist --exclude '*.bak')
 
-# Discover one level of `path = "../sibling"` deps (Cargo.toml of the repo + its member crates).
-SIBS=$(grep -rhoE 'path *= *"\.\./[^"/]+"' "$REPO_ABS" --include=Cargo.toml 2>/dev/null \
-        | sed -E 's|.*"\.\./([^"/]+)".*|\1|' | sort -u || true)
+# Discover `path = "(../)+name"` deps (any depth) anywhere in the repo's Cargo.toml files, resolve
+# each relative to the repo to an absolute dir, and express it relative to the workspace root.
+DEP_RELS=""
+DEP_PATHS=$(grep -rhoE 'path *= *"(\.\./)+[^"]+"' "$REPO_ABS" --include=Cargo.toml 2>/dev/null \
+            | sed -E 's|.*path *= *"([^"]+)".*|\1|' | sort -u || true)
+for d in $DEP_PATHS; do
+  dabs="$(cd "$REPO_ABS" && cd "$d" 2>/dev/null && pwd || true)"
+  if [ -z "$dabs" ]; then echo "    ! path-dep $d unresolved (skipping)" >&2; continue; fi
+  DEP_RELS="$DEP_RELS ${dabs#"$WS_ROOT"/}"
+done
+DEP_RELS=$(echo "$DEP_RELS" | tr ' ' '\n' | sed '/^$/d' | sort -u)
 
-echo "==> [ce-build] node=$NODE image=$IMAGE repo=$NAME cargo $CARGO_ARGS"
-[ -n "$SIBS" ] && echo "    path-dep siblings: $(echo $SIBS | tr '\n' ' ')"
-"${SSH[@]}" "$NODE" "mkdir -p /root/ce-build/cargo-registry '$WS/$NAME' '/root/ce-build/target-$NAME'"
+echo "==> [ce-build] node=$NODE image=$IMAGE repo=$REPO_REL cargo $CARGO_ARGS"
+[ -n "$DEP_RELS" ] && echo "    path-dep crates: $(echo "$DEP_RELS" | tr '\n' ' ')"
+"${SSH[@]}" "$NODE" "mkdir -p /root/ce-build/cargo-registry '$WS/$REPO_REL' '/root/ce-build/target-$NAME'"
 
 echo "==> syncing source"
-rsync -az --delete -e "ssh -o BatchMode=yes" "${RSYNC_EXCL[@]}" "$REPO_ABS/" "$NODE:$WS/$NAME/"
-for s in $SIBS; do
-  if [ -d "$PARENT/$s" ]; then
-    echo "    + sibling $s"
-    "${SSH[@]}" "$NODE" "mkdir -p '$WS/$s'"
-    rsync -az --delete -e "ssh -o BatchMode=yes" "${RSYNC_EXCL[@]}" "$PARENT/$s/" "$NODE:$WS/$s/"
+rsync -az --delete -e "ssh -o BatchMode=yes" "${RSYNC_EXCL[@]}" "$REPO_ABS/" "$NODE:$WS/$REPO_REL/"
+for drel in $DEP_RELS; do
+  if [ -d "$WS_ROOT/$drel" ]; then
+    echo "    + dep $drel"
+    "${SSH[@]}" "$NODE" "mkdir -p '$WS/$drel'"
+    rsync -az --delete -e "ssh -o BatchMode=yes" "${RSYNC_EXCL[@]}" "$WS_ROOT/$drel/" "$NODE:$WS/$drel/"
   else
-    echo "    ! sibling $s not found at $PARENT/$s (skipping)" >&2
+    echo "    ! dep $drel not found at $WS_ROOT/$drel (skipping)" >&2
   fi
 done
 
 echo "==> cargo $CARGO_ARGS  (in $IMAGE on $NODE)"
 "${SSH[@]}" "$NODE" "docker run --rm \
   -e CARGO_TERM_COLOR=always \
-  -v '$WS':/ws -w '/ws/$NAME' \
+  -v '$WS':/ws -w '/ws/$REPO_REL' \
   -v /root/ce-build/cargo-registry:/usr/local/cargo/registry \
-  -v '/root/ce-build/target-$NAME':'/ws/$NAME/target' \
+  -v '/root/ce-build/target-$NAME':'/ws/$REPO_REL/target' \
   '$IMAGE' sh -c 'cargo $CARGO_ARGS'"
