@@ -31,6 +31,23 @@ per-phase modules, so implementers fill in their own module without colliding.
   repo, cooperate.
 - Coordinate via this file before editing `ce-chain/src/lib.rs` dispatch arms (the one shared file).
 
+## Status — P9 (lineage earned-accounting + ECVRF) DONE
+
+`ce-chain/src/lineage.rs` filled (design 2(f)/2(b2)/2(d)): `LineageGraph` (bond-funding/fund-flow
+graph from on-chain `Transfer` edges, deterministic K-hop BFS), `common_funding_origin`,
+`distinct_origin_count` (union-find, collapses sock-puppets by ORIGIN not PeerId — H6/H14),
+`lineage_earned_work_score` (drops self-dealing, collapses same-origin payers, recursive-MeritRank
+weakest-hop weighting, per-origin cap). Additive observational hooks in `lib.rs`:
+`Chain::lineage_graph()` + `Chain::lineage_earned_work_score(node, merit_of)` — NOT yet swapped into
+the consensus `earned_work_score`/`consensus_weight` (left for the integrator to flip after review,
+so no existing consensus/append test changes). `ce-identity/src/vrf.rs`: clean `Vrf` trait +
+`Ed25519AsVrf` (the currently-wired 64-byte signature-as-VRF, behavior-identical to
+`ce-chain::vrf_verify`) + real RFC-9381-class `Ecvrf` via the VETTED `schnorrkel` crate behind the
+optional `ecvrf` feature (OFF by default — adopting it widens `Block.vrf_proof`, a consensus-format
+migration the integrator owns); a `#[doc(hidden)]` consensus-INSECURE placeholder keeps the surface
+compiling when the feature is off. Relay-verified: ce-chain 193+14 tests pass (incl. 12 new P9
+tests), ce-identity passes in both default and `--features ecvrf`, 0 warnings.
+
 ## Build note
 
 The Mac has ~2GB free disk: do NOT `cargo build` the full ce workspace locally. Use

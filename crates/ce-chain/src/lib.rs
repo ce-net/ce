@@ -1121,6 +1121,81 @@ impl Chain {
         }
     }
 
+    /// P9 (design `2(f)`/`2(b2)`/`2(d)`) — build the on-chain bond-funding / fund-flow LINEAGE graph
+    /// from the blocks this node holds. Each confirmed `Transfer { from, to, .. }` is a funding edge
+    /// `from -> to`; this is the graph the lineage-distinctness checks walk (`common_funding_origin`,
+    /// `distinct_origin_count`) to collapse Sybil clusters by ORIGIN rather than by Sybil-farmable
+    /// PeerId. Like `node_history_windowed`/`burned_total_cache` this is an **observational read-model**
+    /// (the transfer graph is already world-readable on-chain) — NOT consensus, NOT signed/hashed, NOT
+    /// part of `append`/fork-choice. O(kept transactions). On a pruned light node it sees only
+    /// post-checkpoint edges (archive nodes are authoritative for the full lineage).
+    ///
+    /// HostBonds are funded out of the host's own free balance (which itself traces through Transfers),
+    /// so the bond-funding origin of a host is captured by the same transfer edges — no separate
+    /// "bond funded by X" edge is emitted (the balance the bond locks arrived via Transfers/rewards).
+    pub fn lineage_graph(&self) -> lineage::LineageGraph {
+        let mut g = lineage::LineageGraph::default();
+        for block in &self.blocks {
+            for tx in &block.transactions {
+                if let TxKind::Transfer { from, to, .. } = &tx.kind {
+                    g.add_edge(*from, *to);
+                }
+            }
+        }
+        g
+    }
+
+    /// P9 (design `2(f)`) — the lineage-distinct, recursively-MeritRank-weighted, per-counterparty-
+    /// capped earned-work score for `node`. This is the Sybil-resistant refinement of the naive
+    /// `earned_work_score` (which sums `NodeStats.earned` regardless of who paid): it groups the
+    /// node's host earnings BY PAYER, collapses payers that share a funding origin (so M sock-puppets
+    /// funded from one wallet count as ONE counterparty, H6/H14), drops self-dealing (earnings from a
+    /// counterparty sharing the node's OWN origin contribute zero — the wash-trade case), weights each
+    /// origin bucket by the payer's MeritRank (`merit_bps`, supplied by the app-layer scorer — design
+    /// `2(e)`; on-chain there is no canonical MeritRank, so the caller injects it), and caps per origin.
+    ///
+    /// `merit_of` returns each counterparty's MeritRank in basis points (`0..=10_000`). Passing
+    /// `|_| 10_000` (full merit) reduces this to a purely on-chain, deterministic lineage+cap score —
+    /// the form usable inside consensus once the integrator decides to swap `earned_work_score` to call
+    /// it. Observational read-model (walks kept blocks); NOT yet wired into `consensus_weight` to avoid
+    /// changing live consensus before review (see the function docs and AGENTS.md).
+    pub fn lineage_earned_work_score<F>(&self, node: &NodeId, merit_of: F) -> u128
+    where
+        F: Fn(&NodeId) -> u128,
+    {
+        // Group this node's post-burn host earnings by payer (the counterparty).
+        let mut by_payer: std::collections::HashMap<NodeId, u128> = std::collections::HashMap::new();
+        for block in &self.blocks {
+            for tx in &block.transactions {
+                match &tx.kind {
+                    TxKind::JobSettle { host, payer, cost, .. } if host == node => {
+                        let net = (*cost).saturating_sub(settlement_burn(*cost));
+                        *by_payer.entry(*payer).or_insert(0) =
+                            by_payer.get(payer).copied().unwrap_or(0).saturating_add(net);
+                    }
+                    TxKind::Heartbeat { host, cell, amount, .. } if host == node => {
+                        let net = (*amount).saturating_sub(settlement_burn(*amount));
+                        *by_payer.entry(*cell).or_insert(0) =
+                            by_payer.get(cell).copied().unwrap_or(0).saturating_add(net);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let graph = self.lineage_graph();
+        // Deterministic order: sort counterparties so the scorer's bucketing is reproducible.
+        let mut rows: Vec<lineage::CounterpartyEarning> = by_payer
+            .into_iter()
+            .map(|(cp, raw)| lineage::CounterpartyEarning {
+                counterparty: cp,
+                raw_earned: raw,
+                merit_bps: merit_of(&cp),
+            })
+            .collect();
+        rows.sort_unstable_by(|a, b| a.counterparty.cmp(&b.counterparty));
+        lineage::lineage_earned_work_score(&graph, node, &rows)
+    }
+
     /// Confirmed transactions that name `node` as a participant — origin, or any role
     /// (`from`/`to`/`payer`/`host`/`cell`/`node`/`issuer`/`offender`/`reporter`/`miner`). Newest
     /// first, paginated: `before` excludes transactions at height `>= before` (cursor for the next
@@ -4687,5 +4762,85 @@ mod tests {
         );
         assert!(chain.total_supply() <= SUPPLY_CAP, "emitted supply never exceeds the cap");
         assert!(chain.total_supply() >= emitted_mid, "emission is monotonic");
+    }
+
+    // ---- P9 (design 2(f)) lineage earned-accounting over a real chain ----
+
+    #[test]
+    fn lineage_graph_captures_transfer_edges() {
+        // A funds B (a real Transfer): the lineage graph records B's funding ancestor A, so A and B
+        // share an origin while an unrelated C does not.
+        let a = make_identity("lin-a");
+        let b = make_identity("lin-b");
+        let c = make_identity("lin-c");
+        let neutral = make_identity("lin-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &a, 5_000);
+        assert!(append_with(&mut chain, &neutral, signed_transfer(&a, b.node_id(), 1_000)));
+
+        let g = chain.lineage_graph();
+        assert!(g.common_funding_origin(&a.node_id(), &b.node_id()), "A funded B → common origin");
+        assert!(!g.common_funding_origin(&a.node_id(), &c.node_id()), "C is unrelated");
+        assert_eq!(lineage::distinct_origin_count(&g, &[a.node_id(), b.node_id()]), 1);
+        assert_eq!(
+            lineage::distinct_origin_count(&g, &[a.node_id(), c.node_id()]),
+            2,
+            "unrelated nodes are distinct origins",
+        );
+    }
+
+    #[test]
+    fn lineage_earned_score_collapses_same_origin_payers_and_drops_self_dealing() {
+        // Host H earns from two payers P1, P2 via settled jobs. When P1 and P2 are funded by a common
+        // origin O, they collapse to ONE counterparty; when H itself funds its payer (self-dealing),
+        // that earning contributes ZERO (the wash trade).
+        let host = make_identity("lin-host");
+        let p1 = make_identity("lin-p1");
+        let p2 = make_identity("lin-p2");
+        let origin = make_identity("lin-origin");
+        let neutral = make_identity("lin-miner2");
+        let mut chain = Chain::genesis();
+
+        // O funds P1 and P2 (so P1, P2 share an origin), and funds them enough to pay for jobs.
+        fund(&mut chain, &origin, 30_000);
+        assert!(append_with(&mut chain, &neutral, signed_transfer(&origin, p1.node_id(), 6_000)));
+        assert!(append_with(&mut chain, &neutral, signed_transfer(&origin, p2.node_id(), 6_000)));
+
+        // P1 and P2 each pay H for a 4_000 job.
+        let net = 4_000u128.saturating_sub(settlement_burn(4_000));
+        assert!(append_with(&mut chain, &neutral, signed_job_bid(&p1, [1u8; 32], 4_000)));
+        assert!(append_with(&mut chain, &neutral, signed_job_settle(&host, &p1, [1u8; 32], 4_000)));
+        assert!(append_with(&mut chain, &neutral, signed_job_bid(&p2, [2u8; 32], 4_000)));
+        assert!(append_with(&mut chain, &neutral, signed_job_settle(&host, &p2, [2u8; 32], 4_000)));
+
+        // Naive earned_work_score sums both: 2*net.
+        assert_eq!(chain.earned_work_score(&host.node_id()), 2 * net);
+
+        // Lineage score with full merit: P1 and P2 share origin O → collapse to ONE counterparty,
+        // so the score is ONE bucket of 2*net (the distinct-counterparty count is 1, not 2).
+        // The Sybil-relevant difference shows in distinct_origin_count and (below) self-dealing.
+        let g = chain.lineage_graph();
+        assert_eq!(
+            lineage::distinct_origin_count(&g, &[p1.node_id(), p2.node_id()]),
+            1,
+            "same-origin payers are one counterparty (bond-splitting does not multiply edges)",
+        );
+        let full = chain.lineage_earned_work_score(&host.node_id(), |_| 10_000);
+        assert_eq!(full, 2 * net, "uncapped full-merit collapse still totals the real earnings");
+
+        // Self-dealing: a payer the HOST funded shares the host's origin → its earnings are dropped.
+        let puppet = make_identity("lin-puppet");
+        let mut chain2 = Chain::genesis();
+        fund(&mut chain2, &host, 30_000);
+        assert!(append_with(&mut chain2, &neutral, signed_transfer(&host, puppet.node_id(), 6_000)));
+        assert!(append_with(&mut chain2, &neutral, signed_job_bid(&puppet, [3u8; 32], 4_000)));
+        assert!(append_with(&mut chain2, &neutral, signed_job_settle(&host, &puppet, [3u8; 32], 4_000)));
+        // Naive score counts the wash earning; lineage score drops it to ZERO.
+        assert_eq!(chain2.earned_work_score(&host.node_id()), net);
+        assert_eq!(
+            chain2.lineage_earned_work_score(&host.node_id(), |_| 10_000),
+            0,
+            "host-funded puppet is self-dealing → zero distinct earned weight",
+        );
     }
 }

@@ -3,6 +3,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use std::path::Path;
 
+pub mod vrf; // P9 (design 2(b), consensus.md:557): `Vrf` trait + Ed25519-as-VRF + RFC-9381 ECVRF.
+
 pub type NodeId = [u8; 32];
 
 pub struct Identity {
