@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# cebuild — build/test/run a local Rust repo on a remote CE node, in a sandboxed rust container.
+#
+# Why: dev laptops are disk- and RAM-constrained; the mesh has nodes that aren't. This offloads
+# heavy or disk-hungry cargo work onto a CE node (the Hetzner relay by default) instead of melting
+# the laptop. It dogfoods the idea CE sells — run work on someone else's machine.
+#
+# Handles sibling path-dependencies: if the repo's Cargo.toml references `path = "../foo"`, foo is
+# synced alongside it so the relative layout resolves on the remote (one level deep).
+#
+# Usage:
+#   tools/cebuild <repo-path> [cargo subcommand + args...]      # default: test
+#   tools/cebuild web/ce-hub test
+#   tools/cebuild ce-ratio test --release
+#   tools/cebuild ce-watch "build --locked"
+#
+# Env:
+#   CE_BUILD_NODE   ssh target of the build node   (default: root@178.105.145.170, the relay)
+#   CE_BUILD_IMAGE  rust docker image              (default: rust:1-bookworm — has gcc/build-essential)
+#
+# Persistent state on the node (so builds are incremental and deps aren't re-downloaded):
+#   /root/cebuild/cargo-registry   shared cargo registry cache
+#   /root/cebuild/ws/<name>        synced source (target repo + any path-dep siblings)
+#   /root/cebuild/target-<name>    per-target persistent target dir
+#
+# Exit code is the cargo exit code, so this composes in scripts and CI.
+set -euo pipefail
+
+NODE="${CE_BUILD_NODE:-root@178.105.145.170}"
+IMAGE="${CE_BUILD_IMAGE:-rust:1-bookworm}"
+
+REPO="${1:?usage: cebuild <repo-path> [cargo args...]   (e.g. cebuild web/ce-hub test)}"
+shift || true
+CARGO_ARGS="${*:-test}"
+
+[ -f "$REPO/Cargo.toml" ] || { echo "cebuild: $REPO has no Cargo.toml" >&2; exit 2; }
+REPO_ABS="$(cd "$REPO" && pwd)"
+PARENT="$(dirname "$REPO_ABS")"
+NAME="$(basename "$REPO_ABS")"
+WS="/root/cebuild/ws"
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
+RSYNC_EXCL=(--exclude target --exclude .git --exclude node_modules --exclude dist --exclude '*.bak')
+
+# Discover one level of `path = "../sibling"` deps (Cargo.toml of the repo + its member crates).
+SIBS=$(grep -rhoE 'path *= *"\.\./[^"/]+"' "$REPO_ABS" --include=Cargo.toml 2>/dev/null \
+        | sed -E 's|.*"\.\./([^"/]+)".*|\1|' | sort -u)
+
+echo "==> [cebuild] node=$NODE image=$IMAGE repo=$NAME cargo $CARGO_ARGS"
+[ -n "$SIBS" ] && echo "    path-dep siblings: $(echo $SIBS | tr '\n' ' ')"
+"${SSH[@]}" "$NODE" "mkdir -p /root/cebuild/cargo-registry '$WS/$NAME' '/root/cebuild/target-$NAME'"
+
+echo "==> syncing source"
+rsync -az --delete -e "ssh -o BatchMode=yes" "${RSYNC_EXCL[@]}" "$REPO_ABS/" "$NODE:$WS/$NAME/"
+for s in $SIBS; do
+  if [ -d "$PARENT/$s" ]; then
+    echo "    + sibling $s"
+    "${SSH[@]}" "$NODE" "mkdir -p '$WS/$s'"
+    rsync -az --delete -e "ssh -o BatchMode=yes" "${RSYNC_EXCL[@]}" "$PARENT/$s/" "$NODE:$WS/$s/"
+  else
+    echo "    ! sibling $s not found at $PARENT/$s (skipping)" >&2
+  fi
+done
+
+echo "==> cargo $CARGO_ARGS  (in $IMAGE on $NODE)"
+"${SSH[@]}" "$NODE" "docker run --rm \
+  -e CARGO_TERM_COLOR=always \
+  -v '$WS':/ws -w '/ws/$NAME' \
+  -v /root/cebuild/cargo-registry:/usr/local/cargo/registry \
+  -v '/root/cebuild/target-$NAME':'/ws/$NAME/target' \
+  '$IMAGE' sh -c 'cargo $CARGO_ARGS'"
