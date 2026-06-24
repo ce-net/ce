@@ -1,0 +1,12 @@
+[package]
+name = "ce-meritrank"
+version = "0.1.0"
+edition = "2024"
+description = "App-layer MeritRank reputation scorer over CE's /history work-ledger (NOT consensus)."
+
+[dependencies]
+# App-layer ONLY. Depends on ce-identity for NodeId and ce-chain for the shared VerifyTier /
+# downgrade_allowed types (single source of truth for the dial), but NOTHING in this crate is on a
+# consensus path — it is a personalized read-model scorer, exactly as design 2(e) requires.
+ce-identity = { path = "../ce-identity" }
+ce-chain = { path = "../ce-chain" }

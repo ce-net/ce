@@ -12,6 +12,7 @@ members = [
     "crates/ce-node",
     "crates/ce-protocol",
     "crates/ce-deploy",
+    "crates/ce-meritrank",
 ]
 resolver = "2"
 

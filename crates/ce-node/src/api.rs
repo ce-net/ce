@@ -621,7 +621,12 @@ fn tx_value(tx: &ce_chain::Tx) -> Option<u128> {
         | TxKind::NameClaim { .. }
         | TxKind::RevokeCapability { .. }
         | TxKind::HostUnbond { .. }
-        | TxKind::SlashEquivocation { .. } => None,
+        | TxKind::SlashEquivocation { .. }
+        | TxKind::CapacityAd { .. }
+        | TxKind::ChallengeResponse { .. }
+        | TxKind::SlashCapacityChallenge { .. }
+        | TxKind::JobResult { .. }
+        | TxKind::SlashVerificationFault { .. } => None,
     }
 }
 
@@ -1109,6 +1114,11 @@ fn tx_stream_view(tx: &Tx) -> TxStreamView {
         TxKind::HostBond { amount, .. } => ("HostBond", *amount),
         TxKind::HostUnbond { .. } => ("HostUnbond", 0),
         TxKind::SlashEquivocation { .. } => ("SlashEquivocation", 0),
+        TxKind::CapacityAd { .. } => ("CapacityAd", 0),
+        TxKind::ChallengeResponse { .. } => ("ChallengeResponse", 0),
+        TxKind::SlashCapacityChallenge { .. } => ("SlashCapacityChallenge", 0),
+        TxKind::JobResult { .. } => ("JobResult", 0),
+        TxKind::SlashVerificationFault { .. } => ("SlashVerificationFault", 0),
     };
     TxStreamView { id: hex::encode(tx.id()), origin: hex::encode(tx.origin), kind, amount }
 }
@@ -1385,6 +1395,25 @@ fn classify_tx(kind: &TxKind, node: &NodeId) -> (&'static str, u128, Option<Node
                 ("out", Some(*reporter))
             };
             ("SlashEquivocation", 0, cp, dir)
+        }
+        TxKind::CapacityAd { .. } => ("CapacityAd", 0, None, "self"),
+        TxKind::ChallengeResponse { .. } => ("ChallengeResponse", 0, None, "self"),
+        TxKind::SlashCapacityChallenge { offender, reporter, .. } => {
+            let (dir, cp) = if reporter == node {
+                ("in", Some(*offender))
+            } else {
+                ("out", Some(*reporter))
+            };
+            ("SlashCapacityChallenge", 0, cp, dir)
+        }
+        TxKind::JobResult { .. } => ("JobResult", 0, None, "self"),
+        TxKind::SlashVerificationFault { offender, reporter, .. } => {
+            let (dir, cp) = if reporter == node {
+                ("in", Some(*offender))
+            } else {
+                ("out", Some(*reporter))
+            };
+            ("SlashVerificationFault", 0, cp, dir)
         }
     }
 }

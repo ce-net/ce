@@ -31,6 +31,52 @@ per-phase modules, so implementers fill in their own module without colliding.
   repo, cooperate.
 - Coordinate via this file before editing `ce-chain/src/lib.rs` dispatch arms (the one shared file).
 
+## Status — ALL PHASES P4-P9 INTEGRATED, FULL WORKSPACE GREEN (2026-06-24)
+
+The six disjoint phase implementations (P4 bond gate, P5 net_hardening, P6 capacity_audit,
+P7 placement_beacon + verification, P8 held_escrow + ce-meritrank, P9 lineage + ECVRF) are
+integrated and the WHOLE `ce` workspace builds and tests clean on the relay
+(`root@178.105.145.170:/opt/build/ce-sybil`, `CARGO_TARGET_DIR=/opt/build/target-sybil`):
+
+- `cargo build --workspace` — clean, **0 warnings**.
+- `cargo test --workspace` — **all pass, 0 failed** (ce-chain 193 unit + 14 prop incl. the
+  pre-existing consensus/append/economy tests, unchanged; ce-meritrank 14; ce-node 12 unit +
+  adversarial/chain_actor/local_cluster integration; ce-mesh 31; ce-identity 13 + prop).
+- `cargo build/test -p ce-identity --features ecvrf` — clean (real schnorrkel RFC-9381 VRF).
+- `cargo build -p ce-mesh --features real-vdf` — lib compiles (real POA Wesolowski VDF). The
+  optional-feature **test binary** needs the system lib `libgmp` (`-lgmp`) installed to link;
+  the default build (PlaceholderVdf) needs nothing. This is an environment dep of the
+  unmaintained `vdf 0.1` crate, not a code defect — `real-vdf` is OFF by default for exactly
+  this reason. The default workspace (what CI/integrator build) is fully green.
+
+Integration wiring done this pass: the five new `TxKind` variants (`CapacityAd`,
+`ChallengeResponse`, `SlashCapacityChallenge`, `JobResult`, `SlashVerificationFault`) are now
+handled in every `ce-node` match site (`tx_value`/`tx_burn_amount` x3 -> None;
+`tx_stream_view` -> labelled, amount 0; `classify_tx` -> labelled, slash classes carry
+offender/reporter direction). No consensus value/amount semantics attached to the new variants
+(they move no credits directly) so chain economy math is unchanged.
+
+CRYPTO (per task rule — never hand-rolled): both heavy primitives are a clean trait + a vetted
+crate behind an OFF-by-default feature + a `#[doc(hidden)]` consensus-INSECURE placeholder for the
+default build. VDF: `ce-mesh::placement_beacon::Vdf` trait, `RealVdf` (POA `vdf 0.1` Wesolowski,
+feature `real-vdf`), `PlaceholderVdf` default. VRF: `ce-identity::vrf::Vrf` trait, `Ecvrf`
+(schnorrkel sr25519, feature `ecvrf`), `Ed25519AsVrf` default (the currently-wired
+signature-as-VRF). Both carry `needs-review (crypto)` doc markers; the integrator owns the
+parameter pinning + the consensus-format migration before any swap.
+
+REMAINING before this secures real consensus (integrator + security review):
+1. Swap the additive observational hooks into live consensus (lineage `earned_work_score`,
+   the per-job slice-lock admission gate, the placement-beacon seed into committee/auditor
+   selection) — deliberately left un-flipped so no existing append/consensus test changed.
+2. Enable `real-vdf` + `ecvrf` and migrate the on-chain `Block.vrf_proof`/beacon format
+   (consensus-format change); pin VDF discriminant + `delay->difficulty` for `T_vdf >> slot`.
+3. Empirical calibration (design 5.9): bond floor `T_floor`, FaultFee fraction, correlation
+   window + circuit-breaker, MeritRank alpha/beta/gamma, held-escrow schedule, committee N/K,
+   burn-vs-reporter split.
+4. Expert security review of the committee-selection / multi-winner-forced-error / lineage and
+   MeritRank circularity-break logic against the red-team findings (design 7).
+5. Phase 5 network hardening must ship WITH/BEFORE Phase 8 held-escrow (disappearance-vs-eclipse).
+
 ## Status — P9 (lineage earned-accounting + ECVRF) DONE
 
 `ce-chain/src/lineage.rs` filled (design 2(f)/2(b2)/2(d)): `LineageGraph` (bond-funding/fund-flow

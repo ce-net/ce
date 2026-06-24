@@ -17,8 +17,17 @@ anyhow = "1"
 async-trait = "0.1"
 tracing = "0.1"
 futures = "0.3"
-# Sybil-security P7 (placement_beacon): a VETTED Wesolowski/Pietrzak VDF crate. TODO(P7): enable a
-# real crate (e.g. `vdf = "0.1"`, class-group based) once it builds cleanly here; until then
-# placement_beacon ships a clearly-marked `PlaceholderVdf` behind the `Vdf` trait — never a
-# hand-rolled VDF. Left commented so the scaffold builds without heavy C deps (task crypto rule).
-# vdf = "0.1"
+# Sybil-security P7 (placement_beacon): a VETTED Wesolowski/Pietrzak VDF crate (POA Network's pure-
+# Rust class-group VDF — no GMP/C deps; verified to build clean on the relay). It is wired behind the
+# OPTIONAL `real-vdf` feature so the default build stays warning-free (the crate is unmaintained and
+# pulls an old `sha2 0.8`, which would otherwise add a future-incompat warning to the shared consensus
+# repo). The `Vdf` trait in placement_beacon.rs is the stable interface; `RealVdf` (feature-gated)
+# adapts this crate, `PlaceholderVdf` (default) is the clearly-marked consensus-INSECURE stand-in.
+# Production swap = build with `--features real-vdf` and select `RealVdf`. NEVER a hand-rolled VDF.
+vdf = { version = "0.1", optional = true }
+
+[features]
+# Enable the vetted Wesolowski VDF (`RealVdf`) for the producer-unbiasable placement beacon (P7).
+# Off by default to keep the default consensus build clean; the integrator/operator turns it on for
+# any network that routes audit-seed value above the trivial threshold (design 2(b), MANDATORY VDF).
+real-vdf = ["dep:vdf"]

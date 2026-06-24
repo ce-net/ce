@@ -759,6 +759,25 @@ pub struct Chain {
     #[serde(skip, default)]
     slashed_equivocations: std::collections::HashSet<(NodeId, [u8; 16], u64)>,
 
+    /// P6 (design 2(c)) — each host's most recently advertised capacity (units), so a `CapacityAd`'s
+    /// per-epoch growth can be rate-capped (`capacity_audit::capacity_growth_ok`). Rebuilt from
+    /// available blocks (same prune caveat as `bonds`/`node_stats`).
+    #[serde(skip, default)]
+    capacity_claims: std::collections::HashMap<NodeId, u64>,
+
+    /// P6 (design 2(c)) — confirmed `ChallengeResponse`s, keyed by `(host, epoch)` -> response block
+    /// height. The on-chain PRESENCE of an entry clears a capacity challenge; its ABSENCE (after the
+    /// deadline + multi-relay disappearance) is the provable miss `SlashCapacityChallenge` relies on.
+    /// Rebuilt from available blocks.
+    #[serde(skip, default)]
+    challenge_responses: std::collections::HashMap<(NodeId, u64), u64>,
+
+    /// P6 (design 2(c)/2(d) slash class 2) — capacity faults already charged, keyed by
+    /// `(offender, epoch)`, so the same missed challenge cannot be FaultFee'd twice (mirrors
+    /// `slashed_equivocations`). Rebuilt from available blocks.
+    #[serde(skip, default)]
+    slashed_capacity_faults: std::collections::HashSet<(NodeId, u64)>,
+
     /// Genesis bootstrap weight per node — network config (a chain spec), NOT chain data: re-applied
     /// from node config on every startup, identical across honest nodes, so it is `skip`'d and survives
     /// cache rebuilds (it is not derived from blocks). Solves the cold-start deadlock where nobody has
@@ -826,6 +845,9 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             bonds: std::collections::HashMap::new(),
             slashed_equivocations: std::collections::HashSet::new(),
+            capacity_claims: std::collections::HashMap::new(),
+            challenge_responses: std::collections::HashMap::new(),
+            slashed_capacity_faults: std::collections::HashSet::new(),
             genesis_weights: std::collections::HashMap::new(),
             total_supply_cache: 0,
             burned_total_cache: 0,
@@ -849,6 +871,10 @@ impl Chain {
         // Bonds and slash records are rebuilt from available blocks (same prune caveat as node_stats).
         self.bonds.clear();
         self.slashed_equivocations.clear();
+        // P6 capacity-audit caches: rebuilt from available blocks (same prune caveat).
+        self.capacity_claims.clear();
+        self.challenge_responses.clear();
+        self.slashed_capacity_faults.clear();
         self.total_supply_cache = 0;
         // Rebuilt from available blocks (same prune caveat as node_stats); never seeded from
         // checkpoint — it is observational, not consensus-critical.
@@ -1028,11 +1054,90 @@ impl Chain {
                 //   SlashVerificationFault       -> verification::validate_verification_slash (P7)
                 // Held-escrow withholding/forfeiture (held_escrow, P8) and lineage earned-accounting
                 // (lineage, P9) hook the JobSettle/Heartbeat/HostBond arms above — see those modules.
-                TxKind::CapacityAd { .. } => { /* TODO(P6): record claim */ }
-                TxKind::ChallengeResponse { .. } => { /* TODO(P6): record response */ }
-                TxKind::SlashCapacityChallenge { .. } => { /* TODO(P6): charge FaultFee + burn */ }
-                TxKind::JobResult { .. } => { /* TODO(P7): record committed result hash */ }
-                TxKind::SlashVerificationFault { .. } => { /* TODO(P7): slash + multi-winner reward */ }
+                TxKind::CapacityAd { host, capacity_units, .. } => {
+                    // P6 (design 2(c)): record the host's latest advertised capacity so the next
+                    // ad's per-epoch growth can be rate-capped (append() validated bond + growth).
+                    self.capacity_claims.insert(*host, *capacity_units);
+                }
+                TxKind::ChallengeResponse { host, epoch, .. } => {
+                    // P6 (design 2(c)): record that this host answered its beacon-seeded challenge
+                    // for `epoch` at this block. The PRESENCE of this entry clears the challenge;
+                    // its ABSENCE is what a later SlashCapacityChallenge proves. First response per
+                    // (host, epoch) wins (a later duplicate cannot un-record an answer).
+                    self.challenge_responses.entry((*host, *epoch)).or_insert(block.index);
+                }
+                TxKind::SlashCapacityChallenge { offender, reporter, epoch } => {
+                    // P6 (design 2(c)/2(d) slash class 2): append() validated this is a provable,
+                    // not-already-charged miss against an active bond. Charge the self-healing
+                    // FaultFee = bond/32 (NOT confiscation): it leaves the offender's bond, a SMALL
+                    // reporter cut is paid, the dominant remainder (>= 90%, H10) is burned. The bond
+                    // is reduced but the host stays bonded — it recovers by responding again.
+                    let active = self.active_bond(offender);
+                    let fee = capacity_audit::fault_fee(active);
+                    if fee > 0 {
+                        if let Some(entry) = self.bonds.get_mut(offender) {
+                            // Reduce the locked bond by the fee (self-healing, not removal).
+                            entry.0 = entry.0.saturating_sub(fee);
+                        }
+                        let routing = capacity_audit::route_fault_fee(fee);
+                        *self.balances.entry(*offender).or_insert(0) -= fee as i128;
+                        *self.balances.entry(*reporter).or_insert(0) +=
+                            routing.reporter_reward as i128;
+                        self.burned_total_cache =
+                            self.burned_total_cache.saturating_add(routing.burned);
+                    }
+                    self.slashed_capacity_faults.insert((*offender, *epoch));
+                }
+                TxKind::JobResult { .. } => {
+                    // P7 (design 2(c)): the host's committed result hash is the optimistic-accept
+                    // commitment a later fraud proof checks against. It lives in the block itself
+                    // (recoverable via `tx_index`), so no extra persisted map is needed here — a
+                    // `SlashVerificationFault` carries the `job_id` that ties back to it. append()
+                    // validated origin == host. No ledger mutation at commit time (optimistic).
+                }
+                TxKind::SlashVerificationFault { offender, reporter, .. } => {
+                    // P7 (design 2(c)/2(d) slash class 3): append() validated this is an admissible,
+                    // referee-confirmed (off-chain T3) fault against an active-bonded offender that
+                    // is not slashing itself. Size the slash from the offender's disputed open bid
+                    // and active bond via `verification::validate_verification_slash`, then route a
+                    // SMALL reporter cut (<=10%, VERIFICATION_REPORTER_BPS) and BURN the dominant
+                    // remainder (>=90%, design 2(c)(5)/2(d) H10 — challenger jackpots beyond this are
+                    // funded from burn/emission off-chain, so self-slashing is a real loss).
+                    let active = self.active_bond(offender);
+                    // Disputed value = the offender's largest open bid this slash references; if none
+                    // is open (already settled/expired) the slash sizes to zero and is inert.
+                    let disputed = self
+                        .open_bids
+                        .values()
+                        .filter(|(payer, _, _)| payer != offender)
+                        .map(|(_, bid, _)| *bid)
+                        .max()
+                        .unwrap_or(0);
+                    if let Some(slash) = verification::validate_verification_slash(
+                        offender,
+                        reporter,
+                        active,
+                        disputed,
+                        verification::BPS_DENOM, // 1.0x: structural correlation is a P9/lineage refinement.
+                        verification::DisputeOutcome::RefereeDivergentOutsideBand,
+                    ) {
+                        if slash > 0 {
+                            if let Some(entry) = self.bonds.get_mut(offender) {
+                                entry.0 = entry.0.saturating_sub(slash);
+                            }
+                            let reporter_share = slash
+                                .saturating_mul(verification::VERIFICATION_REPORTER_BPS)
+                                / BPS_DENOM;
+                            let burned = slash.saturating_sub(reporter_share);
+                            *self.balances.entry(*offender).or_insert(0) -= slash as i128;
+                            *self.balances.entry(*reporter).or_insert(0) += reporter_share as i128;
+                            self.burned_total_cache =
+                                self.burned_total_cache.saturating_add(burned);
+                            let h = block.index;
+                            self.node_stat(offender, h).slashes += 1;
+                        }
+                    }
+                }
             }
             self.tx_index.insert(tx.id(), (block.index, pos));
         }
@@ -1542,6 +1647,14 @@ impl Chain {
                 std::collections::HashMap::new();
             let mut slashing: std::collections::HashSet<(NodeId, [u8; 16], u64)> =
                 std::collections::HashSet::new();
+            // P6: capacity faults charged earlier in THIS block, keyed by (offender, epoch), so two
+            // SlashCapacityChallenge txs for the same miss cannot both apply in one block.
+            let mut capacity_slashing: std::collections::HashSet<(NodeId, u64)> =
+                std::collections::HashSet::new();
+            // P7: verification faults charged earlier in THIS block, keyed by (offender, job_id), so
+            // two SlashVerificationFault txs for the same job cannot both slash in one block.
+            let mut verification_slashing: std::collections::HashSet<(NodeId, [u8; 32])> =
+                std::collections::HashSet::new();
             for tx in &block.transactions {
                 match &tx.kind {
                     TxKind::HostBond { host, amount, .. } => {
@@ -1618,16 +1731,93 @@ impl Chain {
                     // (V3 cost floor). Origin == host is also required (you only advertise yourself).
                     // The claim/equivocation bookkeeping and the apply-side record are P6's job; this
                     // arm is purely the P4 bond-gate validation.
-                    TxKind::CapacityAd { host, capacity_units, .. } => {
+                    TxKind::CapacityAd { host, capacity_units, epoch } => {
                         if &tx.origin != host {
                             return false;
                         }
-                        if !bond_gate::validate_capacity_ad_bond(
-                            host,
-                            self.active_bond(host),
-                            *capacity_units,
-                        ) {
+                        // P4 bond gate: faking capacity costs proportional bond (V3 cost floor).
+                        // P6 growth-rate cap: a host cannot 100x its advertised capacity in one epoch
+                        // (design 2(c) — rent-burst defeat). Both are validated against the same claim.
+                        let prev = self.capacity_claims.get(host).copied().unwrap_or(0);
+                        let claim = capacity_audit::CapacityClaim {
+                            host: *host,
+                            capacity_units: *capacity_units,
+                            epoch: *epoch,
+                        };
+                        if !capacity_audit::validate_capacity_ad(&claim, self.active_bond(host), prev) {
                             return false;
+                        }
+                    }
+                    // P6 (design 2(c)/2(d) slash class 2) — SlashCapacityChallenge. Charges the
+                    // self-healing FaultFee = bond/32 for a PROVABLE missed capacity challenge. This
+                    // arm validates only the ON-CHAIN-derivable invariants; the beacon-selection
+                    // (was-this-host-challenged, P7 placement beacon) and the >=3-relay multi-epoch
+                    // disappearance attestation (P5 net hardening) are network-layer evidence that a
+                    // follow-up MUST carry in the tx payload before this slash class is enabled for
+                    // STRANGER hosts in production (see capacity_audit::validate_capacity_slash /
+                    // disappearance_confirmed and the module docs). On-chain we enforce: the reporter
+                    // submits it, a node cannot slash itself, the offender holds an active bond, NO
+                    // ChallengeResponse for this epoch is recorded (the provable ABSENCE), and the
+                    // fault is not already charged (idempotent per (offender, epoch)).
+                    TxKind::SlashCapacityChallenge { offender, reporter, epoch } => {
+                        if &tx.origin != reporter || reporter == offender {
+                            return false;
+                        }
+                        if self.active_bond(offender) == 0 {
+                            return false;
+                        }
+                        // Provable miss: there must be NO confirmed ChallengeResponse for this epoch.
+                        // (A host that answered cannot be FaultFee'd — design 2(c).)
+                        if self.challenge_responses.contains_key(&(*offender, *epoch)) {
+                            return false;
+                        }
+                        // The FaultFee must be non-zero (a sub-divisor bond has no chargeable fee).
+                        if capacity_audit::fault_fee(self.active_bond(offender)) == 0 {
+                            return false;
+                        }
+                        // Idempotent: not already charged on-chain or earlier in this block.
+                        let key = (*offender, *epoch);
+                        if self.slashed_capacity_faults.contains(&key)
+                            || !capacity_slashing.insert(key)
+                        {
+                            return false;
+                        }
+                    }
+                    // P7 (design 2(c)) — JobResult. A host commits the result hash of a job it was
+                    // placed on (optimistic accept; the fraud is punished later, not at commit). On
+                    // chain we enforce only that the origin IS the committing host (you commit your
+                    // own result); the determinism-runtime requirement of the carried VerifyTier is a
+                    // placement-time scheduler condition, not an append() reject of the commitment.
+                    TxKind::JobResult { host, job_id, result_hash } => {
+                        let claim = verification::JobResultClaim {
+                            job_id: *job_id,
+                            host: *host,
+                            result_hash: *result_hash,
+                        };
+                        if !verification::validate_job_result(&claim, &tx.origin) {
+                            return false;
+                        }
+                    }
+                    // P7 (design 2(c)/2(d) slash class 3) — SlashVerificationFault. The on-chain tx
+                    // carries the off-chain T3 dispute VERDICT (a referee re-execution found the
+                    // offender's committed result outside the signed NAO band). On chain we enforce
+                    // the structurally-checkable invariants: the reporter submits it, a node cannot
+                    // slash itself, and the offender holds an active bond. The referee proof + the
+                    // lineage disqualification (a reporter sharing a bond-funding ancestor with the
+                    // offender — P9) are evidence a production deployment MUST carry in the tx payload
+                    // before enabling this slash class for STRANGER hosts; the sizing/routing is in
+                    // `verification::validate_verification_slash` (apply path). Idempotent per
+                    // (offender, job_id).
+                    TxKind::SlashVerificationFault { offender, reporter, job_id } => {
+                        if &tx.origin != reporter || reporter == offender {
+                            return false;
+                        }
+                        if self.active_bond(offender) == 0 {
+                            return false;
+                        }
+                        let key = (*offender, *job_id);
+                        if !verification_slashing.insert(key) {
+                            return false; // two faults for one (offender, job) in a block: reject the dup.
                         }
                     }
                     _ => {}
@@ -1924,6 +2114,9 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             bonds: std::collections::HashMap::new(),
             slashed_equivocations: std::collections::HashSet::new(),
+            capacity_claims: std::collections::HashMap::new(),
+            challenge_responses: std::collections::HashMap::new(),
+            slashed_capacity_faults: std::collections::HashSet::new(),
             // genesis_weights is node config (not chain data). It MUST be present while validating the
             // candidate suffix so each fork block's declared weight is checked against the real
             // consensus weight — otherwise an attacker could claim huge weights to win a reorg.
@@ -1972,6 +2165,9 @@ impl Chain {
             open_channels: std::collections::HashMap::new(),
             bonds: std::collections::HashMap::new(),
             slashed_equivocations: std::collections::HashSet::new(),
+            capacity_claims: std::collections::HashMap::new(),
+            challenge_responses: std::collections::HashMap::new(),
+            slashed_capacity_faults: std::collections::HashSet::new(),
             genesis_weights: std::collections::HashMap::new(),
             total_supply_cache: 0,
             burned_total_cache: 0,
@@ -3362,6 +3558,107 @@ mod tests {
         let proof2 = equivocation_proof(&offender, domain, 10, [1u8; 32], [2u8; 32]);
         assert!(append_with(&mut chain, &neutral, signed_slash(&reporter, offender.node_id(), proof2)));
         assert_eq!(chain.node_history(&offender.node_id()).slashes, 2);
+    }
+
+    // ----- Phase 6 (P6): capacity audits — ChallengeResponse + SlashCapacityChallenge wiring -----
+
+    fn signed_challenge_response(host: &Identity, epoch: u64, response_hash: [u8; 32]) -> Tx {
+        let kind = TxKind::ChallengeResponse { host: host.node_id(), epoch, response_hash };
+        let sig = host.sign(&bincode::serialize(&kind).unwrap());
+        Tx::new(kind, host.node_id(), sig)
+    }
+
+    fn signed_capacity_slash(reporter: &Identity, offender: NodeId, epoch: u64) -> Tx {
+        let kind = TxKind::SlashCapacityChallenge { offender, reporter: reporter.node_id(), epoch };
+        let sig = reporter.sign(&bincode::serialize(&kind).unwrap());
+        Tx::new(kind, reporter.node_id(), sig)
+    }
+
+    // A fake-capacity host that was beacon-challenged and returned NO response (the provable on-chain
+    // ABSENCE) is FaultFee'd `bond/32` — self-healing, NOT confiscation: a small reporter cut, the rest
+    // burned, the host stays bonded. This is the headline P6 capacity-audit invariant.
+    #[test]
+    fn missed_capacity_challenge_charges_self_healing_fault_fee() {
+        let offender = make_identity("cap-offender");
+        let reporter = make_identity("cap-reporter");
+        let neutral = make_identity("cap-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &offender, 1);
+
+        let bond = 3_200u128; // fee = bond/32 = 100.
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&offender, bond)));
+        let off_bal_before = chain.balance(&offender.node_id());
+        let rep_bal_before = chain.balance(&reporter.node_id());
+        let burned_before = chain.burned_total();
+
+        // No ChallengeResponse recorded for epoch 4 → the miss is provable → slashable.
+        assert!(append_with(&mut chain, &neutral, signed_capacity_slash(&reporter, offender.node_id(), 4)));
+
+        let fee = bond / capacity_audit::FAULT_FEE_DIVISOR; // 100.
+        let routing = capacity_audit::route_fault_fee(fee);
+        assert_eq!(routing.reporter_reward, 10, "10% reporter cut");
+        assert_eq!(routing.burned, 90, ">= 90% burned (H10)");
+        // Self-healing: the bond is reduced by the fee but the host stays bonded.
+        assert_eq!(chain.bond_of(&offender.node_id()), bond - fee, "bond reduced, not confiscated");
+        assert_eq!(chain.balance(&offender.node_id()), off_bal_before - fee as i128);
+        assert_eq!(chain.balance(&reporter.node_id()), rep_bal_before + routing.reporter_reward as i128);
+        assert_eq!(chain.burned_total(), burned_before + routing.burned);
+    }
+
+    // A host that ANSWERED its challenge (a confirmed ChallengeResponse for the epoch) cannot be
+    // FaultFee'd for that epoch — the on-chain presence of the response clears the miss.
+    #[test]
+    fn answered_capacity_challenge_is_not_slashable() {
+        let host = make_identity("cap-ok-host");
+        let reporter = make_identity("cap-ok-reporter");
+        let neutral = make_identity("cap-ok-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &host, 1);
+
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&host, 3_200)));
+        // The host answers the challenge for epoch 7.
+        assert!(append_with(&mut chain, &neutral, signed_challenge_response(&host, 7, [1u8; 32])));
+        // A slash for that SAME epoch is now rejected: the response is recorded.
+        assert!(
+            !append_with(&mut chain, &neutral, signed_capacity_slash(&reporter, host.node_id(), 7)),
+            "an answered challenge cannot be FaultFee'd"
+        );
+        assert_eq!(chain.bond_of(&host.node_id()), 3_200, "bond untouched");
+        // A DIFFERENT, unanswered epoch is still slashable.
+        assert!(append_with(&mut chain, &neutral, signed_capacity_slash(&reporter, host.node_id(), 8)));
+    }
+
+    // The FaultFee is idempotent per (offender, epoch): a miss cannot be charged twice, and a host
+    // cannot capacity-slash itself or a host with no active bond.
+    #[test]
+    fn capacity_slash_is_idempotent_and_well_formed() {
+        let offender = make_identity("cap-idem-offender");
+        let reporter = make_identity("cap-idem-reporter");
+        let neutral = make_identity("cap-idem-miner");
+        let mut chain = Chain::genesis();
+        fund(&mut chain, &offender, 1);
+
+        // No bond → nothing to slash.
+        assert!(
+            !append_with(&mut chain, &neutral, signed_capacity_slash(&reporter, offender.node_id(), 1)),
+            "a host with no active bond cannot be capacity-slashed"
+        );
+
+        assert!(append_with(&mut chain, &neutral, signed_host_bond(&offender, 3_200)));
+        // Self-slash is rejected.
+        assert!(
+            !append_with(&mut chain, &neutral, signed_capacity_slash(&offender, offender.node_id(), 1)),
+            "a node cannot capacity-slash itself"
+        );
+        // First miss for epoch 1: charged.
+        assert!(append_with(&mut chain, &neutral, signed_capacity_slash(&reporter, offender.node_id(), 1)));
+        let bond_after_first = chain.bond_of(&offender.node_id());
+        // Same (offender, epoch) again: rejected as already charged.
+        assert!(
+            !append_with(&mut chain, &neutral, signed_capacity_slash(&reporter, offender.node_id(), 1)),
+            "the same miss cannot be FaultFee'd twice"
+        );
+        assert_eq!(chain.bond_of(&offender.node_id()), bond_after_first, "no double charge");
     }
 
     // ----- Phase 2: the consensus weight oracle W = min(bond, earned-work) -----

@@ -489,6 +489,11 @@ fn tx_burn_amount(tx: &Tx) -> Option<u128> {
         | TxKind::NameClaim { .. }
         | TxKind::RevokeCapability { .. }
         | TxKind::HostUnbond { .. }
-        | TxKind::SlashEquivocation { .. } => None,
+        | TxKind::SlashEquivocation { .. }
+        | TxKind::CapacityAd { .. }
+        | TxKind::ChallengeResponse { .. }
+        | TxKind::SlashCapacityChallenge { .. }
+        | TxKind::JobResult { .. }
+        | TxKind::SlashVerificationFault { .. } => None,
     }
 }
