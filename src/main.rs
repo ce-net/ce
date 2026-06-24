@@ -46,7 +46,7 @@ fn local_ip_addrs() -> Result<Vec<IpAddr>> {
 }
 
 #[derive(Parser)]
-#[command(name = "ce", about = "CE node", version)]
+#[command(name = "ce", about = "CE node", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CE_GIT_HASH"), ", ", env!("CE_BUILD_DATE"), ")"))]
 struct Cli {
     #[arg(long, help = "Override data directory (default: ~/.local/share/ce)")]
     data_dir: Option<PathBuf>,
