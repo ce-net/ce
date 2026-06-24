@@ -39,11 +39,11 @@ PARENT="$(dirname "$REPO_ABS")"
 NAME="$(basename "$REPO_ABS")"
 WS="/root/cebuild/ws"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
-RSYNC_EXCL=(--exclude target --exclude .git --exclude node_modules --exclude dist --exclude '*.bak')
+RSYNC_EXCL=(--exclude 'target' --exclude 'target-*' --exclude .git --exclude node_modules --exclude dist --exclude '*.bak')
 
 # Discover one level of `path = "../sibling"` deps (Cargo.toml of the repo + its member crates).
 SIBS=$(grep -rhoE 'path *= *"\.\./[^"/]+"' "$REPO_ABS" --include=Cargo.toml 2>/dev/null \
-        | sed -E 's|.*"\.\./([^"/]+)".*|\1|' | sort -u)
+        | sed -E 's|.*"\.\./([^"/]+)".*|\1|' | sort -u || true)
 
 echo "==> [cebuild] node=$NODE image=$IMAGE repo=$NAME cargo $CARGO_ARGS"
 [ -n "$SIBS" ] && echo "    path-dep siblings: $(echo $SIBS | tr '\n' ' ')"
