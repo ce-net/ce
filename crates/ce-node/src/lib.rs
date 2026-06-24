@@ -182,7 +182,7 @@ pub struct RelayAccount {
 }
 pub(crate) type RelayMeter = Arc<Mutex<HashMap<[u8; 32], RelayAccount>>>;
 
-const APP_INBOX_CAPACITY: usize = 200;
+pub(crate) const APP_INBOX_CAPACITY: usize = 200;
 
 // ----- Node config -----
 
@@ -2330,7 +2330,7 @@ fn num_cpus() -> usize {
 }
 
 /// Unix seconds now (saturating to 0 before the epoch).
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 

@@ -1335,3 +1335,59 @@ async fn app_message_delivered_across_mesh() {
     assert_eq!(m["topic"], "control");
     assert_eq!(m["payload_hex"], payload_hex, "payload intact");
 }
+
+/// Self-delivery: a message a node addresses to its OWN NodeId is delivered to its local apps
+/// through the node's message bus — libp2p cannot dial self, so before self-delivery `/mesh/send`
+/// to self returned a 502 "Failed to dial the requested peer". This loopback is what lets apps
+/// co-located on a single node message each other (the mesh-native, no-localhost-HTTP pattern).
+#[tokio::test(flavor = "multi_thread")]
+async fn app_message_self_delivery() {
+    let (p2p, api) = alloc_ports();
+    let dir = tmpdir("self-deliver");
+    let _node = Node::start(NodeConfig {
+        listen_port: p2p,
+        bootstrap_peers: vec![],
+        data_dir: dir.clone(),
+        api_port: api,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let id = host_node_id(&dir);
+
+    sleep(Duration::from_millis(600)).await;
+
+    let client = reqwest::Client::new();
+    let payload_hex = hex::encode(b"self");
+    let resp = client
+        .post(format!("http://127.0.0.1:{api}/mesh/send")).bearer_auth(TEST_API_TOKEN)
+        .json(&serde_json::json!({
+            "to": hex::encode(id),
+            "topic": "loopback",
+            "payload_hex": payload_hex,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "mesh/send to self should be delivered locally, not dialed");
+
+    let mut found = None;
+    for _ in 0..10 {
+        sleep(Duration::from_millis(300)).await;
+        let msgs: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{api}/mesh/messages"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(m) = msgs.as_array().and_then(|a| a.iter().find(|m| m["topic"] == "loopback")) {
+            found = Some(m.clone());
+            break;
+        }
+    }
+    let m = found.expect("the node should receive its own self-addressed message");
+    assert_eq!(m["from"], hex::encode(id), "self message is from this node");
+    assert_eq!(m["payload_hex"], payload_hex, "payload intact");
+}

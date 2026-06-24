@@ -28,8 +28,8 @@ use std::{
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
-    AppInbox, AppMessage, Atlas, CeJobStatus, ChainHandle, JobRecord, JobStore, NetGraph,
-    PeerCapacity, RttStat, SignalRing, TxPool,
+    APP_INBOX_CAPACITY, AppInbox, AppMessage, Atlas, CeJobStatus, ChainHandle, JobRecord, JobStore,
+    NetGraph, PeerCapacity, RttStat, SignalRing, TxPool, now_secs,
 };
 
 /// Per-sender last-accepted timestamp (ms). Used to enforce strictly increasing
@@ -1839,6 +1839,28 @@ async fn send_message(State(state): State<ApiState>, Json(req): Json<SendMessage
         Ok(p) => p,
         Err(_) => return err(StatusCode::BAD_REQUEST, "payload_hex must be valid hex"),
     };
+    // Self-delivery: a message addressed to our OWN NodeId is delivered to our local apps through
+    // the node's message bus, never the network — libp2p cannot dial self. This lets apps
+    // co-located on one node message each other (they filter by topic); a cross-node send still
+    // takes the mesh path below. The local app sees `from` = this node, exactly as a peer would.
+    if to == state.host_node_id {
+        let msg = AppMessage {
+            from: hex::encode(state.host_node_id),
+            topic: req.topic,
+            payload_hex: hex::encode(&payload),
+            received_at: now_secs(),
+            reply_token: None,
+        };
+        {
+            let mut ring = state.app_inbox.lock().await;
+            if ring.len() >= APP_INBOX_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(msg.clone());
+        }
+        let _ = state.app_msg_tx.send(msg);
+        return (StatusCode::OK, Json(serde_json::json!({ "status": "delivered" }))).into_response();
+    }
     let peer_id = match peer_id_from_node_id(&to) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad recipient id: {e}")),
