@@ -1537,6 +1537,24 @@ impl Chain {
                             return false;
                         }
                     }
+                    // P4 (design 2(a)) — bond gate for CapacityAd. A host may only publish (or
+                    // refresh) a capacity ad if it already holds `active_bond >=
+                    // required_bond(capacity_units)`, so faking capacity costs proportional bond
+                    // (V3 cost floor). Origin == host is also required (you only advertise yourself).
+                    // The claim/equivocation bookkeeping and the apply-side record are P6's job; this
+                    // arm is purely the P4 bond-gate validation.
+                    TxKind::CapacityAd { host, capacity_units, .. } => {
+                        if &tx.origin != host {
+                            return false;
+                        }
+                        if !bond_gate::validate_capacity_ad_bond(
+                            host,
+                            self.active_bond(host),
+                            *capacity_units,
+                        ) {
+                            return false;
+                        }
+                    }
                     _ => {}
                 }
             }
