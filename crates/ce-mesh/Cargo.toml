@@ -7,7 +7,7 @@ edition = "2024"
 ce-identity = { path = "../ce-identity" }
 ce-chain = { path = "../ce-chain" }
 ce-protocol = { path = "../ce-protocol" }
-libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "tokio", "macros", "mdns", "quic", "relay", "autonat", "dcutr", "request-response", "ping"] }
+libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "tokio", "macros", "mdns", "quic", "relay", "autonat", "dcutr", "request-response", "ping", "websocket", "dns"] }
 libp2p-stream = "=0.1.0-alpha"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

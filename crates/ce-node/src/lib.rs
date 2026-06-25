@@ -369,9 +369,9 @@ impl Node {
         let self_tags = capability_tags(docker_available, num_cpus() as u32, available_mem_mb());
 
         let (mesh, mesh_handle, mesh_rx, tunnel_control) = if config.disable_local_discovery {
-            Mesh::new_isolated(identity.secret_bytes())?
+            Mesh::new_isolated(identity.secret_bytes()).await?
         } else {
-            Mesh::new(identity.secret_bytes())?
+            Mesh::new(identity.secret_bytes()).await?
         };
 
         let mut mesh = mesh;

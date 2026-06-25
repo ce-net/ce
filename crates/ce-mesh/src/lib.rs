@@ -594,21 +594,24 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    pub fn new(
+    pub async fn new(
         secret_key_bytes: [u8; 32],
     ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>, StreamControl)> {
-        Self::new_inner(secret_key_bytes, false)
+        Self::new_inner(secret_key_bytes, false).await
     }
 
     /// Like `new`, but disables mDNS peer discovery. Use in tests to prevent
     /// test nodes from connecting to live local nodes via multicast.
-    pub fn new_isolated(
+    pub async fn new_isolated(
         secret_key_bytes: [u8; 32],
     ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>, StreamControl)> {
-        Self::new_inner(secret_key_bytes, true)
+        Self::new_inner(secret_key_bytes, true).await
     }
 
-    fn new_inner(
+    // async because the websocket transport (with_websocket) sets up a DNS resolver, which the
+    // libp2p 0.53 SwarmBuilder builds asynchronously. The browser-reachable /ws listener it enables
+    // is only bound when CE_WS_PORT is set (see run()), so default/native nodes are unaffected.
+    async fn new_inner(
         secret_key_bytes: [u8; 32],
         disable_local_discovery: bool,
     ) -> Result<(Self, MeshHandle, mpsc::Receiver<MeshEvent>, StreamControl)> {
@@ -632,6 +635,13 @@ impl Mesh {
                 yamux::Config::default,
             )?
             .with_quic()
+            // Browser-reachable transport: a real js-libp2p peer in a browser dials the relay over
+            // secure-websocket (wss via the edge) and joins the mesh directly. Always built; only the
+            // relay binds a /ws listener (CE_WS_PORT in run()), so native nodes carry no listener.
+            // with_dns advances OtherTransportPhase -> WebsocketPhase (and resolves /dns4 dial addrs).
+            .with_dns()?
+            .with_websocket(noise::Config::new, yamux::Config::default)
+            .await?
             .with_relay_client(noise::Config::new, yamux::Config::default)?
             .with_behaviour(|key, relay_client| {
                 let peer_id = key.public().to_peer_id();
@@ -755,6 +765,19 @@ impl Mesh {
         let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
         if let Err(e) = self.swarm.listen_on(quic_addr) {
             debug!("QUIC listen: {e}");
+        }
+
+        // Browser-reachable libp2p: when CE_WS_PORT is set (the public relay), bind a websocket
+        // listener so a js-libp2p peer in a browser can dial in over wss (TLS terminated at the edge)
+        // and join the mesh as a real, self-identified peer. Native nodes leave this unset.
+        if let Ok(ws_port) = std::env::var("CE_WS_PORT") {
+            if let Ok(p) = ws_port.trim().parse::<u16>() {
+                let ws_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{p}/ws").parse()?;
+                match self.swarm.listen_on(ws_addr) {
+                    Ok(_) => info!("mesh: listening for browser libp2p peers on /tcp/{p}/ws"),
+                    Err(e) => warn!("WS listen on {p}: {e}"),
+                }
+            }
         }
 
         for topic in [
