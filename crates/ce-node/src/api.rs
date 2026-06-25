@@ -1699,14 +1699,28 @@ async fn put_blob(State(state): State<ApiState>, body: axum::body::Bytes) -> Res
     let hash: [u8; 32] = Sha256::digest(&body).into();
     let hex = hex::encode(hash);
     let dir = state.data_dir.join("blobs");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("blob dir: {e}"));
+    let path = dir.join(&hex);
+    // Write off the async runtime: blocking `std::fs` on an executor thread spikes tail latency for
+    // every other in-flight request (and stalls badly under mining load). `Bytes::clone` is a cheap
+    // Arc bump, not a copy.
+    let to_write = body.clone();
+    match tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&path, &to_write)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("store blob: {e}")),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("blob write task: {e}")),
     }
-    if let Err(e) = std::fs::write(dir.join(&hex), &body) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("store blob: {e}"));
-    }
-    // Announce to the DHT that we now provide this chunk, so peers can fetch it (Stage 2).
-    let _ = state.mesh_handle.provide_chunk(hash).await;
+    // Announce to the DHT fire-and-forget: provider records are best-effort and re-announced
+    // periodically, so blocking the write on a full Kademlia provide round trip is pure added
+    // latency (it was the ~1s write floor). Spawn it and return immediately.
+    let mesh = state.mesh_handle.clone();
+    tokio::spawn(async move {
+        let _ = mesh.provide_chunk(hash).await;
+    });
     (StatusCode::CREATED, Json(serde_json::json!({ "hash": hex }))).into_response()
 }
 
@@ -1714,7 +1728,9 @@ async fn get_blob(State(state): State<ApiState>, Path(hash): Path<String>) -> Re
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return err(StatusCode::BAD_REQUEST, "hash must be 64 hex chars");
     }
-    if let Ok(bytes) = std::fs::read(state.data_dir.join("blobs").join(&hash)) {
+    // Local read off the async runtime (see put_blob). A miss falls through to the mesh fetch.
+    let local_path = state.data_dir.join("blobs").join(&hash);
+    if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || std::fs::read(&local_path)).await {
         return (StatusCode::OK, bytes).into_response();
     }
     // Not held locally — pull it from the mesh: find providers via the DHT, fetch from one, and
@@ -1730,10 +1746,12 @@ async fn get_blob(State(state): State<ApiState>, Path(hash): Path<String>) -> Re
     }
 }
 
-/// Pull a content-addressed chunk from the mesh: discover providers via the DHT, `FetchChunk` from
-/// each in turn, and accept the first reply whose bytes hash to `cid`. On success the chunk is
-/// stored locally and re-announced. Returns `None` if no provider yields valid bytes in time.
+/// Pull a content-addressed chunk from the mesh with **latency-aware placement**: discover providers
+/// via the DHT, rank them by measured `/netgraph` RTT (nearest first), and race the nearest few in
+/// parallel — the first reply whose bytes hash to `cid` wins. Cached + re-announced (announce
+/// fire-and-forget). Returns `None` if no provider yields valid bytes in time.
 async fn fetch_chunk_from_mesh(state: &ApiState, cid: [u8; 32]) -> Option<Vec<u8>> {
+    use futures::StreamExt;
     let providers = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         state.mesh_handle.find_providers(cid),
@@ -1741,20 +1759,58 @@ async fn fetch_chunk_from_mesh(state: &ApiState, cid: [u8; 32]) -> Option<Vec<u8
     .await
     .ok()?
     .ok()?;
+    if providers.is_empty() {
+        return None;
+    }
 
-    for peer in providers {
-        let req = RpcRequest::FetchChunk { from_node: state.host_node_id, cid, receipt: None };
-        if let Ok(RpcResponse::ChunkData { bytes, .. }) = state.mesh_handle.send_rpc(peer, req).await
-        {
-            let got: [u8; 32] = Sha256::digest(&bytes).into();
-            if got != cid {
-                continue; // wrong/tampered bytes — try the next provider
+    // Placement: prefer the closest copy. Rank by smoothed RTT (unknown peers sort last), then race
+    // the nearest `RACE` at a time — locality + parallelism instead of a random sequential scan.
+    let mut ranked = providers;
+    {
+        let g = state.netgraph.lock().await;
+        ranked.sort_by(|a, b| {
+            let ra = g.get(&a.to_string()).map(|s| s.rtt_ms).unwrap_or(f64::INFINITY);
+            let rb = g.get(&b.to_string()).map(|s| s.rtt_ms).unwrap_or(f64::INFINITY);
+            ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    const RACE: usize = 3;
+    let from_node = state.host_node_id;
+    for wave in ranked.chunks(RACE) {
+        let mut futs = futures::stream::FuturesUnordered::new();
+        for peer in wave {
+            let peer = peer.clone();
+            let mesh = state.mesh_handle.clone();
+            futs.push(async move {
+                let req = RpcRequest::FetchChunk { from_node, cid, receipt: None };
+                match mesh.send_rpc(peer, req).await {
+                    Ok(RpcResponse::ChunkData { bytes, .. }) => {
+                        let got: [u8; 32] = Sha256::digest(&bytes).into();
+                        if got == cid { Some(bytes) } else { None }
+                    }
+                    _ => None,
+                }
+            });
+        }
+        while let Some(res) = futs.next().await {
+            if let Some(bytes) = res {
+                // Cache off the runtime + re-announce fire-and-forget (popular data self-replicates).
+                let path = state.data_dir.join("blobs").join(hex::encode(cid));
+                let b2 = bytes.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&path, &b2);
+                })
+                .await;
+                let mesh = state.mesh_handle.clone();
+                tokio::spawn(async move {
+                    let _ = mesh.provide_chunk(cid).await;
+                });
+                return Some(bytes);
             }
-            let dir = state.data_dir.join("blobs");
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(dir.join(hex::encode(cid)), &bytes);
-            let _ = state.mesh_handle.provide_chunk(cid).await;
-            return Some(bytes);
         }
     }
     None
