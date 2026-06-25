@@ -104,6 +104,25 @@ fn is_localhost_origin(origin: &str) -> bool {
     host == "localhost" || host == "127.0.0.1"
 }
 
+/// Is this `Origin` header the production CE website (or one of its subdomains)? Accepts only the
+/// exact origin `https://ce-net.com` and `https://<label>.ce-net.com` (e.g. `www.ce-net.com`,
+/// `cast-c0be11e0ce.ce-net.com`). Strict by construction: the scheme must be `https`, there is no
+/// port, and the host must equal `ce-net.com` or end with the dot-bounded suffix `.ce-net.com` —
+/// so look-alikes like `evilce-net.com`, `notce-net.com`, or `ce-net.com.evil.com` are rejected.
+/// This widens the read-only GET CORS surface so the public site can detect a local node in a
+/// visitor's browser; it never exposes mutating routes (CORS allows GET only, writes need the token).
+fn is_ce_web_origin(origin: &str) -> bool {
+    let host = match origin.strip_prefix("https://") {
+        Some(h) => h,
+        None => return false,
+    };
+    // No port, path, userinfo, or other authority cruft is permitted on the web origin.
+    if host.contains([':', '/', '@', '?', '#']) {
+        return false;
+    }
+    host == "ce-net.com" || host.ends_with(".ce-net.com")
+}
+
 /// Constant-time byte comparison (avoids timing oracles on the token check).
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -2228,18 +2247,21 @@ pub async fn start(
     // unaffected — they arrive over the Noise-authenticated libp2p RPC path, not this HTTP API.
     let app = app.layer(middleware::from_fn_with_state(api_token.clone(), require_api_token));
 
-    // Read-only, localhost-scoped CORS so a browser dashboard served from http://localhost can fetch
-    // the GET/SSE read surfaces (status, history, transactions, atlas, beacon, streams). Scoped to
-    // GET only: mutating routes (POST/PUT/DELETE) are NOT made cross-origin-reachable — a browser
-    // preflight for a non-GET method receives no allow, and the api.token already gates writes. The
-    // origin predicate reflects only loopback origins (http(s)://localhost|127.0.0.1|[::1][:port]),
-    // so a hostile public web page cannot read this node's API from a victim's browser.
+    // Read-only CORS so a browser dashboard can fetch the GET/SSE read surfaces (status, history,
+    // transactions, atlas, beacon, streams). Scoped to GET only: mutating routes (POST/PUT/DELETE)
+    // are NOT made cross-origin-reachable — a browser preflight for a non-GET method receives no
+    // allow, and the api.token already gates writes. The origin predicate reflects only loopback
+    // origins (http(s)://localhost|127.0.0.1|[::1][:port]) and the production website
+    // (https://ce-net.com and its subdomains), so the public site can detect a local node while a
+    // hostile arbitrary page still cannot read this node's API from a victim's browser. Credentials
+    // are NOT allowed; content-type is permitted defensively for a simple GET.
     let cors = tower_http::cors::CorsLayer::new()
         .allow_methods([Method::GET])
+        .allow_headers([axum::http::header::CONTENT_TYPE])
         .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _req| {
             origin
                 .to_str()
-                .map(is_localhost_origin)
+                .map(|o| is_localhost_origin(o) || is_ce_web_origin(o))
                 .unwrap_or(false)
         }));
     let app = app.layer(cors);
@@ -2329,6 +2351,36 @@ mod tests {
             "",
         ] {
             assert!(!is_localhost_origin(o), "should reject {o}");
+        }
+    }
+
+    #[test]
+    fn ce_web_origins_accepted() {
+        for o in [
+            "https://ce-net.com",
+            "https://www.ce-net.com",
+            "https://x.ce-net.com",
+            "https://cast-c0be11e0ce.ce-net.com",
+        ] {
+            assert!(is_ce_web_origin(o), "should accept {o}");
+        }
+    }
+
+    #[test]
+    fn ce_web_origins_rejected() {
+        for o in [
+            "http://ce-net.com",            // not https
+            "https://ce-net.com.evil.com",  // suffix attack
+            "https://evilce-net.com",       // no dot boundary
+            "https://notce-net.com",        // no dot boundary
+            "https://ce-net.com:8844",      // no port allowed
+            "https://ce-net.com/path",      // no path allowed
+            "https://a@ce-net.com",         // userinfo
+            "ftp://ce-net.com",
+            "ce-net.com",
+            "",
+        ] {
+            assert!(!is_ce_web_origin(o), "should reject {o}");
         }
     }
 

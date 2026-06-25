@@ -8,7 +8,7 @@ All request and response bodies are JSON. All responses include a `Content-Type:
 
 **Auth.** Mutating (non-GET) requests require `Authorization: Bearer <data_dir>/api.token`. Read-only GETs are open.
 
-**CORS.** Read-only GET and SSE endpoints send permissive CORS headers **only** for loopback origins (`http(s)://localhost`, `127.0.0.1`, `[::1]`, any port), so a browser dashboard served from `localhost` can fetch them. CORS is scoped to the `GET` method: mutating routes are never made cross-origin-reachable, and a hostile public web page cannot read this node's API from a victim's browser.
+**CORS.** Read-only GET and SSE endpoints send permissive CORS headers **only** for loopback origins (`http(s)://localhost`, `127.0.0.1`, `[::1]`, any port) and the production website (`https://ce-net.com` and its subdomains, e.g. `https://www.ce-net.com`), so a browser dashboard served from `localhost` and the public site (for local-node detection) can fetch them. The web-origin match is strict: `https` only, no port, and a dot-bounded host (look-alikes like `evilce-net.com` or `ce-net.com.evil.com` are rejected). CORS is scoped to the `GET` method: mutating routes are never made cross-origin-reachable, credentials are not allowed, and an arbitrary hostile page cannot read this node's API from a victim's browser.
 
 **No key endpoint (by design).** There is deliberately **no** `/key/*` HTTP route. Identity-key backup and restore are TTY-only CLI actions (`ce key backup` / `ce key restore`); key material must never cross the API boundary (a network-reachable export would let any api.token holder exfiltrate the identity). A CI boundary gate fails the build if a `/key/*` route or a credit-minting endpoint is ever added.
 
