@@ -1391,3 +1391,71 @@ async fn app_message_self_delivery() {
     assert_eq!(m["from"], hex::encode(id), "self message is from this node");
     assert_eq!(m["payload_hex"], payload_hex, "payload intact");
 }
+
+/// Self request/reply: a `/mesh/request` to one's OWN NodeId is delivered to the local app with a
+/// reply_token, and the app's `/mesh/reply` wakes the waiting requester — all without the network
+/// (libp2p can't dial self, so this used to 502). This is what lets co-located apps do mesh
+/// request/reply on a single node (e.g. a relying party calling a co-located ce-auth `verify`).
+#[tokio::test(flavor = "multi_thread")]
+async fn app_request_self_delivery() {
+    let (p2p, api) = alloc_ports();
+    let dir = tmpdir("self-request");
+    let _node = Node::start(NodeConfig {
+        listen_port: p2p,
+        bootstrap_peers: vec![],
+        data_dir: dir.clone(),
+        api_port: api,
+        mine: false,
+        disable_local_discovery: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let id = host_node_id(&dir);
+
+    sleep(Duration::from_millis(600)).await;
+
+    // Background "app": find the inbound request (reply_token set) on topic "echo" and answer it.
+    let responder = tokio::spawn(async move {
+        let c = reqwest::Client::new();
+        for _ in 0..60 {
+            sleep(Duration::from_millis(100)).await;
+            let msgs: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{api}/mesh/messages"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if let Some(m) = msgs.as_array().and_then(|a| {
+                a.iter().find(|m| m["topic"] == "echo" && m.get("reply_token").is_some())
+            }) {
+                let token = m["reply_token"].as_u64().unwrap();
+                let _ = c
+                    .post(format!("http://127.0.0.1:{api}/mesh/reply"))
+                    .bearer_auth(TEST_API_TOKEN)
+                    .json(&serde_json::json!({ "token": token, "payload_hex": hex::encode(b"pong") }))
+                    .send()
+                    .await;
+                return;
+            }
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{api}/mesh/request"))
+        .bearer_auth(TEST_API_TOKEN)
+        .json(&serde_json::json!({
+            "to": hex::encode(id),
+            "topic": "echo",
+            "payload_hex": hex::encode(b"ping"),
+            "timeout_ms": 8000,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "self request must be served locally, not dialed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["payload_hex"], hex::encode(b"pong"), "the local app's reply comes back");
+    let _ = responder.await;
+}

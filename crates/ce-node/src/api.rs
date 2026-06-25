@@ -19,13 +19,14 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     convert::Infallible,
     path::PathBuf,
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::{
     APP_INBOX_CAPACITY, AppInbox, AppMessage, Atlas, CeJobStatus, ChainHandle, JobRecord, JobStore,
@@ -54,6 +55,13 @@ struct ApiState {
     /// Push channel — subscribers receive every inbound app message instantly.
     app_msg_tx: broadcast::Sender<AppMessage>,
     send_nonce: Arc<AtomicU64>,
+    /// Waiters for self-addressed `/mesh/request`s. libp2p cannot dial self, so a request to our
+    /// own NodeId is delivered to the local app with a `reply_token`; the app's `/mesh/reply` wakes
+    /// the matching waiter here. The token has its high bit set so it never collides with a mesh
+    /// correlation id.
+    pending_self: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
+    /// Counter for self-request reply tokens (high bit OR'd in at use).
+    self_req_seq: Arc<AtomicU64>,
     job_store: JobStore,
     pool: TxPool,
     /// Poke the job manager to check for newly-signed settlements immediately.
@@ -1914,11 +1922,49 @@ async fn mesh_request(State(state): State<ApiState>, Json(req): Json<AppRequestR
         Ok(p) => p,
         Err(_) => return err(StatusCode::BAD_REQUEST, "payload_hex must be valid hex"),
     };
+    let timeout = std::time::Duration::from_millis(req.timeout_ms.unwrap_or(30_000));
+    // Self-request: libp2p cannot dial self, so deliver to the LOCAL app with a reply_token and
+    // await its /mesh/reply here (mirrors self-delivery for /mesh/send). Lets co-located apps do
+    // request/reply over the mesh API on a single node.
+    if to == state.host_node_id {
+        let token = state.self_req_seq.fetch_add(1, Ordering::Relaxed) | (1u64 << 63);
+        let (tx, rx) = oneshot::channel::<Vec<u8>>();
+        state.pending_self.lock().await.insert(token, tx);
+        let msg = AppMessage {
+            from: hex::encode(state.host_node_id),
+            topic: req.topic,
+            payload_hex: hex::encode(&payload),
+            received_at: now_secs(),
+            reply_token: Some(token),
+        };
+        {
+            let mut ring = state.app_inbox.lock().await;
+            if ring.len() >= APP_INBOX_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(msg.clone());
+        }
+        let _ = state.app_msg_tx.send(msg);
+        return match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(payload)) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "payload_hex": hex::encode(payload) })),
+            )
+                .into_response(),
+            Ok(Err(_)) => {
+                state.pending_self.lock().await.remove(&token);
+                err(StatusCode::BAD_GATEWAY, "local app dropped the reply")
+            }
+            Err(_) => {
+                state.pending_self.lock().await.remove(&token);
+                err(StatusCode::GATEWAY_TIMEOUT, "local app did not reply in time")
+            }
+        };
+    }
     let peer_id = match peer_id_from_node_id(&to) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad recipient id: {e}")),
     };
-    let timeout = std::time::Duration::from_millis(req.timeout_ms.unwrap_or(30_000));
     let rpc = RpcRequest::AppRequest { from_node: state.host_node_id, topic: req.topic, payload };
     match tokio::time::timeout(timeout, state.mesh_handle.send_rpc(peer_id, rpc)).await {
         Ok(Ok(RpcResponse::AppReply { payload })) => {
@@ -1946,6 +1992,12 @@ async fn mesh_reply(State(state): State<ApiState>, Json(req): Json<ReplyRequest>
         Ok(p) => p,
         Err(_) => return err(StatusCode::BAD_REQUEST, "payload_hex must be valid hex"),
     };
+    // Local self-reply: if the token belongs to a self-request waiter (high bit set), fulfill it
+    // directly instead of routing over the mesh.
+    if let Some(tx) = state.pending_self.lock().await.remove(&req.token) {
+        let _ = tx.send(payload);
+        return (StatusCode::OK, Json(serde_json::json!({ "status": "replied" }))).into_response();
+    }
     match state.mesh_handle.respond_rpc(req.token, RpcResponse::AppReply { payload }).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "replied" }))).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("reply failed: {e}")),
@@ -2050,6 +2102,8 @@ pub async fn start(
         app_inbox,
         app_msg_tx,
         send_nonce,
+        pending_self: Arc::new(Mutex::new(HashMap::new())),
+        self_req_seq: Arc::new(AtomicU64::new(0)),
         job_store,
         pool,
         settle_notify_tx,
