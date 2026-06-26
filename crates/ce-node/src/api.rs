@@ -2300,7 +2300,11 @@ pub async fn start(
         .route("/channels/receipt", post(channel_receipt))
         .route("/channels/:id/close", post(channel_close))
         .route("/channels/:id/expire", post(channel_expire))
-        .route("/blobs", post(put_blob))
+        // Content-addressed blobs can be multi-MB (app bundles, wasm, images). axum's DefaultBodyLimit is
+        // 2 MiB, which 413s real uploads (e.g. a wgpu wasm bundle published via ce-serve). Raise it on the
+        // blob ingest route specifically. (Streaming the body to disk instead of buffering is the further
+        // optimization noted in docs/optimization-roadmap.md.)
+        .route("/blobs", post(put_blob).layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024)))
         .route("/blobs/:hash", get(get_blob))
         .route("/data/fetch", post(data_fetch))
         .route("/mesh/send", post(send_message))
