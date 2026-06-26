@@ -609,6 +609,7 @@ name = "ce"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "ce-appmgr",
  "ce-cap",
  "ce-chain",
  "ce-identity",
@@ -629,6 +630,21 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ce-appmgr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

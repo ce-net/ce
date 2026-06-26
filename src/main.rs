@@ -301,6 +301,69 @@ enum Commands {
         #[arg(long, default_value = "8844")]
         api_port: u16,
     },
+    /// Install, run, and supervise any app or system through `ce` — the only host binary.
+    ///
+    /// Apps (CE-native, arbitrary legacy software, or whole systems) are described by a
+    /// `ceapp.toml` in the ce-hub registry and installed into the single ce-owned store.
+    /// See PLAN/ce-app-package-runtime.md.
+    App {
+        #[command(subcommand)]
+        command: AppCommands,
+    },
+}
+
+/// `ce app ...` — the universal app & system manager.
+#[derive(Subcommand)]
+enum AppCommands {
+    /// Resolve an app + its dependency graph and install it (records + launcher shim).
+    ///
+    /// Without `--yes` this is a dry run: it prints the resolved plan and required
+    /// services/capabilities, and changes nothing. `--on` places the install on the
+    /// mesh (default `self`); non-local placements ship to the target node's agent.
+    Install {
+        /// App name as published to the registry.
+        name: String,
+        /// Placement: self | node=<id> | tag=a,b | fleet=<name> | nearest.
+        #[arg(long, default_value = "self")]
+        on: String,
+        /// ce-hub registry origin to resolve manifests from.
+        #[arg(long, default_value = "https://ce-net.com")]
+        registry: String,
+        /// Apply the plan (write install records + shims) instead of a dry run.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show an app's manifest and resolved install plan from the registry.
+    Info {
+        name: String,
+        #[arg(long, default_value = "https://ce-net.com")]
+        registry: String,
+    },
+    /// List apps installed locally through `ce`.
+    Ls,
+    /// List running app instances across the whole mesh (from ce-hub).
+    Ps {
+        /// Only show instances of this app.
+        #[arg(long)]
+        app: Option<String>,
+        /// ce-hub origin holding the global instance registry.
+        #[arg(long, default_value = "https://ce-net.com")]
+        hub: String,
+    },
+    /// Remove an installed app (record + artifacts + launcher shim).
+    Uninstall {
+        name: String,
+    },
+    /// Run an installed app in its sandbox (one-shot). Args after `--` go to the app.
+    Run {
+        name: String,
+        /// Placement: self | node=<id> | tag=a,b | fleet=<name> | nearest.
+        #[arg(long, default_value = "self")]
+        on: String,
+        /// Arguments passed through to the app (after `--`).
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1649,8 +1712,235 @@ async fn main() -> Result<()> {
             println!("signal id: {}", result["id"].as_str().unwrap_or("?"));
             println!("nonce    : {}", result["nonce"].as_u64().unwrap_or(0));
         }
+        Commands::App { command } => app_command(command, &data_dir).await?,
     }
 
+    Ok(())
+}
+
+// ===== ce app — universal app & system manager =====
+
+/// The launcher-shim / entrypoint name for an app: the native binary name when the
+/// app ships a native binary, otherwise the app name itself (oci/wasm/recipe).
+fn app_shim_name(m: &ce_appmgr::AppManifest) -> String {
+    m.native
+        .as_ref()
+        .map(|n| n.bin.clone())
+        .unwrap_or_else(|| m.app.name.clone())
+}
+
+/// Print the non-app requirements a resolved plan carries (services, capabilities,
+/// host features). Shared by `info` and `install`.
+fn print_plan_requirements(plan: &ce_appmgr::Plan) {
+    if !plan.services.is_empty() {
+        println!("  services    : {}", plan.services.iter().cloned().collect::<Vec<_>>().join(", "));
+    }
+    if !plan.capabilities.is_empty() {
+        println!("  capabilities: {}", plan.capabilities.iter().cloned().collect::<Vec<_>>().join(", "));
+    }
+    if !plan.system.is_empty() {
+        let sys: Vec<String> = plan.system.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        println!("  system      : {}", sys.join(", "));
+    }
+}
+
+async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()> {
+    let store = ce_appmgr::Store::new(data_dir);
+    match cmd {
+        AppCommands::Info { name, registry } => {
+            let reg = ce_appmgr::HubRegistry::new(registry);
+            let plan = ce_appmgr::resolve(&reg, &name).await?;
+            // The root app is the last item in install order.
+            let root = plan
+                .items
+                .last()
+                .ok_or_else(|| anyhow!("empty plan for '{name}'"))?;
+            let m = &root.manifest;
+            println!("{} {}", m.app.name, m.app.version);
+            if !m.app.summary.is_empty() {
+                println!("  {}", m.app.summary);
+            }
+            println!("  runtime     : {:?}", m.app.runtime);
+            let target = ce_appmgr::host_target();
+            match m.app.runtime {
+                ce_appmgr::Runtime::Native => match m.native_digest(&target) {
+                    Some(d) => println!("  artifact    : {target} -> {d}"),
+                    None => println!("  artifact    : (no native build for {target})"),
+                },
+                ce_appmgr::Runtime::Oci => {
+                    if let Some(o) = &m.oci {
+                        println!("  image       : {}", o.image);
+                    }
+                }
+                ce_appmgr::Runtime::Wasm => {
+                    if let Some(w) = &m.wasm {
+                        println!("  artifact    : {} (portable)", w.artifact);
+                    }
+                }
+                ce_appmgr::Runtime::Recipe => {
+                    if let Some(r) = &m.recipe {
+                        println!("  source      : {}", r.source);
+                    }
+                }
+            }
+            println!("  sandbox     : {:?} / net={}", m.sandbox.tier, m.sandbox.net);
+            if m.is_daemon() {
+                println!("  daemon      : yes (supervised by the ce service)");
+            }
+            print_plan_requirements(&plan);
+            if plan.items.len() > 1 {
+                println!("  install order: {}", plan.order().join(" -> "));
+            }
+        }
+
+        AppCommands::Install { name, on, registry, yes } => {
+            let placement = ce_appmgr::Placement::parse(&on)?;
+            if !placement.is_local() {
+                // Global install: ship the resolved install to the target node's
+                // agent over mesh-deploy (capability-authed). The remote agent runs
+                // the same resolve+materialize+supervise path and registers the
+                // instance in ce-hub. Wired with the mesh-deploy milestone.
+                return Err(anyhow!(
+                    "global placement '{placement}' not yet wired — local install only for now \
+                     (ship-to-mesh lands with the mesh-deploy milestone; see PLAN/ce-app-package-runtime.md)"
+                ));
+            }
+            let reg = ce_appmgr::HubRegistry::new(registry);
+            let plan = ce_appmgr::resolve(&reg, &name).await?;
+            println!("Plan for '{name}' (on {placement}):");
+            for item in &plan.items {
+                let m = &item.manifest;
+                let marker = if store.is_installed(&m.app.name) { " (already installed)" } else { "" };
+                println!("  - {} {} [{:?}]{marker}", m.app.name, m.app.version, m.app.runtime);
+            }
+            print_plan_requirements(&plan);
+
+            if !yes {
+                println!("\nDry run. Re-run with --yes to install.");
+                return Ok(());
+            }
+
+            store.ensure()?;
+            for item in &plan.items {
+                let m = &item.manifest;
+                if store.is_installed(&m.app.name) {
+                    continue;
+                }
+                let target = ce_appmgr::host_target();
+                // Resolve the content digest where the tier is content-addressed.
+                let digest = match m.app.runtime {
+                    ce_appmgr::Runtime::Native => m.native_digest(&target).map(str::to_string),
+                    ce_appmgr::Runtime::Wasm => m.wasm.as_ref().map(|w| w.artifact.clone()),
+                    _ => None,
+                };
+                if m.app.runtime == ce_appmgr::Runtime::Native && digest.is_none() {
+                    return Err(anyhow!(
+                        "'{}' has no native build for {target}; cannot install here",
+                        m.app.name
+                    ));
+                }
+                let rec = ce_appmgr::InstalledApp {
+                    manifest: m.clone(),
+                    target: target.clone(),
+                    digest,
+                };
+                store.record(&rec)?;
+                #[cfg(unix)]
+                {
+                    let shim = app_shim_name(m);
+                    let path = store.write_shim(&shim, &m.app.name)?;
+                    println!("installed {} {} -> shim {}", m.app.name, m.app.version, path.display());
+                }
+                #[cfg(not(unix))]
+                println!("installed {} {} (shims: unix only for now)", m.app.name, m.app.version);
+            }
+            // Materializing native/wasm artifacts (blob fetch + verify) and pulling
+            // oci images on first run land with the runtime-execution milestone (M2/M3).
+            println!(
+                "\nRegistered with ce. Artifact materialization + sandboxed run wiring is the next milestone."
+            );
+            println!("Ensure {} is on PATH.", store.bin_dir().display());
+        }
+
+        AppCommands::Ls => {
+            let apps = store.list()?;
+            if apps.is_empty() {
+                println!("No apps installed. Try: ce app install <name>");
+                return Ok(());
+            }
+            for a in apps {
+                let kind = if a.manifest.is_daemon() { "daemon" } else { "cli" };
+                println!(
+                    "{:<20} {:<10} {:<7} {:?}",
+                    a.manifest.app.name, a.manifest.app.version, kind, a.manifest.app.runtime
+                );
+            }
+        }
+
+        AppCommands::Ps { app, hub } => {
+            let hub = ce_appmgr::HubInstances::new(hub);
+            let filter = ce_appmgr::InstanceFilter { app, ..Default::default() };
+            let instances = hub.list(&filter).await?;
+            if instances.is_empty() {
+                println!("No running instances.");
+                return Ok(());
+            }
+            println!("{:<24} {:<14} {:<10} {:<10} NODE", "INSTANCE", "APP", "VERSION", "HEALTH");
+            for i in instances {
+                let node_short: String = i.node_id.chars().take(12).collect();
+                println!(
+                    "{:<24} {:<14} {:<10} {:<10} {node_short}",
+                    i.id, i.app, i.version, format!("{:?}", i.health)
+                );
+            }
+        }
+
+        AppCommands::Uninstall { name } => {
+            let Some(rec) = store.get(&name)? else {
+                println!("'{name}' is not installed.");
+                return Ok(());
+            };
+            #[cfg(unix)]
+            store.remove_shim(&app_shim_name(&rec.manifest))?;
+            store.remove(&name)?;
+            println!("Uninstalled {name}.");
+        }
+
+        AppCommands::Run { name, on, args } => {
+            let placement = ce_appmgr::Placement::parse(&on)?;
+            if !placement.is_local() {
+                return Err(anyhow!(
+                    "global placement '{placement}' not yet wired — local run only for now \
+                     (mesh placement lands with the mesh-deploy milestone)"
+                ));
+            }
+            let Some(rec) = store.get(&name)? else {
+                return Err(anyhow!("'{name}' is not installed. Run: ce app install {name}"));
+            };
+            let m = &rec.manifest;
+            // Runtime execution (oci via ce-container, wasm via ce-wasm, native spawn)
+            // is the next milestone. For now, report exactly what would run so the
+            // shim/scope plumbing is verifiable end to end.
+            println!("would run '{}' [{:?}] in sandbox {:?} (net={})",
+                m.app.name, m.app.runtime, m.sandbox.tier, m.sandbox.net);
+            match m.app.runtime {
+                ce_appmgr::Runtime::Oci => {
+                    if let Some(o) = &m.oci {
+                        println!("  image: {}", o.image);
+                    }
+                }
+                ce_appmgr::Runtime::Native => {
+                    let bin = m.native.as_ref().map(|n| n.bin.as_str()).unwrap_or(&m.app.name);
+                    println!("  bin  : {bin} (target {})", rec.target);
+                }
+                _ => {}
+            }
+            if !args.is_empty() {
+                println!("  args : {}", args.join(" "));
+            }
+            println!("(runtime execution lands in the next milestone — see PLAN/ce-app-package-runtime.md)");
+        }
+    }
     Ok(())
 }
 

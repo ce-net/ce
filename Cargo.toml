@@ -6,6 +6,7 @@ members = [
     "crates/ce-runtime",
     "crates/ce-guard",
     "crates/ce-wasm",
+    "crates/ce-appmgr",
     "crates/ce-chain",
     "crates/ce-mesh",
     "crates/ce-container",
@@ -29,6 +30,7 @@ ce-node = { path = "crates/ce-node" }
 ce-identity = { path = "crates/ce-identity" }
 ce-cap = { path = "crates/ce-cap" }
 ce-chain = { path = "crates/ce-chain" }
+ce-appmgr = { path = "crates/ce-appmgr" }
 futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

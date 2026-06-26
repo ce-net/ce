@@ -1,0 +1,25 @@
+# Example: a whole legacy SYSTEM, never CE-native, never WASM.
+# Installs + supervises Postgres through `ce` via the universal oci tier.
+#   ce app install postgres --yes
+#   ce app daemon enable postgres   (supervisor milestone)
+
+[app]
+name    = "postgres"
+version = "16.0.0"
+summary = "PostgreSQL relational database (legacy system, run via oci)"
+runtime = "oci"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+
+[oci]
+image   = "docker.io/library/postgres:16"
+ports   = ["5432"]
+volumes = ["data:/var/lib/postgresql/data"]
+
+[sandbox]
+tier = "gvisor"
+net  = "loopback"
+
+[daemon]
+enabled = false
+restart = "on-failure"
+health  = "tcp://127.0.0.1:5432"
