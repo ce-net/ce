@@ -615,6 +615,7 @@ dependencies = [
  "ce-container",
  "ce-identity",
  "ce-node",
+ "ce-wasm",
  "chacha20poly1305",
  "clap",
  "directories",
