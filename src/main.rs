@@ -370,6 +370,14 @@ enum AppCommands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
+    /// Stop a (possibly remote) app instance deployed via `--on`, by its job id.
+    Kill {
+        /// The job id printed by `ce app install/run --on <placement>`.
+        job_id: String,
+        /// Node the instance runs on: node=<id> or a wallet alias.
+        #[arg(long)]
+        on: String,
+    },
 }
 
 /// `ce app daemon ...` — the single supervisor that replaces per-app plists.
@@ -1825,14 +1833,16 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
         AppCommands::Install { name, on, registry, yes } => {
             let placement = ce_appmgr::Placement::parse(&on)?;
             if !placement.is_local() {
-                // Global install: ship the resolved install to the target node's
-                // agent over mesh-deploy (capability-authed). The remote agent runs
-                // the same resolve+materialize+supervise path and registers the
-                // instance in ce-hub. Wired with the mesh-deploy milestone.
-                return Err(anyhow!(
-                    "global placement '{placement}' not yet wired — local install only for now \
-                     (ship-to-mesh lands with the mesh-deploy milestone; see PLAN/ce-app-package-runtime.md)"
-                ));
+                // Global install: resolve the app, then ship its image to the target
+                // node over the mesh-deploy primitive (capability-authed). The remote
+                // node runs it sandboxed as a job; we register the instance to ce-hub.
+                let reg = ce_appmgr::HubRegistry::new(&registry);
+                let plan = ce_appmgr::resolve(&reg, &name).await?;
+                let root = plan.items.last().ok_or_else(|| anyhow!("empty plan for '{name}'"))?;
+                let m = &root.manifest;
+                let image = oci_image_or_err(m)?;
+                let version = m.app.version.to_string();
+                return mesh_deploy_oci(&name, &version, &image, &placement, data_dir).await;
             }
             let reg = ce_appmgr::HubRegistry::new(&registry);
             let plan = ce_appmgr::resolve(&reg, &name).await?;
@@ -1941,16 +1951,16 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
 
         AppCommands::Run { name, on, args } => {
             let placement = ce_appmgr::Placement::parse(&on)?;
-            if !placement.is_local() {
-                return Err(anyhow!(
-                    "global placement '{placement}' not yet wired — local run only for now \
-                     (mesh placement lands with the mesh-deploy milestone)"
-                ));
-            }
             let Some(rec) = store.get(&name)? else {
                 return Err(anyhow!("'{name}' is not installed. Run: ce app install {name}"));
             };
             let version = rec.manifest.app.version.to_string();
+            if !placement.is_local() {
+                // Global run: ship the (already-installed) app's image to the target
+                // node over mesh-deploy.
+                let image = oci_image_or_err(&rec.manifest)?;
+                return mesh_deploy_oci(&name, &version, &image, &placement, data_dir).await;
+            }
             let plan = ce_appmgr::plan_run(&store, &rec, args)?;
             run_app(&name, &version, plan, data_dir).await?;
         }
@@ -1989,6 +1999,121 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
                 run_supervisor(&store, data_dir, &hub, once, interval).await?;
             }
         },
+
+        AppCommands::Kill { job_id, on } => {
+            let placement = ce_appmgr::Placement::parse(&on)?;
+            let node = match &placement {
+                ce_appmgr::Placement::Node(id) => id.clone(),
+                other => {
+                    return Err(anyhow!(
+                        "`ce app kill` needs the node the instance runs on: --on node=<id> (got '{other}')"
+                    ));
+                }
+            };
+            let (node_id_hex, cap) = resolve_target(&data_dir.to_path_buf(), &node)?;
+            let api_token = read_api_token(data_dir);
+            let client = api_client(&api_token);
+            let body = serde_json::json!({ "node_id": node_id_hex, "job_id": job_id, "grant": cap });
+            let resp = client
+                .post("http://127.0.0.1:8844/mesh-kill")
+                .json(&body)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("kill failed ({status}): {text}"));
+            }
+            println!("killed job {job_id} on node={node_id_hex}");
+        }
+    }
+    Ok(())
+}
+
+/// The oci image for a manifest, or a clear error for tiers that can't yet be
+/// placed on the mesh (native/wasm global install needs the remote agent path).
+fn oci_image_or_err(m: &ce_appmgr::AppManifest) -> Result<String> {
+    if m.app.runtime != ce_appmgr::Runtime::Oci {
+        return Err(anyhow!(
+            "global placement currently supports oci apps (postgres, ffmpeg, ...); \
+             '{}' is {:?} — install it locally with --on self, or publish an oci build",
+            m.app.name,
+            m.app.runtime
+        ));
+    }
+    m.oci
+        .as_ref()
+        .map(|o| o.image.clone())
+        .ok_or_else(|| anyhow!("oci manifest missing [oci].image"))
+}
+
+/// Ship an oci app to a target node via the node's `/mesh-deploy` primitive
+/// (capability-authed), then register the instance in ce-hub. Only explicit
+/// `node=<id>` placement is wired; tag/fleet/nearest need atlas-based selection.
+async fn mesh_deploy_oci(
+    app_name: &str,
+    version: &str,
+    image: &str,
+    placement: &ce_appmgr::Placement,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    let target = match placement {
+        ce_appmgr::Placement::Node(id) => id.clone(),
+        other => {
+            return Err(anyhow!(
+                "placement '{other}' needs atlas-based selection (tag/fleet/nearest) — \
+                 pending; use --on node=<id> for now"
+            ));
+        }
+    };
+    let (node_id_hex, cap) = resolve_target(&data_dir.to_path_buf(), &target)?;
+    let api_token = read_api_token(data_dir);
+    let client = api_client(&api_token);
+    // Conservative default envelope; a 1-credit bid keeps the directed deploy cheap.
+    let bid = parse_credits("1")?.to_string();
+    let body = serde_json::json!({
+        "node_id": node_id_hex,
+        "image": image,
+        "cmd": Vec::<String>::new(),
+        "cpu_cores": ce_appmgr::run::DEFAULT_CPU_CORES,
+        "mem_mb": ce_appmgr::run::DEFAULT_MEM_MB,
+        "duration_secs": 3600u64,
+        "bid": bid,
+        "grant": cap,
+    });
+    let resp = client
+        .post("http://127.0.0.1:8844/mesh-deploy")
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("mesh-deploy failed ({status}): {text}"));
+    }
+    let result: serde_json::Value = resp.json().await?;
+    let job_id = result["job_id"].as_str().unwrap_or("?");
+    println!("deployed {app_name} {version} on node={node_id_hex} (oci {image}, job {job_id})");
+
+    // Best-effort: record the remote instance in ce-hub's global registry.
+    let hub = ce_appmgr::HubInstances::new("https://ce-net.com");
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let rec = ce_appmgr::InstanceRecord {
+        id: ce_appmgr::InstanceRecord::make_id(&node_id_hex, app_name, 0),
+        app: app_name.to_string(),
+        version: version.to_string(),
+        node_id: node_id_hex.clone(),
+        runtime: ce_appmgr::Runtime::Oci,
+        placement: placement.clone(),
+        health: ce_appmgr::Health::Starting,
+        started_unix: started,
+        metrics: serde_json::Value::Null,
+    };
+    if let Err(e) = hub.register(&rec).await {
+        eprintln!("note: ce-hub registration for the remote instance failed (continuing): {e}");
     }
     Ok(())
 }
