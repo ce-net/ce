@@ -30,12 +30,14 @@ pub mod registry;
 pub mod resolver;
 pub mod run;
 pub mod store;
+pub mod supervisor;
 
 pub use ctlapi::{CallerContext, ControlPlane, DepHandle, EnsureDepRequest, InstallRequest};
 pub use instances::{Health, HubInstances, InstanceFilter, InstanceRecord};
 pub use manifest::{AppManifest, Runtime, SandboxTier};
 pub use materialize::{BlobClient, Materialized, materialize};
 pub use run::{RunPlan, plan_run};
+pub use supervisor::{DaemonPolicy, RestartPolicy, daemon_policy, enabled_daemons};
 pub use placement::Placement;
 pub use platform::host_target;
 pub use registry::HubRegistry;

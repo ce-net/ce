@@ -118,6 +118,33 @@ impl Store {
         Ok(())
     }
 
+    /// Path of the marker that records whether an app's daemon is enabled for the
+    /// single ce supervisor to keep running.
+    fn daemon_flag_path(&self, name: &str) -> PathBuf {
+        self.app_dir(name).join("daemon.enabled")
+    }
+
+    /// Enable or disable supervision of an app's daemon. Enabling an app that has no
+    /// `[daemon]` is a caller error; the marker is a presence flag (its content is
+    /// informational only).
+    pub fn set_daemon_enabled(&self, name: &str, on: bool) -> Result<()> {
+        let p = self.daemon_flag_path(name);
+        if on {
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&p, b"enabled\n")?;
+        } else if p.exists() {
+            std::fs::remove_file(&p)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the app's daemon is enabled for supervision.
+    pub fn is_daemon_enabled(&self, name: &str) -> bool {
+        self.daemon_flag_path(name).exists()
+    }
+
     /// Remove an app's entire tree (record + artifacts). Shims are removed by the
     /// caller, which knows the shim names. Idempotent.
     pub fn remove(&self, name: &str) -> Result<()> {

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ce_chain::{Chain, CREDIT};
 use ce_identity::Identity;
 use ce_cap::{self as capability, Caveats, Resource, SignedCapability};
@@ -364,6 +364,34 @@ enum AppCommands {
         /// Arguments passed through to the app (after `--`).
         #[arg(last = true)]
         args: Vec<String>,
+    },
+    /// Manage long-running app daemons supervised by the single `ce` service.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
+}
+
+/// `ce app daemon ...` — the single supervisor that replaces per-app plists.
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Mark a daemon app to be kept running by the ce supervisor.
+    Enable { name: String },
+    /// Stop supervising a daemon app.
+    Disable { name: String },
+    /// List enabled daemons.
+    Ls,
+    /// Run the supervisor: start + keep enabled daemons running, register them to ce-hub.
+    Run {
+        /// ce-hub origin holding the global instance registry.
+        #[arg(long, default_value = "https://ce-net.com")]
+        hub: String,
+        /// Do a single reconcile pass (start missing daemons + register) and exit.
+        #[arg(long)]
+        once: bool,
+        /// Reconcile interval in seconds for the supervision loop.
+        #[arg(long, default_value = "5")]
+        interval: u64,
     },
 }
 
@@ -1926,8 +1954,212 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
             let plan = ce_appmgr::plan_run(&store, &rec, args)?;
             run_app(&name, &version, plan, data_dir).await?;
         }
+
+        AppCommands::Daemon { command } => match command {
+            DaemonCommands::Enable { name } => {
+                let Some(rec) = store.get(&name)? else {
+                    return Err(anyhow!("'{name}' is not installed. Run: ce app install {name}"));
+                };
+                if !rec.manifest.is_daemon() {
+                    return Err(anyhow!("'{name}' is a one-shot app (no [daemon]); use `ce app run`"));
+                }
+                store.set_daemon_enabled(&name, true)?;
+                println!("Enabled daemon '{name}'. Start it with: ce app daemon run");
+            }
+            DaemonCommands::Disable { name } => {
+                store.set_daemon_enabled(&name, false)?;
+                println!("Disabled daemon '{name}'.");
+            }
+            DaemonCommands::Ls => {
+                let daemons = ce_appmgr::enabled_daemons(&store)?;
+                if daemons.is_empty() {
+                    println!("No daemons enabled. Enable one: ce app daemon enable <name>");
+                    return Ok(());
+                }
+                for a in daemons {
+                    let policy = ce_appmgr::daemon_policy(&a.manifest);
+                    let restart = policy.map(|p| format!("{:?}", p.restart)).unwrap_or_default();
+                    println!(
+                        "{:<20} {:<10} {:?}  restart={restart}",
+                        a.manifest.app.name, a.manifest.app.version, a.manifest.app.runtime
+                    );
+                }
+            }
+            DaemonCommands::Run { hub, once, interval } => {
+                run_supervisor(&store, data_dir, &hub, once, interval).await?;
+            }
+        },
     }
     Ok(())
+}
+
+/// The single supervisor: keep every enabled daemon running and registered in
+/// ce-hub's global instance registry. Replaces per-app launchd/systemd plists.
+///
+/// Native daemons are spawned as host processes and restarted per their policy;
+/// oci daemons are launched (detached) via ce-container. ce-hub registration is
+/// best-effort — a missing hub logs a warning but never stops supervision.
+async fn run_supervisor(
+    store: &ce_appmgr::Store,
+    data_dir: &std::path::Path,
+    hub_url: &str,
+    once: bool,
+    interval: u64,
+) -> Result<()> {
+    use std::collections::HashMap;
+    let hub = ce_appmgr::HubInstances::new(hub_url);
+    let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
+    let node_hex = identity.node_id_hex();
+
+    // Native children we own, keyed by app name. (oci daemons are tracked by Docker.)
+    let mut children: HashMap<String, std::process::Child> = HashMap::new();
+
+    loop {
+        let daemons = ce_appmgr::enabled_daemons(store)?;
+        for app in &daemons {
+            let name = app.manifest.app.name.clone();
+            let version = app.manifest.app.version.to_string();
+            let policy = ce_appmgr::daemon_policy(&app.manifest);
+
+            // Phase 1: classify a tracked native child without holding the borrow
+            // across the `children.remove`/await below.
+            enum Reap {
+                Running,
+                Exited(i32),
+                WaitErr,
+                Untracked,
+            }
+            let reap = match children.get_mut(&name) {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(status)) => Reap::Exited(status.code().unwrap_or(1)),
+                    Ok(None) => Reap::Running,
+                    Err(e) => {
+                        eprintln!("daemon '{name}': wait failed: {e}");
+                        Reap::WaitErr
+                    }
+                },
+                None => Reap::Untracked,
+            };
+            let iid = ce_appmgr::InstanceRecord::make_id(&node_hex, &name, 0);
+            match reap {
+                Reap::Running => {
+                    let _ = hub
+                        .heartbeat(&iid, ce_appmgr::Health::Healthy, serde_json::json!({}))
+                        .await;
+                    continue;
+                }
+                Reap::WaitErr => continue,
+                Reap::Exited(code) => {
+                    children.remove(&name);
+                    let _ = hub
+                        .heartbeat(
+                            &iid,
+                            ce_appmgr::Health::Unhealthy,
+                            serde_json::json!({ "exit_code": code }),
+                        )
+                        .await;
+                    let restart = policy
+                        .as_ref()
+                        .map(|p| p.restart.should_restart(code))
+                        .unwrap_or(false);
+                    if !restart {
+                        println!("daemon '{name}' exited ({code}); not restarting");
+                        continue;
+                    }
+                    println!("daemon '{name}' exited ({code}); restarting");
+                }
+                Reap::Untracked => {}
+            }
+
+            // Not running — start it.
+            let plan = ce_appmgr::plan_run(store, app, Vec::new())?;
+            match plan {
+                ce_appmgr::RunPlan::Native { bin, args } => {
+                    if !bin.exists() {
+                        eprintln!("daemon '{name}': artifact missing at {}", bin.display());
+                        continue;
+                    }
+                    match std::process::Command::new(&bin).args(&args).spawn() {
+                        Ok(child) => {
+                            children.insert(name.clone(), child);
+                            register_instance(&hub, &node_hex, &name, &version, "native").await;
+                            println!("started daemon '{name}' (native)");
+                        }
+                        Err(e) => eprintln!("daemon '{name}': spawn failed: {e}"),
+                    }
+                }
+                ce_appmgr::RunPlan::Oci { image, cmd, env, cpu_cores, mem_mb, daemon: _, .. } => {
+                    let node_id = identity.node_id();
+                    match ce_container::ContainerManager::new(node_id).await {
+                        Ok(cm) => {
+                            let job_id: [u8; 32] =
+                                Sha256::digest(format!("{name}:{version}").as_bytes()).into();
+                            let spec = ce_container::JobSpec {
+                                job_id,
+                                image: image.clone(),
+                                cmd,
+                                env,
+                                cpu_cores,
+                                mem_mb,
+                                payer: node_id,
+                            };
+                            match cm.launch_job(&spec).await {
+                                Ok(cid) => {
+                                    register_instance(&hub, &node_hex, &name, &version, "oci").await;
+                                    println!("started daemon '{name}' (oci {image}, container {cid})");
+                                }
+                                Err(e) => eprintln!("daemon '{name}': launch failed: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("daemon '{name}': Docker unavailable: {e}"),
+                    }
+                }
+                other => {
+                    eprintln!("daemon '{name}': unsupported runtime for supervision: {other:?}");
+                }
+            }
+        }
+
+        if once {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+    }
+    Ok(())
+}
+
+/// Register a started instance with ce-hub's global registry (best-effort).
+async fn register_instance(
+    hub: &ce_appmgr::HubInstances,
+    node_hex: &str,
+    name: &str,
+    version: &str,
+    runtime: &str,
+) {
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let runtime = match runtime {
+        "oci" => ce_appmgr::Runtime::Oci,
+        "wasm" => ce_appmgr::Runtime::Wasm,
+        "recipe" => ce_appmgr::Runtime::Recipe,
+        _ => ce_appmgr::Runtime::Native,
+    };
+    let rec = ce_appmgr::InstanceRecord {
+        id: ce_appmgr::InstanceRecord::make_id(node_hex, name, 0),
+        app: name.to_string(),
+        version: version.to_string(),
+        node_id: node_hex.to_string(),
+        runtime,
+        placement: ce_appmgr::Placement::Local,
+        health: ce_appmgr::Health::Starting,
+        started_unix: started,
+        metrics: serde_json::Value::Null,
+    };
+    if let Err(e) = hub.register(&rec).await {
+        eprintln!("warning: ce-hub registration for '{name}' failed (continuing): {e}");
+    }
 }
 
 /// Execute a [`ce_appmgr::RunPlan`] in the appropriate runtime. Native spawns a host
@@ -1989,6 +2221,7 @@ async fn run_app(
                 eprint!("{err}");
                 std::process::exit(code as i32);
             }
+            Ok(())
         }
         RunPlan::Wasm { module, args: _ } => Err(anyhow!(
             "wasm execution is the optional tier and not yet wired (module {}); \
