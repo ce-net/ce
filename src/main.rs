@@ -2414,7 +2414,21 @@ fn resolve_ctl_caller(data_dir: &std::path::Path, token: &str) -> Option<ce_appm
 
 /// Serve the CtlAPI on a unix socket: one JSON `CtlEnvelope` per line in, one
 /// `CtlResponse` per line out. Every request is gated by the caller's token before
-/// any side effect.
+/// any side effect. Unix only — the transport is a unix domain socket.
+#[cfg(not(unix))]
+async fn ctl_serve(
+    _store: &ce_appmgr::Store,
+    _data_dir: &std::path::Path,
+    _sock: &str,
+    _registry: &str,
+    _hub: &str,
+) -> Result<()> {
+    Err(anyhow!(
+        "the app-facing CtlAPI uses a unix domain socket and is not available on this platform"
+    ))
+}
+
+#[cfg(unix)]
 async fn ctl_serve(
     store: &ce_appmgr::Store,
     data_dir: &std::path::Path,
