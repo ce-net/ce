@@ -767,6 +767,7 @@ dependencies = [
  "axum",
  "bincode",
  "bollard",
+ "ce-appmgr",
  "ce-cap",
  "ce-chain",
  "ce-container",

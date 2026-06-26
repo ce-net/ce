@@ -25,7 +25,7 @@ use libp2p::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
@@ -620,6 +620,14 @@ pub struct Mesh {
     /// Peers explicitly permitted when `disable_local_discovery` is true.
     /// Populated from bootstrap and relay addresses. Empty = allow all (production mode).
     allowed_peers: std::collections::HashSet<PeerId>,
+    /// RPCs addressed to a peer we are not yet connected to: peer → queued (request, reply, when).
+    /// Instead of failing instantly with `NoAddresses`, we queue, kick off DHT discovery + a dial,
+    /// and flush on `ConnectionEstablished`. Stale entries are timed out by the RPC sweep.
+    pending_rpc_by_peer:
+        HashMap<PeerId, Vec<(RpcRequest, oneshot::Sender<RpcResponse>, Instant)>>,
+    /// Set once we've kicked off the first Kademlia bootstrap (after the first connection gives us a
+    /// peer to query). The periodic DHT refresh keeps the routing table warm thereafter.
+    bootstrapped: bool,
 }
 
 impl Mesh {
@@ -680,7 +688,12 @@ impl Mesh {
                     gossipsub::MessageId::from(hash.to_vec())
                 };
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
-                    .heartbeat_interval(Duration::from_secs(1))
+                    // Fast initial mesh formation: the libp2p default heartbeat_initial_delay is 5s,
+                    // which delays the FIRST mesh maintenance (and thus all early gossip) by 5s. Start
+                    // almost immediately and beat a little faster so freshly-joined nodes propagate
+                    // blocks/txs/app records within a heartbeat or two instead of seconds.
+                    .heartbeat_initial_delay(Duration::from_millis(100))
+                    .heartbeat_interval(Duration::from_millis(700))
                     .validation_mode(gossipsub::ValidationMode::Strict)
                     .message_id_fn(message_id_fn)
                     .max_transmit_size(4 * 1024 * 1024)
@@ -760,6 +773,8 @@ impl Mesh {
             sync_nonce: 0,
             disable_local_discovery,
             allowed_peers: std::collections::HashSet::new(),
+            pending_rpc_by_peer: HashMap::new(),
+            bootstrapped: false,
         };
 
         let handle = MeshHandle { cmd_tx };
@@ -831,6 +846,16 @@ impl Mesh {
             segments: self.segments_topic.hash(),
         };
 
+        // Periodic maintenance so initial communication converges fast and stays warm:
+        //  - rpc_sweep: re-discover/dial peers with queued RPCs and time out unreachable ones.
+        //  - dht_refresh: actively bootstrap Kademlia so the routing table can resolve any peer
+        //    (the old loop only ever learned addresses passively, which is why a first directed
+        //    request to a not-yet-known peer used to fail until discovery happened to catch up).
+        let mut rpc_sweep = tokio::time::interval(Duration::from_secs(2));
+        rpc_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut dht_refresh = tokio::time::interval(Duration::from_secs(30));
+        dht_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 Some(cmd) = self.cmd_rx.recv() => {
@@ -840,9 +865,67 @@ impl Mesh {
                     let Some(event) = event else { break };
                     self.handle_event(event, &topics).await;
                 }
+                _ = rpc_sweep.tick() => {
+                    self.sweep_pending_rpc();
+                }
+                _ = dht_refresh.tick() => {
+                    let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+                }
             }
         }
         Ok(())
+    }
+
+    /// Begin resolving an unconnected peer: query the DHT for the peers closest to it (which adds its
+    /// address to our routing table) and attempt a direct dial (succeeds immediately if any behaviour
+    /// already knows an address). Cheap and idempotent.
+    fn discover_peer(&mut self, peer_id: PeerId) {
+        self.swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
+        let _ = self.swarm.dial(peer_id);
+    }
+
+    /// Send every RPC queued for `peer_id` now that a connection exists.
+    fn flush_pending_rpc(&mut self, peer_id: &PeerId) {
+        if let Some(queue) = self.pending_rpc_by_peer.remove(peer_id) {
+            for (request, reply_tx, _queued) in queue {
+                let req_id = self.swarm.behaviour_mut().rpc.send_request(peer_id, request);
+                self.pending_outbound.insert(req_id, reply_tx);
+            }
+        }
+    }
+
+    /// Re-attempt discovery for peers that still have queued RPCs, and time out requests whose peer
+    /// never became reachable (so a caller waiting on `send_rpc` gets a clean error, not a hang).
+    fn sweep_pending_rpc(&mut self) {
+        if self.pending_rpc_by_peer.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let peers: Vec<PeerId> = self.pending_rpc_by_peer.keys().copied().collect();
+        for peer in peers {
+            if let Some(queue) = self.pending_rpc_by_peer.get_mut(&peer) {
+                let mut i = 0;
+                while i < queue.len() {
+                    if now.duration_since(queue[i].2) > Duration::from_secs(20) {
+                        let (_, reply_tx, _) = queue.swap_remove(i);
+                        let _ = reply_tx.send(RpcResponse::Error(
+                            "rpc: peer unreachable (timed out during discovery)".into(),
+                        ));
+                    } else {
+                        i += 1;
+                    }
+                }
+                if queue.is_empty() {
+                    self.pending_rpc_by_peer.remove(&peer);
+                    continue;
+                }
+            }
+            if self.swarm.is_connected(&peer) {
+                self.flush_pending_rpc(&peer);
+            } else {
+                self.discover_peer(peer);
+            }
+        }
     }
 
     async fn handle_event(&mut self, event: SwarmEvent<CeBehaviourEvent>, topics: &Topics) {
@@ -894,6 +977,32 @@ impl Mesh {
                 kad::Event::OutboundQueryProgressed { id, result, step, .. }
             )) => {
                 self.handle_kad_query(id, result, step.last);
+            }
+
+            // We just learned (or refreshed) a peer's address. If RPCs are queued for it and we're
+            // not connected yet, dial now — the resulting connection flushes the queue.
+            SwarmEvent::Behaviour(CeBehaviourEvent::Kademlia(
+                kad::Event::RoutingUpdated { peer, .. }
+            )) => {
+                if self.pending_rpc_by_peer.contains_key(&peer) && !self.swarm.is_connected(&peer) {
+                    let _ = self.swarm.dial(peer);
+                }
+            }
+
+            // A connection came up: bootstrap the DHT the first time (now we have a peer to query),
+            // flush any RPCs queued for this peer, and notify the node.
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                // First successful bootstrap warms the routing table. Only latch `bootstrapped` once
+                // it actually starts — an incoming first connection may arrive before the peer is in
+                // the table (identify pending), which would otherwise skip bootstrap until the 30s
+                // periodic refresh.
+                if !self.bootstrapped
+                    && self.swarm.behaviour_mut().kademlia.bootstrap().is_ok()
+                {
+                    self.bootstrapped = true;
+                }
+                self.flush_pending_rpc(&peer_id);
+                let _ = self.event_tx.send(MeshEvent::PeerConnected(peer_id)).await;
             }
 
             // Everything else: decode and forward to the node.
@@ -1012,9 +1121,24 @@ impl Mesh {
                 }
             }
             MeshCommand::SendRpc { peer_id, request, reply_tx } => {
-                let req_id = self.swarm.behaviour_mut().rpc
-                    .send_request(&peer_id, request);
-                self.pending_outbound.insert(req_id, reply_tx);
+                if self.swarm.is_connected(&peer_id) {
+                    let req_id = self.swarm.behaviour_mut().rpc
+                        .send_request(&peer_id, request);
+                    self.pending_outbound.insert(req_id, reply_tx);
+                } else {
+                    // No connection yet. Queue the request and kick off discovery; it flushes on
+                    // ConnectionEstablished. The old code sent blindly here, which failed instantly
+                    // with NoAddresses whenever the peer's address wasn't already known.
+                    let kickoff = {
+                        let queue = self.pending_rpc_by_peer.entry(peer_id).or_default();
+                        let first = queue.is_empty();
+                        queue.push((request, reply_tx, Instant::now()));
+                        first
+                    };
+                    if kickoff {
+                        self.discover_peer(peer_id);
+                    }
+                }
             }
             MeshCommand::RespondRpc { correlation_id, response } => {
                 if let Some(channel) = self.pending_inbound.remove(&correlation_id) {
