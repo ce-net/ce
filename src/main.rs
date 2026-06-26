@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
@@ -1921,31 +1922,84 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
             let Some(rec) = store.get(&name)? else {
                 return Err(anyhow!("'{name}' is not installed. Run: ce app install {name}"));
             };
-            let m = &rec.manifest;
-            // Runtime execution (oci via ce-container, wasm via ce-wasm, native spawn)
-            // is the next milestone. For now, report exactly what would run so the
-            // shim/scope plumbing is verifiable end to end.
-            println!("would run '{}' [{:?}] in sandbox {:?} (net={})",
-                m.app.name, m.app.runtime, m.sandbox.tier, m.sandbox.net);
-            match m.app.runtime {
-                ce_appmgr::Runtime::Oci => {
-                    if let Some(o) = &m.oci {
-                        println!("  image: {}", o.image);
-                    }
-                }
-                ce_appmgr::Runtime::Native => {
-                    let bin = m.native.as_ref().map(|n| n.bin.as_str()).unwrap_or(&m.app.name);
-                    println!("  bin  : {bin} (target {})", rec.target);
-                }
-                _ => {}
-            }
-            if !args.is_empty() {
-                println!("  args : {}", args.join(" "));
-            }
-            println!("(runtime execution lands in the next milestone — see PLAN/ce-app-package-runtime.md)");
+            let version = rec.manifest.app.version.to_string();
+            let plan = ce_appmgr::plan_run(&store, &rec, args)?;
+            run_app(&name, &version, plan, data_dir).await?;
         }
     }
     Ok(())
+}
+
+/// Execute a [`ce_appmgr::RunPlan`] in the appropriate runtime. Native spawns a host
+/// process; oci runs in a sandboxed (gVisor when available) container via
+/// `ce-container`; wasm/recipe are deferred. Propagates the child's exit code.
+async fn run_app(
+    name: &str,
+    version: &str,
+    plan: ce_appmgr::RunPlan,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    use ce_appmgr::RunPlan;
+    match plan {
+        RunPlan::Native { bin, args } => {
+            if !bin.exists() {
+                return Err(anyhow!(
+                    "artifact for '{name}' is missing at {} — reinstall: ce app install {name}",
+                    bin.display()
+                ));
+            }
+            // Spawn the materialized binary, inheriting stdio, and propagate its exit.
+            let status = std::process::Command::new(&bin)
+                .args(&args)
+                .status()
+                .with_context(|| format!("spawning {}", bin.display()))?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        RunPlan::Oci { image, cmd, env, cpu_cores, mem_mb, gvisor: _, daemon, net: _ } => {
+            // ce-container detects and prefers gVisor itself; net/fs profile
+            // enforcement is layered on with the sandbox-hardening milestone.
+            let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
+            let node_id = identity.node_id();
+            let cm = ce_container::ContainerManager::new(node_id)
+                .await
+                .context("Docker is not available — oci apps need a running Docker (gVisor recommended)")?;
+            if daemon {
+                // Long-running system: launch detached. job_id is derived from the
+                // app coordinates so a re-run targets the same logical instance.
+                let job_id: [u8; 32] =
+                    Sha256::digest(format!("{name}:{version}").as_bytes()).into();
+                let spec = ce_container::JobSpec {
+                    job_id,
+                    image: image.clone(),
+                    cmd,
+                    env,
+                    cpu_cores,
+                    mem_mb,
+                    payer: node_id,
+                };
+                let cid = cm.launch_job(&spec).await?;
+                println!("started {name} {version} (oci {image}, container {cid})");
+            } else {
+                // One-shot CLI: run, stream output, propagate exit.
+                let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+                let spec = ce_container::ExecSpec { image, cmd, cwd: None };
+                let (out, err, code) =
+                    ce_container::exec_in_container(&cm.docker, &spec, &home).await?;
+                print!("{out}");
+                eprint!("{err}");
+                std::process::exit(code as i32);
+            }
+        }
+        RunPlan::Wasm { module, args: _ } => Err(anyhow!(
+            "wasm execution is the optional tier and not yet wired (module {}); \
+             use the oci or native tier for now",
+            module.display()
+        )),
+        RunPlan::Recipe { source } => Err(anyhow!(
+            "recipe apps build on the relay and promote to a native artifact — \
+             run path pending (source {source})"
+        )),
+    }
 }
 
 #[cfg(test)]

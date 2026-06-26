@@ -31,6 +31,7 @@ ce-identity = { path = "crates/ce-identity" }
 ce-cap = { path = "crates/ce-cap" }
 ce-chain = { path = "crates/ce-chain" }
 ce-appmgr = { path = "crates/ce-appmgr" }
+ce-container = { path = "crates/ce-container" }
 futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

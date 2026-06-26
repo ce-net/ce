@@ -612,6 +612,7 @@ dependencies = [
  "ce-appmgr",
  "ce-cap",
  "ce-chain",
+ "ce-container",
  "ce-identity",
  "ce-node",
  "chacha20poly1305",
