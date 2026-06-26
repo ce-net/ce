@@ -3,7 +3,7 @@ name = "ce-cap"
 version = "0.1.0"
 edition = "2024"
 description = "CE capability primitive — verify signed, attenuating capability chains. Shared by the node and apps."
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [dependencies]
 ce-identity = { path = "../ce-identity" }

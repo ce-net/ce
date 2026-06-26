@@ -3,7 +3,7 @@ name = "ce-guard"
 version = "0.1.0"
 edition = "2024"
 description = "Content-free pre-execution screening seam: the Guardian trait, verdict, and request types. No AI, no policy, no category vocabulary — the brain lives in the ce-guardian app."
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [dependencies]
 anyhow = "1"
