@@ -115,6 +115,46 @@ impl std::fmt::Display for DenyReason {
     }
 }
 
+/// The wire envelope an app sends to its agent over the CtlAPI socket. The token
+/// authenticates the caller (the agent maps it to a [`CallerContext`]); `request`
+/// selects the operation. One JSON object per line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CtlEnvelope {
+    /// Per-instance token (from `CE_INSTANCE_TOKEN`).
+    pub token: String,
+    pub request: CtlRequest,
+}
+
+/// An app-to-agent request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum CtlRequest {
+    EnsureDep(EnsureDepRequest),
+    Install(InstallRequest),
+    Instances(InstancesQuery),
+}
+
+/// The agent's reply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CtlResponse {
+    /// Success; `result` carries the operation's JSON payload (e.g. a [`DepHandle`]).
+    Ok { result: serde_json::Value },
+    /// Refused by a security gate, with the precise reason.
+    Denied { reason: DenyReason },
+    /// Operation error (resolution/runtime failure).
+    Error { message: String },
+}
+
+impl CtlResponse {
+    pub fn ok<T: Serialize>(value: &T) -> CtlResponse {
+        match serde_json::to_value(value) {
+            Ok(v) => CtlResponse::Ok { result: v },
+            Err(e) => CtlResponse::Error { message: format!("serialize: {e}") },
+        }
+    }
+}
+
 /// The behavior the per-node agent implements to serve managed apps. The transport
 /// (unix socket / mesh) decodes a request, resolves a [`CallerContext`] from the
 /// instance token, runs the security gates, then calls the matching method here.

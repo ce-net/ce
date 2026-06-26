@@ -32,7 +32,10 @@ pub mod run;
 pub mod store;
 pub mod supervisor;
 
-pub use ctlapi::{CallerContext, ControlPlane, DepHandle, EnsureDepRequest, InstallRequest};
+pub use ctlapi::{
+    CallerContext, ControlPlane, CtlEnvelope, CtlRequest, CtlResponse, DenyReason, DepHandle,
+    EnsureDepRequest, InstallRequest, InstancesQuery, precheck_declared,
+};
 pub use instances::{Health, HubInstances, InstanceFilter, InstanceRecord};
 pub use manifest::{AppManifest, Runtime, SandboxTier};
 pub use materialize::{BlobClient, Materialized, materialize};

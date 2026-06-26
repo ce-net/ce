@@ -378,6 +378,36 @@ enum AppCommands {
         #[arg(long)]
         on: String,
     },
+    /// The app-facing control API: apps ensure their own deps + install securely.
+    Ctl {
+        #[command(subcommand)]
+        command: CtlCommands,
+    },
+}
+
+/// `ce app ctl ...` — the per-instance, capability-scoped app-facing control API.
+#[derive(Subcommand)]
+enum CtlCommands {
+    /// Mint a per-instance token whose authority is derived from an installed app's
+    /// manifest `[deps]` (declared deps + capabilities). Hand it to the app as
+    /// `CE_INSTANCE_TOKEN`.
+    Token {
+        /// The installed app the token authorizes.
+        app: String,
+    },
+    /// Serve the CtlAPI on a unix socket. Apps connected to it can ensure declared
+    /// dependencies and install — each request gated by the caller's token.
+    Serve {
+        /// Unix socket path to bind (injected into sandboxes as CE_CTL_SOCK).
+        #[arg(long, default_value = "/tmp/ce-ctl.sock")]
+        sock: String,
+        /// ce-hub registry origin used to resolve dependencies.
+        #[arg(long, default_value = "https://ce-net.com")]
+        registry: String,
+        /// ce-hub origin for the instance registry.
+        #[arg(long, default_value = "https://ce-net.com")]
+        hub: String,
+    },
 }
 
 /// `ce app daemon ...` — the single supervisor that replaces per-app plists.
@@ -2026,8 +2056,323 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
             }
             println!("killed job {job_id} on node={node_id_hex}");
         }
+
+        AppCommands::Ctl { command } => match command {
+            CtlCommands::Token { app } => {
+                let Some(rec) = store.get(&app)? else {
+                    return Err(anyhow!("'{app}' is not installed. Run: ce app install {app}"));
+                };
+                let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
+                let token = mint_ctl_token(&identity, &app);
+                let caller = caller_context_for(&rec.manifest, &app);
+                write_ctl_token(data_dir, &token, &caller)?;
+                println!("CE_INSTANCE_TOKEN={token}");
+                println!("authorizes app '{app}': deps={:?} caps={:?}", caller.declared_deps, caller.capabilities);
+            }
+            CtlCommands::Serve { sock, registry, hub } => {
+                ctl_serve(&store, data_dir, &sock, &registry, &hub).await?;
+            }
+        },
     }
     Ok(())
+}
+
+// ===== app-facing CtlAPI (M6): transport + security gates =====
+
+/// Derive a [`ce_appmgr::CallerContext`] from an app's manifest: declared deps are
+/// the app dependencies + required services; capabilities are the manifest's.
+fn caller_context_for(m: &ce_appmgr::AppManifest, app: &str) -> ce_appmgr::CallerContext {
+    let mut declared: Vec<String> = m
+        .deps
+        .apps
+        .iter()
+        .filter_map(|d| ce_appmgr::DepSpec::parse(d).ok().map(|s| s.name))
+        .collect();
+    declared.extend(m.deps.services.iter().cloned());
+    ce_appmgr::CallerContext {
+        instance_id: ce_appmgr::InstanceRecord::make_id("local", app, 0),
+        app: app.to_string(),
+        capabilities: m.deps.capabilities.clone(),
+        declared_deps: declared,
+    }
+}
+
+/// An unguessable per-instance token bound to the node's secret key, so tokens
+/// can't be forged by another process.
+fn mint_ctl_token(identity: &Identity, app: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(identity.secret_bytes());
+    h.update(app.as_bytes());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    h.update(nanos.to_le_bytes());
+    hex::encode(h.finalize())
+}
+
+fn ctl_tokens_dir(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("ctl").join("tokens")
+}
+
+/// Persist token -> CallerContext so `ctl serve` can authenticate the caller.
+fn write_ctl_token(
+    data_dir: &std::path::Path,
+    token: &str,
+    caller: &ce_appmgr::CallerContext,
+) -> Result<()> {
+    let dir = ctl_tokens_dir(data_dir);
+    std::fs::create_dir_all(&dir)?;
+    let body = serde_json::json!({
+        "app": caller.app,
+        "instance_id": caller.instance_id,
+        "capabilities": caller.capabilities,
+        "declared_deps": caller.declared_deps,
+    });
+    std::fs::write(dir.join(format!("{token}.json")), serde_json::to_vec_pretty(&body)?)?;
+    Ok(())
+}
+
+/// Resolve a token to its [`ce_appmgr::CallerContext`], or `None` if unknown.
+fn resolve_ctl_caller(data_dir: &std::path::Path, token: &str) -> Option<ce_appmgr::CallerContext> {
+    // Reject path tricks in the token before using it as a filename.
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let p = ctl_tokens_dir(data_dir).join(format!("{token}.json"));
+    let s = std::fs::read_to_string(p).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    Some(ce_appmgr::CallerContext {
+        instance_id: v["instance_id"].as_str().unwrap_or_default().to_string(),
+        app: v["app"].as_str().unwrap_or_default().to_string(),
+        capabilities: v["capabilities"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+        declared_deps: v["declared_deps"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+    })
+}
+
+/// Serve the CtlAPI on a unix socket: one JSON `CtlEnvelope` per line in, one
+/// `CtlResponse` per line out. Every request is gated by the caller's token before
+/// any side effect.
+async fn ctl_serve(
+    store: &ce_appmgr::Store,
+    data_dir: &std::path::Path,
+    sock: &str,
+    registry: &str,
+    hub: &str,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let _ = std::fs::remove_file(sock); // clear a stale socket
+    let listener = tokio::net::UnixListener::bind(sock)
+        .with_context(|| format!("binding CtlAPI socket {sock}"))?;
+    println!("CtlAPI listening on {sock} (CE_CTL_SOCK)");
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = BufReader::new(read_half).lines();
+        let store = store.clone();
+        let data_dir = data_dir.to_path_buf();
+        let registry = registry.to_string();
+        let hub = hub.to_string();
+        // Handle each connection inline (low concurrency expected per instance).
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let resp = handle_ctl_line(&store, &data_dir, &registry, &hub, &line).await;
+            let mut out = serde_json::to_string(&resp).unwrap_or_else(|e| {
+                serde_json::to_string(&ce_appmgr::CtlResponse::Error { message: e.to_string() })
+                    .unwrap_or_default()
+            });
+            out.push('\n');
+            if write_half.write_all(out.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// Decode one envelope, authenticate, run the security gates, then dispatch. Pure
+/// enough to unit-test the gate decisions via the returned `CtlResponse`.
+async fn handle_ctl_line(
+    store: &ce_appmgr::Store,
+    data_dir: &std::path::Path,
+    registry: &str,
+    hub: &str,
+    line: &str,
+) -> ce_appmgr::CtlResponse {
+    use ce_appmgr::{ControlPlane, CtlRequest, CtlResponse, DenyReason};
+    let env: ce_appmgr::CtlEnvelope = match serde_json::from_str(line) {
+        Ok(e) => e,
+        Err(e) => return CtlResponse::Error { message: format!("bad request: {e}") },
+    };
+    let Some(caller) = resolve_ctl_caller(data_dir, &env.token) else {
+        return CtlResponse::Error { message: "invalid or unknown instance token".into() };
+    };
+    let agent = AgentControlPlane {
+        store: store.clone(),
+        data_dir: data_dir.to_path_buf(),
+        registry: registry.to_string(),
+        hub: hub.to_string(),
+    };
+    match env.request {
+        CtlRequest::EnsureDep(req) => {
+            // Gate 1: the dep must be declared in the manifest. Gate 2: a capability
+            // permitting it (ce-cap). ce-gov policy is an additional hook (TODO wire).
+            if let Err(reason) = ce_appmgr::precheck_declared(&caller, &req.name) {
+                return CtlResponse::Denied { reason };
+            }
+            if !caller_may_provision(&caller) {
+                return CtlResponse::Denied { reason: DenyReason::CapabilityDenied };
+            }
+            match agent.ensure_dep(&caller, req).await {
+                Ok(handle) => CtlResponse::ok(&handle),
+                Err(e) => CtlResponse::Error { message: e.to_string() },
+            }
+        }
+        CtlRequest::Install(req) => {
+            if let Err(reason) = ce_appmgr::precheck_declared(&caller, &req.name) {
+                return CtlResponse::Denied { reason };
+            }
+            if !caller_may_provision(&caller) {
+                return CtlResponse::Denied { reason: DenyReason::CapabilityDenied };
+            }
+            match agent.install(&caller, req).await {
+                Ok(()) => CtlResponse::ok(&serde_json::json!({ "installed": true })),
+                Err(e) => CtlResponse::Error { message: e.to_string() },
+            }
+        }
+        CtlRequest::Instances(q) => match agent.instances(&caller, q).await {
+            Ok(list) => CtlResponse::ok(&list),
+            Err(e) => CtlResponse::Error { message: e.to_string() },
+        },
+    }
+}
+
+/// Capability gate for provisioning ops: the instance must hold an ability that
+/// lets it install/spawn. (ce-cap chain verification is layered on when instances
+/// carry a real attenuated capability; here we check the declared abilities.)
+fn caller_may_provision(caller: &ce_appmgr::CallerContext) -> bool {
+    caller
+        .capabilities
+        .iter()
+        .any(|c| matches!(c.as_str(), "install" | "exec" | "deploy" | "sync"))
+}
+
+/// The agent's [`ce_appmgr::ControlPlane`] implementation: resolves, installs, and
+/// runs declared dependencies on behalf of a managed app, and answers instance
+/// queries from ce-hub. The security gates run in [`handle_ctl_line`] before these.
+struct AgentControlPlane {
+    store: ce_appmgr::Store,
+    data_dir: PathBuf,
+    registry: String,
+    hub: String,
+}
+
+impl ce_appmgr::ControlPlane for AgentControlPlane {
+    async fn ensure_dep(
+        &self,
+        _caller: &ce_appmgr::CallerContext,
+        req: ce_appmgr::EnsureDepRequest,
+    ) -> Result<ce_appmgr::DepHandle> {
+        let identity = Identity::load_or_generate(&self.data_dir.join("identity"))?;
+        let node_hex = identity.node_id_hex();
+        let instance_id = ce_appmgr::InstanceRecord::make_id(&node_hex, &req.name, 0);
+
+        // Already installed? Treat as satisfied (idempotent ensure).
+        if let Some(rec) = self.store.get(&req.name)? {
+            return Ok(ce_appmgr::DepHandle {
+                name: req.name.clone(),
+                instance_id,
+                endpoint: dep_endpoint(&rec.manifest),
+                created: false,
+            });
+        }
+
+        // Resolve + materialize + record locally (declared, so authorized).
+        let reg = ce_appmgr::HubRegistry::new(&self.registry);
+        let plan = ce_appmgr::resolve(&reg, &req.name).await?;
+        self.store.ensure()?;
+        let blobs = ce_appmgr::BlobClient::new(&self.registry);
+        let target = ce_appmgr::host_target();
+        let mut manifest = None;
+        for item in &plan.items {
+            let m = &item.manifest;
+            if self.store.is_installed(&m.app.name) {
+                if m.app.name == req.name {
+                    manifest = Some(m.clone());
+                }
+                continue;
+            }
+            let materialized = ce_appmgr::materialize(&self.store, &blobs, m, &target).await?;
+            let rec = ce_appmgr::InstalledApp {
+                manifest: m.clone(),
+                target: target.clone(),
+                digest: materialized.digest().map(str::to_string),
+            };
+            self.store.record(&rec)?;
+            if m.app.name == req.name {
+                manifest = Some(m.clone());
+            }
+        }
+        let manifest = manifest
+            .ok_or_else(|| anyhow!("resolved plan did not contain '{}'", req.name))?;
+        let endpoint = dep_endpoint(&manifest);
+        Ok(ce_appmgr::DepHandle { name: req.name, instance_id, endpoint, created: true })
+    }
+
+    async fn install(
+        &self,
+        _caller: &ce_appmgr::CallerContext,
+        req: ce_appmgr::InstallRequest,
+    ) -> Result<()> {
+        let reg = ce_appmgr::HubRegistry::new(&self.registry);
+        let plan = ce_appmgr::resolve(&reg, &req.name).await?;
+        self.store.ensure()?;
+        let blobs = ce_appmgr::BlobClient::new(&self.registry);
+        let target = ce_appmgr::host_target();
+        for item in &plan.items {
+            let m = &item.manifest;
+            if self.store.is_installed(&m.app.name) {
+                continue;
+            }
+            let materialized = ce_appmgr::materialize(&self.store, &blobs, m, &target).await?;
+            let rec = ce_appmgr::InstalledApp {
+                manifest: m.clone(),
+                target: target.clone(),
+                digest: materialized.digest().map(str::to_string),
+            };
+            self.store.record(&rec)?;
+        }
+        Ok(())
+    }
+
+    async fn instances(
+        &self,
+        _caller: &ce_appmgr::CallerContext,
+        query: ce_appmgr::InstancesQuery,
+    ) -> Result<Vec<ce_appmgr::InstanceRecord>> {
+        let hub = ce_appmgr::HubInstances::new(&self.hub);
+        let filter = ce_appmgr::InstanceFilter { app: query.app, ..Default::default() };
+        hub.list(&filter).await
+    }
+}
+
+/// A best-effort connection endpoint for a dependency: the first oci port on
+/// loopback, else a marker the app can resolve via its own discovery.
+fn dep_endpoint(m: &ce_appmgr::AppManifest) -> String {
+    if let Some(o) = &m.oci {
+        if let Some(port) = o.ports.first() {
+            return format!("127.0.0.1:{}", port.split('/').next().unwrap_or(port));
+        }
+    }
+    format!("ce-app://{}", m.app.name)
 }
 
 /// The oci image for a manifest, or a clear error for tiers that can't yet be
