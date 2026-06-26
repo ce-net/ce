@@ -8,6 +8,11 @@
 //! This is the only seam the rest of CE needs: placement (capability tags), the economy
 //! (heartbeats/channels bill a job, not how it ran), and consensus are all payload-agnostic.
 //! See `docs/runtime.md`.
+//!
+//! **Toward the global supercomputer** (`VISION.md`): a payload-agnostic runtime seam is what
+//! lets one fabric run containers, WASM, and future backends (GPU kernels, LLM inference shards)
+//! side by side — so every kind of work, from a game server to a model shard to a research batch,
+//! shares the same pool and the same economy.
 
 use anyhow::Result;
 use async_trait::async_trait;

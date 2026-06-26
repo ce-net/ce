@@ -12,6 +12,11 @@
 //! The handshake signatures are still verified by the underlying crypto provider (ring); the
 //! custom verifier *additionally* pins the leaf certificate's identity. The mesh (`/ce/rpc/1`)
 //! is separately encrypted by libp2p Noise; this covers the direct HTTP API.
+//!
+//! **Toward the global supercomputer** (`VISION.md`): secure connections with no certificate
+//! authority mean any two devices on Earth can talk privately and authentically with no central
+//! PKI to trust or pay. That absence of a mandatory middleman is a precondition for a network
+//! owned by its participants rather than an operator.
 
 use anyhow::{anyhow, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};

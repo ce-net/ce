@@ -32,6 +32,12 @@
 //! exhausts its fuel (or its wall-clock deadline) returns a catchable `Err`, never aborts the host
 //! process. See [`engine_config`] for the Windows-specific reason signals-based trap delivery is
 //! disabled.
+//!
+//! **Toward the global supercomputer** (`VISION.md`): a sandboxed, deterministic, content-addressed
+//! runtime lets even a phone or a browser safely host a stranger's compute — pulling the vast long
+//! tail of idle consumer hardware into the pool. Determinism makes results verifiable, so the
+//! economy can trust work done on machines it has never met. This is how "everyone's device" becomes
+//! "everyone's supercomputer."
 
 pub mod host_abi;
 

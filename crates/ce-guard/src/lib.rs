@@ -9,6 +9,10 @@
 //! The node holds an `Arc<dyn Guardian>` and calls [`Guardian::screen`] at the one chokepoint every
 //! execution path passes through (after capability authorization, before any container or module is
 //! created). A [`GuardVerdict::Deny`] refuses the launch.
+//!
+//! **Toward the global supercomputer** (`VISION.md`): ordinary people will only open their
+//! devices to the pool if hosts can refuse abusive work. This fail-closed screening chokepoint is
+//! the safety valve that makes donating compute to strangers viable at scale.
 
 use async_trait::async_trait;
 use ce_identity::NodeId;

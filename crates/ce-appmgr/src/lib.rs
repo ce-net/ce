@@ -19,6 +19,12 @@
 //! gates are wired in the `ce` binary on top of these primitives.
 //!
 //! Design: `PLAN/ce-app-package-runtime.md`.
+//!
+//! **Toward the global supercomputer** (`VISION.md`): for one open fabric to host *everything* —
+//! apps, games, LLMs, research tools, even whole legacy systems — something has to install and
+//! supervise any of them, on any host, under one capability-sandboxed roof. This is that layer.
+//! It is how a stranger's machine can safely run your app, and how the long tail of existing
+//! software gets onto the pool without bespoke per-app plumbing.
 
 pub mod ctlapi;
 pub mod instances;
