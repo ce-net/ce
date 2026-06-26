@@ -1720,6 +1720,7 @@ async fn handle_incoming_rpc(
     let (action, chain_bytes): (&str, Option<Vec<u8>>) = match &request {
         RpcRequest::Deploy { grant, .. } => ("deploy", grant.clone()),
         RpcRequest::Kill { grant, .. } => ("kill", grant.clone()),
+        RpcRequest::AppInstall { grant, .. } => ("app:install", grant.clone()),
         _ => unreachable!("non-action RPCs are handled in the event loop"),
     };
     let caps = match chain_bytes.as_deref().map(capability::decode_chain_bytes) {
@@ -1898,7 +1899,54 @@ async fn handle_incoming_rpc(
                 let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
             });
         }
+        RpcRequest::AppInstall { app, registry, .. } => {
+            // Capability already verified above (action `app:install`). Run the SAME local appmgr
+            // install flow the `ce app install` CLI runs: resolve the manifest, materialize +
+            // sha256-verify artifacts, record, and enable the daemon. The single supervisor
+            // (`ce app daemon run`) then keeps it running. This is the native counterpart to Deploy.
+            let data_dir = data_dir.to_path_buf();
+            tokio::spawn(async move {
+                let resp = match install_app_locally(&app, &registry, &data_dir).await {
+                    Ok(version) => RpcResponse::AppInstalled { app, version },
+                    Err(e) => RpcResponse::Error(format!("app install failed: {e}")),
+                };
+                let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
+            });
+        }
     }
+}
+
+/// Run the local appmgr install flow on behalf of an authorized remote controller: resolve the app
+/// from `registry`, materialize + sha256-verify every artifact in its dependency plan into the node's
+/// data dir, record it, and enable any declared daemon (the supervisor starts it). Returns the root
+/// app's installed version. Authorization is the caller's responsibility (the `app:install`
+/// capability is checked before this is invoked).
+async fn install_app_locally(app: &str, registry: &str, data_dir: &Path) -> anyhow::Result<String> {
+    let reg = ce_appmgr::HubRegistry::new(registry);
+    let plan = ce_appmgr::resolve(&reg, app).await?;
+    let store = ce_appmgr::Store::new(data_dir);
+    store.ensure()?;
+    let blobs = ce_appmgr::BlobClient::new(registry);
+    let target = ce_appmgr::host_target();
+    let mut version = String::new();
+    for item in &plan.items {
+        let m = &item.manifest;
+        version = m.app.version.to_string();
+        if store.is_installed(&m.app.name) {
+            continue;
+        }
+        let materialized = ce_appmgr::materialize(&store, &blobs, m, &target).await?;
+        let rec = ce_appmgr::InstalledApp {
+            manifest: m.clone(),
+            target: target.clone(),
+            digest: materialized.digest().map(str::to_string),
+        };
+        store.record(&rec)?;
+        if m.is_daemon() {
+            store.set_daemon_enabled(&m.app.name, true)?;
+        }
+    }
+    Ok(version)
 }
 
 // ----- Job manager loop -----

@@ -46,7 +46,7 @@ pub use instances::{Health, HubInstances, InstanceFilter, InstanceRecord};
 pub use manifest::{AppManifest, Runtime, SandboxTier};
 pub use materialize::{BlobClient, Materialized, materialize};
 pub use run::{RunPlan, plan_run};
-pub use supervisor::{DaemonPolicy, RestartPolicy, daemon_policy, enabled_daemons};
+pub use supervisor::{DaemonPolicy, RestartPolicy, daemon_args, daemon_policy, enabled_daemons};
 pub use placement::Placement;
 pub use platform::host_target;
 pub use registry::{HubRegistry, SignatureSidecar};

@@ -905,6 +905,59 @@ async fn mesh_deploy(State(state): State<ApiState>, Json(req): Json<MeshDeployRe
     }
 }
 
+// ----- POST /mesh-app-install -----
+
+/// Install a published ceapp on a specific remote host over the mesh (the native counterpart to
+/// /mesh-deploy). The local node packages an `AppInstall` RPC with the caller's capability and sends
+/// it to the target, which runs its local appmgr install flow.
+#[derive(Debug, Deserialize)]
+struct MeshAppInstallRequest {
+    node_id: String,
+    #[serde(default)]
+    hint_multiaddr: String,
+    /// Published app name (ceapp slug) to resolve on the target from `registry`.
+    app: String,
+    /// Registry/blob origin the target resolves the manifest and artifacts from.
+    registry: String,
+    #[serde(default)]
+    grant: Option<String>,
+}
+
+async fn mesh_app_install(
+    State(state): State<ApiState>,
+    Json(req): Json<MeshAppInstallRequest>,
+) -> Response {
+    let node_id: NodeId = match hex::decode(&req.node_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "`node_id` must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&node_id) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
+    };
+    let grant = match caps_to_bytes(&req.grant) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    if !req.hint_multiaddr.is_empty() {
+        let _ = state.mesh_handle.dial(req.hint_multiaddr).await;
+    }
+    let rpc_req = RpcRequest::AppInstall {
+        from_node: state.host_node_id,
+        app: req.app,
+        registry: req.registry,
+        grant,
+    };
+    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
+        Ok(RpcResponse::AppInstalled { app, version }) => {
+            (StatusCode::OK, Json(serde_json::json!({ "app": app, "version": version }))).into_response()
+        }
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
+        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
+    }
+}
+
 // ----- POST /mesh-kill -----
 
 #[derive(Debug, Deserialize)]
@@ -2245,6 +2298,7 @@ pub async fn start(
         // Personal mesh OS: direct HTTP auth for LAN use (legacy, kept for compatibility).
         // Personal mesh OS: relay-routed mesh RPCs (correct path for NAT traversal).
         .route("/mesh-deploy", post(mesh_deploy))
+        .route("/mesh-app-install", post(mesh_app_install))
         .route("/mesh-kill", post(mesh_kill))
         .route("/tunnel", post(open_tunnel))
         .with_state(state);

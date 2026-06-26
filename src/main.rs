@@ -1916,16 +1916,52 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
             // is trusted (or trust-on-first-use) before any install side effect.
             verify_publisher(&registry, &name, data_dir, tofu, allow_unsigned).await?;
             if !placement.is_local() {
-                // Global install: resolve the app, then ship its image to the target
-                // node over the mesh-deploy primitive (capability-authed). The remote
-                // node runs it sandboxed as a job; we register the instance to ce-hub.
+                // Global install over the mesh. Resolve once to learn the runtime, then place:
+                //  - oci apps ship as a sandboxed job via /mesh-deploy;
+                //  - native/wasm apps install + supervise on the host via /mesh-app-install
+                //    (the capability-authed remote appmgr agent — the `app:install` ability).
+                // `fleet=mine` fans out to this host plus every paired device in the wallet, so a
+                // single command installs across all your devices.
                 let reg = ce_appmgr::HubRegistry::new(&registry);
                 let plan = ce_appmgr::resolve(&reg, &name).await?;
                 let root = plan.items.last().ok_or_else(|| anyhow!("empty plan for '{name}'"))?;
-                let m = &root.manifest;
-                let image = oci_image_or_err(m)?;
-                let version = m.app.version.to_string();
-                return mesh_deploy_oci(&name, &version, &image, &placement, data_dir).await;
+                let runtime = root.manifest.app.runtime;
+                let version = root.manifest.app.version.to_string();
+                let image = if runtime == ce_appmgr::Runtime::Oci {
+                    Some(oci_image_or_err(&root.manifest)?)
+                } else {
+                    None
+                };
+                if !yes {
+                    println!("Would install '{name}' {version} ({runtime:?}) on {placement}. Re-run with --yes.");
+                    return Ok(());
+                }
+                if let Some(members) = fleet_targets(data_dir, &placement)? {
+                    // Fan out: this host first (a normal local install), then every paired device.
+                    println!("fleet install '{name}' {version} -> this host + {} device(s)", members.len());
+                    install_local(&name, &registry, &store).await?;
+                    // A fleet install is turnkey: enable the daemon on this host too (the remote
+                    // legs enable it on their hosts), so e.g. `clip` runs everywhere after one
+                    // command. The single supervisor (`ce app daemon run`) starts it.
+                    if root.manifest.is_daemon() {
+                        store.set_daemon_enabled(&name, true)?;
+                    }
+                    let mut ok = 1usize;
+                    let mut failed = 0usize;
+                    for member in &members {
+                        let target = ce_appmgr::Placement::Node(member.clone());
+                        match remote_install_one(&name, &registry, &version, image.clone(), &target, data_dir).await {
+                            Ok(()) => ok += 1,
+                            Err(e) => {
+                                eprintln!("  {member}: {e}");
+                                failed += 1;
+                            }
+                        }
+                    }
+                    println!("fleet install: {ok} ok, {failed} failed (this host + {} device(s))", members.len());
+                    return Ok(());
+                }
+                return remote_install_one(&name, &registry, &version, image, &placement, data_dir).await;
             }
             let reg = ce_appmgr::HubRegistry::new(&registry);
             let plan = ce_appmgr::resolve(&reg, &name).await?;
@@ -1941,51 +1977,7 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
                 println!("\nDry run. Re-run with --yes to install.");
                 return Ok(());
             }
-
-            store.ensure()?;
-            // Blobs are content-addressed in the same ce-hub origin that serves manifests.
-            let blobs = ce_appmgr::BlobClient::new(&registry);
-            let target = ce_appmgr::host_target();
-            for item in &plan.items {
-                let m = &item.manifest;
-                if store.is_installed(&m.app.name) {
-                    continue;
-                }
-                // Materialize first (fetch + sha256-verify content-addressed tiers,
-                // resolve the oci image) so a bad/missing artifact fails before we
-                // record anything.
-                let materialized = ce_appmgr::materialize(&store, &blobs, m, &target).await?;
-                let rec = ce_appmgr::InstalledApp {
-                    manifest: m.clone(),
-                    target: target.clone(),
-                    digest: materialized.digest().map(str::to_string),
-                };
-                store.record(&rec)?;
-                #[cfg(unix)]
-                let shim_suffix = {
-                    let shim = app_shim_name(m);
-                    let path = store.write_shim(&shim, &m.app.name)?;
-                    format!(" -> shim {}", path.display())
-                };
-                #[cfg(not(unix))]
-                let shim_suffix = String::from(" (shims: unix only for now)");
-                let what = match &materialized {
-                    ce_appmgr::Materialized::Native { bin_path, .. } => {
-                        format!("native {}", bin_path.display())
-                    }
-                    ce_appmgr::Materialized::Wasm { module_path, .. } => {
-                        format!("wasm {}", module_path.display())
-                    }
-                    ce_appmgr::Materialized::Oci { image } => {
-                        format!("oci {image} (pulled on first run)")
-                    }
-                    ce_appmgr::Materialized::Recipe { source } => {
-                        format!("recipe {source} (built on first run)")
-                    }
-                };
-                println!("installed {} {} [{what}]{shim_suffix}", m.app.name, m.app.version);
-            }
-            println!("\nInstalled. Ensure {} is on PATH.", store.bin_dir().display());
+            install_local(&name, &registry, &store).await?;
         }
 
         AppCommands::Ls => {
@@ -2736,6 +2728,130 @@ async fn resolve_placement_node(placement: &ce_appmgr::Placement, api_token: &st
         .ok_or_else(|| anyhow!("no atlas node satisfies placement '{placement}' (need tags {required:?})"))
 }
 
+/// Install an app on THIS host: resolve, materialize + sha256-verify each artifact, record, and
+/// write launcher shims. Does not enable daemons (local install is deliberate; use `ce app daemon
+/// enable`). Shared by the local install path and the local leg of a `fleet=mine` fan-out.
+async fn install_local(name: &str, registry: &str, store: &ce_appmgr::Store) -> Result<()> {
+    let reg = ce_appmgr::HubRegistry::new(registry);
+    let plan = ce_appmgr::resolve(&reg, name).await?;
+    store.ensure()?;
+    // Blobs are content-addressed in the same ce-hub origin that serves manifests.
+    let blobs = ce_appmgr::BlobClient::new(registry);
+    let target = ce_appmgr::host_target();
+    for item in &plan.items {
+        let m = &item.manifest;
+        if store.is_installed(&m.app.name) {
+            continue;
+        }
+        // Materialize first (fetch + sha256-verify content-addressed tiers, resolve the oci image)
+        // so a bad/missing artifact fails before we record anything.
+        let materialized = ce_appmgr::materialize(store, &blobs, m, &target).await?;
+        let rec = ce_appmgr::InstalledApp {
+            manifest: m.clone(),
+            target: target.clone(),
+            digest: materialized.digest().map(str::to_string),
+        };
+        store.record(&rec)?;
+        #[cfg(unix)]
+        let shim_suffix = {
+            let shim = app_shim_name(m);
+            let path = store.write_shim(&shim, &m.app.name)?;
+            format!(" -> shim {}", path.display())
+        };
+        #[cfg(not(unix))]
+        let shim_suffix = String::from(" (shims: unix only for now)");
+        let what = match &materialized {
+            ce_appmgr::Materialized::Native { bin_path, .. } => format!("native {}", bin_path.display()),
+            ce_appmgr::Materialized::Wasm { module_path, .. } => format!("wasm {}", module_path.display()),
+            ce_appmgr::Materialized::Oci { image } => format!("oci {image} (pulled on first run)"),
+            ce_appmgr::Materialized::Recipe { source } => format!("recipe {source} (built on first run)"),
+        };
+        println!("installed {} {} [{what}]{shim_suffix}", m.app.name, m.app.version);
+    }
+    println!("Installed {name}. Ensure {} is on PATH.", store.bin_dir().display());
+    Ok(())
+}
+
+/// The concrete targets a fan-out placement expands to. `fleet=mine` = every paired device in the
+/// wallet (each already holds an owner-rooted capability for that device), installed alongside this
+/// host. Returns `None` for placements that resolve to a single node (`node=`/`tag=`/`nearest`/other
+/// fleets), which install on exactly one target.
+fn fleet_targets(
+    data_dir: &std::path::Path,
+    placement: &ce_appmgr::Placement,
+) -> Result<Option<Vec<String>>> {
+    match placement {
+        ce_appmgr::Placement::Fleet(name) if name == "mine" => {
+            let wallet = load_wallet(&data_dir.to_path_buf());
+            let members: Vec<String> = wallet.entries.keys().cloned().collect();
+            if members.is_empty() {
+                return Err(anyhow!(
+                    "fleet=mine is empty: no paired devices in the wallet (add one with `ce wallet add`)"
+                ));
+            }
+            Ok(Some(members))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Install one app on one remote target: oci apps ship as a job via `mesh_deploy_oci`; native/wasm
+/// apps install + supervise on the host via the remote appmgr agent (`/mesh-app-install`).
+async fn remote_install_one(
+    name: &str,
+    registry: &str,
+    version: &str,
+    image: Option<String>,
+    placement: &ce_appmgr::Placement,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    match image {
+        Some(img) => mesh_deploy_oci(name, version, &img, placement, data_dir).await,
+        None => mesh_app_install_one(name, registry, placement, data_dir).await,
+    }
+}
+
+/// Ship a native/wasm ceapp install to a target node via `/mesh-app-install` (capability-authed).
+/// The target runs the appmgr install flow and enables any declared daemon; the local node only
+/// packages and forwards the request with the wallet's capability for that device.
+async fn mesh_app_install_one(
+    name: &str,
+    registry: &str,
+    placement: &ce_appmgr::Placement,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    let target = match placement {
+        ce_appmgr::Placement::Node(id) => id.clone(),
+        ce_appmgr::Placement::Local => {
+            return Err(anyhow!("internal: local placement reached mesh_app_install_one"));
+        }
+        other => resolve_placement_node(other, &read_api_token(data_dir)).await?,
+    };
+    let (node_id_hex, cap) = resolve_target(&data_dir.to_path_buf(), &target)?;
+    let api_token = read_api_token(data_dir);
+    let client = api_client(&api_token);
+    let body = serde_json::json!({
+        "node_id": node_id_hex,
+        "registry": registry,
+        "app": name,
+        "grant": cap,
+    });
+    let resp = client
+        .post("http://127.0.0.1:8844/mesh-app-install")
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("mesh-app-install failed ({status}): {text}"));
+    }
+    let result: serde_json::Value = resp.json().await?;
+    let ver = result["version"].as_str().unwrap_or("?");
+    println!("installed {name} {ver} on node={node_id_hex} (native, via remote appmgr)");
+    Ok(())
+}
+
 /// The oci image for a manifest, or a clear error for tiers that can't yet be
 /// placed on the mesh (native/wasm global install needs the remote agent path).
 fn oci_image_or_err(m: &ce_appmgr::AppManifest) -> Result<String> {
@@ -2901,8 +3017,9 @@ async fn run_supervisor(
                 Reap::Untracked => {}
             }
 
-            // Not running — start it.
-            let plan = ce_appmgr::plan_run(store, app, Vec::new())?;
+            // Not running — start it with the manifest's [daemon].args (e.g. `agent`), so a
+            // multi-command native binary launches in daemon mode, not its bare CLI mode.
+            let plan = ce_appmgr::plan_run(store, app, ce_appmgr::daemon_args(&app.manifest))?;
             match plan {
                 ce_appmgr::RunPlan::Native { bin, args } => {
                     if !bin.exists() {

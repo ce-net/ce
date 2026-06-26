@@ -176,6 +176,10 @@ pub enum SandboxTier {
 pub struct Daemon {
     #[serde(default)]
     pub enabled: bool,
+    /// Args the supervisor passes when launching the daemon (e.g. `["agent"]` so a
+    /// multi-command native binary starts in its daemon mode rather than its CLI mode).
+    #[serde(default)]
+    pub args: Vec<String>,
     #[serde(default = "default_restart")]
     pub restart: String,
     /// Liveness probe the single ce supervisor polls (URL or command).

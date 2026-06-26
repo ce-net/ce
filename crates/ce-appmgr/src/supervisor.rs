@@ -61,6 +61,13 @@ pub fn daemon_policy(m: &AppManifest) -> Option<DaemonPolicy> {
     })
 }
 
+/// The args the supervisor should launch a daemon with (`[daemon].args`), e.g.
+/// `["agent"]` so a multi-command native binary starts in daemon mode. Empty for a
+/// one-shot CLI or a daemon that needs no args.
+pub fn daemon_args(m: &AppManifest) -> Vec<String> {
+    m.daemon.as_ref().map(|d| d.args.clone()).unwrap_or_default()
+}
+
 /// The installed daemon apps the supervisor should currently keep running:
 /// installed, declares a `[daemon]`, and enabled via `ce app daemon enable`.
 pub fn enabled_daemons(store: &Store) -> Result<Vec<InstalledApp>> {

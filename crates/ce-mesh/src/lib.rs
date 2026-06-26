@@ -146,6 +146,21 @@ pub enum RpcRequest {
         job_id: String,
         grant: Option<Vec<u8>>,
     },
+    /// Install (and supervise, if it declares a `[daemon]`) a published ceapp on a specific remote
+    /// host — the directed, native counterpart to `Deploy` (which only runs an oci job). The host
+    /// runs the SAME local appmgr install flow: resolve the manifest from `registry`, materialize +
+    /// sha256-verify its artifacts from that registry's blob store, record it, and enable its daemon.
+    /// Authorized by the generic `ce-cap` verifier against the `app:install` ability. Replies with
+    /// `AppInstalled`. This is what makes `ce app install <app> --on fleet=mine` work for native apps.
+    AppInstall {
+        from_node: NodeId,
+        /// App name to resolve from the registry (the published ceapp slug).
+        app: String,
+        /// Registry/blob origin that serves the manifest and content-addressed artifacts.
+        registry: String,
+        /// Scoped capability chain (bincode of `Vec<SignedCapability>`), opaque to transport.
+        grant: Option<Vec<u8>>,
+    },
     /// Fetch a content-addressed chunk (data-layer blob) from a peer that holds it. `cid` is the
     /// sha256 of the bytes; the caller verifies `sha256(reply) == cid` on receipt, so a wrong or
     /// tampered reply is detected and discarded. Open/unpaid in v0 — like `SegmentFetch`, serving
@@ -191,6 +206,7 @@ impl RpcRequest {
             Self::SegmentFetch { from_node, .. }
             | Self::Deploy { from_node, .. }
             | Self::Kill { from_node, .. }
+            | Self::AppInstall { from_node, .. }
             | Self::FetchChunk { from_node, .. }
             | Self::AppMessage { from_node, .. }
             | Self::AppRequest { from_node, .. }
@@ -212,6 +228,8 @@ pub enum RpcResponse {
     Deployed { job_id: String, output: Option<String> },
     /// A deployed cell was stopped.
     Killed,
+    /// A ceapp was installed on the remote host. `version` is the installed manifest version.
+    AppInstalled { app: String, version: String },
     /// The requested content-addressed chunk's bytes. The caller verifies `sha256(bytes) == cid`.
     ChunkData { cid: [u8; 32], bytes: Vec<u8> },
     /// The receiving node enqueued a directed `AppMessage` for the local app.
