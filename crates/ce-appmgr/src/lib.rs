@@ -23,6 +23,7 @@
 pub mod ctlapi;
 pub mod instances;
 pub mod manifest;
+pub mod materialize;
 pub mod placement;
 pub mod platform;
 pub mod registry;
@@ -32,6 +33,7 @@ pub mod store;
 pub use ctlapi::{CallerContext, ControlPlane, DepHandle, EnsureDepRequest, InstallRequest};
 pub use instances::{Health, HubInstances, InstanceFilter, InstanceRecord};
 pub use manifest::{AppManifest, Runtime, SandboxTier};
+pub use materialize::{BlobClient, Materialized, materialize};
 pub use placement::Placement;
 pub use platform::host_target;
 pub use registry::HubRegistry;

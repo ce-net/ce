@@ -638,10 +638,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "directories",
+ "hex",
  "reqwest",
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "tracing",

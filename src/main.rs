@@ -1805,7 +1805,7 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
                      (ship-to-mesh lands with the mesh-deploy milestone; see PLAN/ce-app-package-runtime.md)"
                 ));
             }
-            let reg = ce_appmgr::HubRegistry::new(registry);
+            let reg = ce_appmgr::HubRegistry::new(&registry);
             let plan = ce_appmgr::resolve(&reg, &name).await?;
             println!("Plan for '{name}' (on {placement}):");
             for item in &plan.items {
@@ -1821,45 +1821,49 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
             }
 
             store.ensure()?;
+            // Blobs are content-addressed in the same ce-hub origin that serves manifests.
+            let blobs = ce_appmgr::BlobClient::new(&registry);
+            let target = ce_appmgr::host_target();
             for item in &plan.items {
                 let m = &item.manifest;
                 if store.is_installed(&m.app.name) {
                     continue;
                 }
-                let target = ce_appmgr::host_target();
-                // Resolve the content digest where the tier is content-addressed.
-                let digest = match m.app.runtime {
-                    ce_appmgr::Runtime::Native => m.native_digest(&target).map(str::to_string),
-                    ce_appmgr::Runtime::Wasm => m.wasm.as_ref().map(|w| w.artifact.clone()),
-                    _ => None,
-                };
-                if m.app.runtime == ce_appmgr::Runtime::Native && digest.is_none() {
-                    return Err(anyhow!(
-                        "'{}' has no native build for {target}; cannot install here",
-                        m.app.name
-                    ));
-                }
+                // Materialize first (fetch + sha256-verify content-addressed tiers,
+                // resolve the oci image) so a bad/missing artifact fails before we
+                // record anything.
+                let materialized = ce_appmgr::materialize(&store, &blobs, m, &target).await?;
                 let rec = ce_appmgr::InstalledApp {
                     manifest: m.clone(),
                     target: target.clone(),
-                    digest,
+                    digest: materialized.digest().map(str::to_string),
                 };
                 store.record(&rec)?;
                 #[cfg(unix)]
-                {
+                let shim_suffix = {
                     let shim = app_shim_name(m);
                     let path = store.write_shim(&shim, &m.app.name)?;
-                    println!("installed {} {} -> shim {}", m.app.name, m.app.version, path.display());
-                }
+                    format!(" -> shim {}", path.display())
+                };
                 #[cfg(not(unix))]
-                println!("installed {} {} (shims: unix only for now)", m.app.name, m.app.version);
+                let shim_suffix = String::from(" (shims: unix only for now)");
+                let what = match &materialized {
+                    ce_appmgr::Materialized::Native { bin_path, .. } => {
+                        format!("native {}", bin_path.display())
+                    }
+                    ce_appmgr::Materialized::Wasm { module_path, .. } => {
+                        format!("wasm {}", module_path.display())
+                    }
+                    ce_appmgr::Materialized::Oci { image } => {
+                        format!("oci {image} (pulled on first run)")
+                    }
+                    ce_appmgr::Materialized::Recipe { source } => {
+                        format!("recipe {source} (built on first run)")
+                    }
+                };
+                println!("installed {} {} [{what}]{shim_suffix}", m.app.name, m.app.version);
             }
-            // Materializing native/wasm artifacts (blob fetch + verify) and pulling
-            // oci images on first run land with the runtime-execution milestone (M2/M3).
-            println!(
-                "\nRegistered with ce. Artifact materialization + sandboxed run wiring is the next milestone."
-            );
-            println!("Ensure {} is on PATH.", store.bin_dir().display());
+            println!("\nInstalled. Ensure {} is on PATH.", store.bin_dir().display());
         }
 
         AppCommands::Ls => {
