@@ -10,6 +10,12 @@
 //!
 //! No node/SDK dependency: this is plain reqwest + sha2 + std::fs so the agent can
 //! materialize without pulling in libp2p or ce-rs.
+//!
+//! Content addressing is what makes artifact distribution trustless at fleet scale:
+//! because the digest is verified before a byte is written, any of millions of nodes
+//! can pull the identical artifact from whichever blob holder is nearest and still be
+//! certain it is the published bytes — no trust in the source, automatic dedup of
+//! popular artifacts, and corruption caught locally rather than spread.
 
 use crate::manifest::{AppManifest, Runtime};
 use crate::store::Store;

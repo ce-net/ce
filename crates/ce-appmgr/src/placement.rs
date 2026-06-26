@@ -2,6 +2,12 @@
 //! run target the mesh via `--on <placement>`. Local (`self`) is the default; all
 //! other placements ship the install to the target node's agent over the existing
 //! mesh-deploy / mesh-kill primitives (capability-authed, mesh-first).
+//!
+//! This is the addressing scheme that turns scattered donated machines into one pool:
+//! `tag`, `fleet`, and `nearest` are designed so a single command targets the right
+//! slice of millions of nodes — every GPU box, an entire edge fleet, or the
+//! lowest-latency capable host — without anyone naming or tracking individual
+//! machines. It is how work is aimed at the supercomputer rather than at a server.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};

@@ -33,7 +33,7 @@
 //! process. See [`engine_config`] for the Windows-specific reason signals-based trap delivery is
 //! disabled.
 //!
-//! **Toward the global supercomputer** (`VISION.md`): a sandboxed, deterministic, content-addressed
+//! **Toward the global supercomputer**: a sandboxed, deterministic, content-addressed
 //! runtime lets even a phone or a browser safely host a stranger's compute — pulling the vast long
 //! tail of idle consumer hardware into the pool. Determinism makes results verifiable, so the
 //! economy can trust work done on machines it has never met. This is how "everyone's device" becomes
@@ -150,6 +150,15 @@ fn engine_config() -> Config {
     config.wasm_relaxed_simd(false);
     config.relaxed_simd_deterministic(true);
     config
+}
+
+/// Construct a wasmtime [`Engine`] with CE's execution config (fuel-metered, deterministic,
+/// bounded traps). Lets the `ce` binary run a materialized wasm app via [`execute_command`] /
+/// [`execute`] without re-deriving the private config.
+pub fn new_engine() -> Result<Engine> {
+    Engine::new(&engine_config())
+        .map_err(anyhow::Error::from)
+        .context("wasmtime engine")
 }
 
 /// Run a fuel-metered WASM closure under a wall-clock watchdog.

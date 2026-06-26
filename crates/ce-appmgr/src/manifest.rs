@@ -10,6 +10,12 @@
 //! - [`Runtime::Native`] — a prebuilt host binary, resolved per (os, arch).
 //! - [`Runtime::Wasm`]   — one `.wasm` module for all platforms (optional tier).
 //! - [`Runtime::Recipe`] — build-from-source fallback, promoted to a cached artifact.
+//!
+//! One signed manifest is what lets the donated hardware pool stay coherent: the same
+//! `ceapp.toml` is designed to install the right thing on a Mac laptop, an x86 relay,
+//! or an ARM phone, so across a fleet of millions of mismatched machines an app is
+//! described once and runs everywhere. The tiered runtimes are the bridge that turns
+//! that diversity into a single, uniformly usable compute substrate.
 
 use anyhow::{Result, bail};
 use semver::Version;

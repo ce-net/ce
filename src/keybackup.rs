@@ -18,6 +18,13 @@
 //!    `ce`; this is documented so nobody expects cross-wallet compatibility.
 //!  - Encrypted keystore: HKDF-SHA256(passphrase, random salt) -> XChaCha20-Poly1305 over the 32
 //!    bytes, written as JSON. The node_id is stored in clear (it is public) for verification.
+//!
+//! At the scale of the supercomputer, this is what makes participation survivable: a node's identity
+//! key is the sole, unrecoverable proof of its earned credits, name, and standing in the mesh, and
+//! across millions of self-custodying operators hardware will be lost, wiped, and replaced
+//! constantly. Giving every operator an offline, transcribable, same-host-only way to back up and
+//! restore that seed — with no network export path to attack — keeps custody decentralized: no
+//! recovery service to run, trust, or breach, just each participant holding their own keys.
 
 use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};

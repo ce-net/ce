@@ -1,3 +1,13 @@
+//! Criterion microbenchmarks for the CEP-1 `CellSignal` envelope: building (and signing) a signal
+//! across 0/64/1024-byte payloads, `verify`, bincode `encode`/`decode`, and the SHA-256 `id()`.
+//!
+//! Cell signals are the substrate's routing and capability-advertisement messages, gossiped and
+//! relayed continuously between cells; build cost is paid by every sender and verify/decode cost is
+//! paid by every receiver and forwarder along a path. When millions of devices flood signals to
+//! find capacity and address work across the mesh, the per-signal serialize-verify-hash budget set
+//! here governs how much signaling traffic the network can carry before the envelope itself becomes
+//! the bottleneck. These are isolated codec/crypto benchmarks, not a live gossip measurement.
+
 use ce_identity::Identity;
 use ce_protocol::{BurnProof, CellAddress, CellSignal, Capability};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};

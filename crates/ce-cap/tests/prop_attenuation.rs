@@ -14,6 +14,14 @@
 //!
 //! These are the properties an attacker would probe; encoding them as proptests turns "we thought
 //! of these cases" into "the prover searched the space and found no counterexample".
+//!
+//! Why this matters at scale: capabilities are the only authorization primitive gating who may run,
+//! sync, or tunnel on whose donated hardware. A single attenuation hole — a middle link that could
+//! widen abilities or a resource-subset predicate that said yes to a non-subset — would let one
+//! delegated token escalate into authority over machines across the whole mesh, and that flaw would
+//! be reachable by every relay forwarding chains for millions of nodes. Searching random chains here
+//! (rather than the hand-picked unit cases) is how we keep that catastrophic, network-wide failure
+//! mode out of the substrate. This is a test crate, not a production path.
 
 use ce_cap::{
     Capability, Caveats, Resource, SignedCapability, authorize, cap_bytes, decode_chain,

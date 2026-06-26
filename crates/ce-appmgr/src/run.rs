@@ -5,6 +5,12 @@
 //! `ce-container`, instantiating a wasm module via `ce-wasm`) happens in the `ce`
 //! binary, which owns those runtime deps. Keeping the plan here makes it unit-
 //! testable without Docker or wasmtime.
+//!
+//! Isolating the sandbox decision in pure, testable code is a safety prerequisite for
+//! the pool: donated devices run arbitrary published apps, so every host must derive
+//! the same gVisor/WASI confinement and resource envelope from the manifest the same
+//! way. Designed so that, replicated across millions of nodes, untrusted compute is
+//! always fenced identically rather than by per-machine, hand-tuned configuration.
 
 use crate::manifest::{Runtime, SandboxTier};
 use crate::store::{InstalledApp, Store};

@@ -1,3 +1,9 @@
+//! The chain is the shared ledger that prices and settles donated compute for the whole
+//! network, so funnelling every read and write through one owner task keeps a node's view of
+//! that money consistent while it simultaneously mines, serves sync, and ingests gossip. That
+//! single-writer discipline is what lets the substrate scale toward a planet of nodes without
+//! any host livelocking on its own state or showing two callers disagreeing balances.
+
 /// Chain actor — single-owner model replacing Arc<Mutex<Chain>>.
 ///
 /// One dedicated task owns the Chain value. All callers send typed ChainCmd

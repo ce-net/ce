@@ -4,6 +4,12 @@
 //! (e.g. `darwin-arm64`, `linux-amd64`). We normalise Rust's `std::env::consts`
 //! values to that vocabulary so one manifest resolves the right bytes on any host
 //! while the install *command* stays identical everywhere.
+//!
+//! This tiny normalisation is load-bearing at scale: the pooled compute comes from
+//! wildly mixed hardware, and collapsing each host's reported os/arch to one shared
+//! vocabulary is what lets a single published manifest auto-resolve the correct binary
+//! on any of millions of devices. The matching layer makes a heterogeneous fleet
+//! behave as one uniform target.
 
 /// Canonical OS token used in manifest artifact keys.
 pub fn os() -> &'static str {

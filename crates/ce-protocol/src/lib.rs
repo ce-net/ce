@@ -9,7 +9,7 @@
 //! `MeshEvent::CellSignal` for valid signals. Burn-proof / chain-side
 //! validation lives in ce-node.
 //!
-//! **Toward the global supercomputer** (`VISION.md`): cell signaling is how workloads spread
+//! **Toward the global supercomputer**: cell signaling is how workloads spread
 //! across the fabric — coordinating, paying, and self-replicating across many hosts. It is the
 //! substrate for apps and services that span the whole pool instead of living on one machine.
 

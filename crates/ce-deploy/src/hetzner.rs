@@ -1,3 +1,17 @@
+//! Thin async client for the Hetzner Cloud API: create, poll, list, and delete servers.
+//!
+//! This is the metal-acquisition layer beneath the cluster orchestrator. It posts cx23 Ubuntu
+//! instances into existence, retries through Hetzner's transient `resource_limit_exceeded` after a
+//! deletion frees an IP, polls `wait_until_running` until the OS reports running AND SSH actually
+//! answers, and tears machines down on teardown. Everything else in `ce-deploy` assumes a reachable
+//! root@ip; this module is what makes that true.
+//!
+//! In the supercomputer story, real capacity ultimately rents or owns hardware somewhere, and a node
+//! has to be born before it can mine, sync, or serve jobs. This is the concrete Hetzner adapter for
+//! that birth. Designed so that, to add capacity at scale, you drive a provider API like this one in
+//! a loop — the same request/poll/delete shape generalizes to other clouds, so the network can grow
+//! by programmatic supply rather than hand-clicked servers.
+
 use anyhow::{anyhow, Result};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};

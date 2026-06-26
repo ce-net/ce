@@ -9,6 +9,12 @@
 //! extends ce-hub's existing live-node/instance tracker. The agent registers on
 //! start, heartbeats on the supervisor's health interval, and deregisters on stop;
 //! ce-hub expires instances whose heartbeat lapses.
+//!
+//! This is the live census of the fabric: designed so that, across millions of
+//! churning devices, the network always has an up-to-date map of what is running and
+//! where without any node holding global state. Heartbeat-and-expire keeps that map
+//! self-healing as donors join and drop, and it is the substrate scheduling and
+//! re-placement read to pack pooled compute onto healthy nodes.
 
 use crate::manifest::Runtime;
 use crate::placement::Placement;

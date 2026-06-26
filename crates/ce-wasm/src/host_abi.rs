@@ -50,6 +50,11 @@
 //! Every host call deducts a fixed [`HOST_CALL_FUEL`] from the Store's fuel before doing any work,
 //! so reaching into CE primitives costs gas just like executing instructions. If the Store has
 //! insufficient fuel the call traps (fuel exhaustion), exactly like a runaway compute loop.
+//!
+//! Mission/scale: this gate is what lets the network safely run a stranger's WASM on a
+//! stranger's hardware. Designed so that across millions of donated devices a guest reaches
+//! host blobs or logging only through a signed, verified ability, pooled compute stays
+//! sandboxed by default and authority is carried explicitly rather than ambiently trusted.
 
 use std::sync::Arc;
 

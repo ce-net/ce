@@ -4,6 +4,10 @@
 //! Tests here are self-contained: they spin up in-process nodes with
 //! `disable_local_discovery: true` so they cannot accidentally connect to any
 //! live local ce node running on the developer's machine via mDNS.
+//!
+//! At planetary scale the mesh is permissionless: any of millions of peers may be hostile, so
+//! these attack models run in CI as standing proof that a single honest node defends its chain
+//! and economy without trusting its neighbours.
 
 use ce_chain::{Chain, Tx, TxKind};
 use ce_identity::Identity;

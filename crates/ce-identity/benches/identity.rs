@@ -1,3 +1,13 @@
+//! Criterion microbenchmarks for the Ed25519 root operations in `ce-identity`: signing a payload,
+//! verifying a signature, and loading a persisted key from disk.
+//!
+//! Verify is the number that matters most: every transaction, block seal, capability link, and
+//! cell signal is checked with it, and it runs once per signature on every node that receives the
+//! object — so verify cost, not sign cost, is what the mesh pays in bulk. Across millions of
+//! donated devices doing billions of authenticated operations, the verify-per-second ceiling here
+//! bounds how fast authenticated work can move through the whole supercomputer. This measures the
+//! crypto primitives in isolation; it is not an end-to-end throughput test.
+
 use ce_identity::{Identity, verify};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;

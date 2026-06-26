@@ -7,6 +7,11 @@
 //! Algorithm: Dabek et al., "Vivaldi: A Decentralized Network Coordinate System" (SIGCOMM 2004),
 //! with the additive *height* term modelling per-node last-mile access latency. The update follows
 //! the well-tested HashiCorp Serf formulation.
+//!
+//! Carrying one cheap coordinate per node instead of an all-pairs probe matrix is what makes
+//! latency-aware scheduling tractable across millions of peers: any node can predict RTT to
+//! any other from gossiped coordinates alone, so the supercomputer can place work near its
+//! data and users without ever measuring the full O(n^2) mesh.
 
 use serde::{Deserialize, Serialize};
 

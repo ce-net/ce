@@ -9,6 +9,14 @@
 //!   hostile peer becomes a clean `Err`, not an abort;
 //! * `requires_burn` matches its documented predicate for any payload/burn-proof combination;
 //! * the content-addressed `id()` is stable across an encode/decode round-trip.
+//!
+//! CEP-1 signals are how cells find capacity and address work across the mesh, so the envelope is
+//! handled by untrusted relays and peers at every hop. The properties proven here keep that traffic
+//! safe at scale: field-binding means a forwarder cannot re-attribute or rewrite a signal it carries
+//! for millions of senders, a stable content id means peers agree on what a signal IS for dedup and
+//! routing, and panic-free decoding means a single malformed frame from a hostile node cannot crash
+//! the receivers along a path. Random-input search hardens the wire format an adversary controls
+//! most directly. This is a test crate exercising the protocol library, not the live signaling loop.
 
 use ce_identity::Identity;
 use ce_protocol::{BurnProof, Capability, CellAddress, CellSignal};

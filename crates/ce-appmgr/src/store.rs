@@ -11,6 +11,12 @@
 //!
 //! There are no other host-installed binaries and no per-app plists: daemons are
 //! registered here and supervised by the single `ce` service.
+//!
+//! Containing every install under one ce-owned tree is what keeps a donor's machine
+//! trustworthy at scale: with no scattered host binaries or per-app service files,
+//! onboarding and full teardown are uniform and reversible on each of millions of
+//! contributed devices, so people can lend compute to the supercomputer without it
+//! leaving residue or fighting their system's own package manager.
 
 use crate::manifest::AppManifest;
 use anyhow::{Context, Result};

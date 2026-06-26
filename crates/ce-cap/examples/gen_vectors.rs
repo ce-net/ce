@@ -3,6 +3,14 @@
 //!
 //! Run: `cargo run -p ce-cap --example gen_vectors > ../ce-ts/cap/test/golden-vectors.json`
 //! Identities are built from fixed seeds, so the output is fully reproducible across machines.
+//!
+//! This is a fixture generator, not a test, but it underwrites a load-bearing property: in a global
+//! supercomputer that anyone can join from a phone browser, the TypeScript cap verifier must hash
+//! and authorize capability tokens to the exact same bytes as this Rust one, or a token minted on a
+//! laptop would be read differently by a browser peer. The cases here deliberately span every
+//! `Resource` variant, the full `Caveats` permutations, empty/multi abilities, the `u64::MAX` nonce
+//! boundary, and a two-link delegation chain, so any cross-language disagreement surfaces in CI
+//! rather than as a silent authorization split once millions of heterogeneous nodes are verifying.
 
 use ce_cap::{cap_bytes, cap_id, Caveats, Resource, SignedCapability};
 use ce_identity::Identity;

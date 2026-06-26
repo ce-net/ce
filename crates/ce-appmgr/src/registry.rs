@@ -5,6 +5,12 @@
 //! M0/M1 single-version registry; a multi-version solver replaces the lookup once
 //! ce-hub records version history. Discovery falls back gracefully when the hub is
 //! unreachable so `ce app info` on an already-installed app still works offline.
+//!
+//! This is the shared front door through which the whole fabric discovers and trusts
+//! software: the detached signature sidecar is designed so that any of millions of
+//! nodes can verify a manifest's publisher before executing its code, and the offline
+//! fallback keeps already-installed apps usable under partition — so the network's app
+//! catalog stays both globally consistent and resilient to losing the hub.
 
 use crate::manifest::AppManifest;
 use crate::resolver::Registry;

@@ -40,7 +40,7 @@
 //! `RevokeCapability` anchor keyed by `(issuer, nonce)` consulted via the `is_revoked` callback
 //! (revoking any link revokes its whole subtree); and root-key rotation (the nuclear option).
 //!
-//! **Toward the global supercomputer** (`VISION.md`): a planet-scale pool of strangers' machines
+//! **Toward the global supercomputer**: a planet-scale pool of strangers' machines
 //! can only be shared safely if authority is a verifiable, attenuating chain rather than a
 //! central allowlist. This crate is what lets anyone grant anyone precisely-scoped access to
 //! compute — with no company, account system, or gatekeeper in the middle. No capability model,

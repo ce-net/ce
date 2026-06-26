@@ -1,3 +1,16 @@
+//! Provision and orchestrate a multi-node CE cluster on cloud servers as one unit.
+//!
+//! `Cluster::provision` spins up N servers concurrently, deploys the `ce` binary to each, starts a
+//! genesis node and points the rest at it as bootstrap, then exposes `wait_for_height` and
+//! `assert_consensus` to confirm the fleet actually converged on one chain. It is the programmable
+//! lever that turns raw machines into a running piece of the network with a single call.
+//!
+//! For the global supercomputer this is the seeding and growth primitive: every new region or
+//! capacity bump means standing up more nodes that find each other and agree, and this code proves
+//! that path works repeatably. Designed so that, scaled across millions of nodes, the same
+//! provision-bootstrap-converge motion composes — each cluster is just another cohort joining the
+//! one mesh, with consensus checks catching any cohort that fails to fall into line.
+
 use anyhow::{anyhow, Result};
 use crate::{hetzner::{HetznerClient, Server}, ssh};
 use tokio::time::{sleep, Duration};

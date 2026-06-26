@@ -8,6 +8,14 @@
 //!   64 bytes (CE relies on this for VRF tickets and content-addressed tx ids);
 //! * `verify` NEVER panics on arbitrary 32-byte "node ids" or 64-byte "signatures" from a hostile
 //!   peer — it returns `Err`, never aborts the node.
+//!
+//! This is the bottom turtle. Every higher-level guarantee in the supercomputer — capability chains,
+//! block seals, transaction authenticity, signal attribution — reduces to "this signature verifies
+//! under this key and never under another." If that contract broke, identity across the entire mesh
+//! would be forgeable; and because every node ingests untrusted node-ids and signatures straight off
+//! the wire, a panic in `verify` on crafted bytes would be a one-packet remote kill against millions
+//! of participants. Fuzzing the contract over random and adversarial input is how we keep both
+//! failure modes out. This is a test crate, not the runtime signing path.
 
 use ce_identity::{Identity, NodeId, verify};
 use proptest::prelude::*;

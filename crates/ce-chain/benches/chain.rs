@@ -1,3 +1,14 @@
+//! Criterion microbenchmarks for the `ce-chain` per-block and per-transaction hot paths:
+//! block hashing, seal signing and `verify_seal`, `append`, transaction `verify` and `id`,
+//! the balance scan over 10/100/500 blocks, and JSON (de)serialization of a chain.
+//!
+//! These are the operations every node runs constantly while mining and while syncing: a peer
+//! re-hashes and re-verifies every block and every transaction it receives, and a balance scan
+//! runs on each incoming bid. For a participant-owned global supercomputer where millions of
+//! devices independently re-validate the same shared ledger, a regression in any of these costs
+//! is multiplied by the whole network's block-and-tx volume, so we track them here rather than
+//! discover the slowdown in production. This is a local benchmark, not a mesh or consensus test.
+
 use ce_chain::{Chain, Tx, TxKind};
 use ce_identity::Identity;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};

@@ -3,6 +3,12 @@
 //! per-app launchd/systemd plists. The policy lives here (pure, testable); the
 //! mechanism — spawning, restarting, health probing, ce-hub registration — lives
 //! in the `ce` binary which owns the process/runtime deps.
+//!
+//! Collapsing all daemons behind one OS service is what makes a donated node a
+//! reliable piece of the pool without bespoke operations: designed so that, across
+//! millions of devices, many supervised services stay alive under a single uniform
+//! restart-and-health policy rather than a sprawl of per-app launchd/systemd units —
+//! keeping pooled long-running compute self-healing and consistent everywhere.
 
 use crate::manifest::AppManifest;
 use crate::store::{InstalledApp, Store};

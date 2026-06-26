@@ -1,3 +1,17 @@
+//! Shell out to `ssh`/`scp` to turn a bare server into a running CE node.
+//!
+//! These helpers wrap the system OpenSSH client (batch mode, no host-key prompts) to probe
+//! connectivity, wait out cloud-init and the dpkg lock, install libssl plus Docker, upload the `ce`
+//! binary to `/usr/local/bin/ce`, launch it under `nohup` with the right ports and bootstrap flag,
+//! and read back its hex node id. It is the bootstrapping bridge between "an IP that accepts SSH"
+//! and "a peer on the mesh."
+//!
+//! Toward the global supercomputer, this is the install-and-ignite step every donated or rented
+//! Linux box passes through before it can contribute compute. Designed so that, replicated across
+//! millions of heterogeneous hosts, the same idempotent provision-deploy-start sequence brings each
+//! one online without bespoke per-machine setup; pkill-before-start and lock-waiting make repeated
+//! runs safe so fleet rollouts can re-converge rather than corrupt half-configured nodes.
+
 use anyhow::{anyhow, Result};
 use std::process::{Command, Output};
 use tokio::time::{sleep, Duration};

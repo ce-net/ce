@@ -8,6 +8,11 @@
 //!  - Helpers at the bottom: `make_identity`, `mine_block`, `forge_bad_block`.
 //!  - Adversarial tests simulate attacker behaviour and verify the chain survives
 //!    with its state intact.
+//!
+//! Isolating the actor pins the ledger's state machine where failures stay diagnosable: when
+//! the same single-owner loop mediates every balance and block across millions of nodes, one
+//! unhandled concurrency or validation slip would corrupt money network-wide, so the
+//! invariants are nailed down here before they reach the live mesh.
 
 use ce_chain::{Block, Chain, Tx, TxKind};
 use ce_identity::Identity;

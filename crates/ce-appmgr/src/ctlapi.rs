@@ -17,6 +17,12 @@
 //! pass an optional ce-gov policy scan and a resource/credit budget. This module
 //! defines the wire types and the [`ControlPlane`] behavior the agent implements;
 //! the socket/mesh transport and the ce-cap/ce-gov gates live in the `ce` binary.
+//!
+//! At scale this is how apps self-assemble instead of being hand-wired: an app
+//! declares its dependencies once and, wherever it lands among millions of donated
+//! nodes, asks its local agent to ensure them — so the pooled supercomputer composes
+//! whole systems on demand with no central orchestrator, every request fenced by the
+//! caller's attenuated capability so untrusted code can never exceed its grant.
 
 use crate::instances::InstanceRecord;
 use crate::placement::Placement;

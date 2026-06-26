@@ -5,6 +5,12 @@
 //! requirement, detects cycles, and returns a topologically-ordered install plan
 //! (dependencies before dependents). Service/capability/system deps are surfaced
 //! on the plan so the caller can provision or prompt for them.
+//!
+//! Deterministic ordering and cycle detection are what make installing whole systems
+//! (not just single binaries) safe to repeat across the fabric: the same closure
+//! resolves to the same plan on every node, so a complex multi-app stack deploys
+//! identically whether it lands on one machine or fans out over millions, and a
+//! malformed dependency graph is rejected before any node acts on it.
 
 use crate::manifest::AppManifest;
 use anyhow::{Result, anyhow, bail};

@@ -10,7 +10,7 @@
 //! execution path passes through (after capability authorization, before any container or module is
 //! created). A [`GuardVerdict::Deny`] refuses the launch.
 //!
-//! **Toward the global supercomputer** (`VISION.md`): ordinary people will only open their
+//! **Toward the global supercomputer**: ordinary people will only open their
 //! devices to the pool if hosts can refuse abusive work. This fail-closed screening chokepoint is
 //! the safety valve that makes donating compute to strangers viable at scale.
 

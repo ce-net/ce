@@ -2,6 +2,11 @@
 //! These tests spin up real Node instances in-process on different ports
 //! and verify that mining, sync, the tx pool, and the HTTP API all work
 //! end-to-end without any Hetzner infrastructure.
+//!
+//! Driving a real multi-node cluster in one process exercises the smallest honest instance of
+//! the agreement that must hold identically when the same code forms a mesh of millions of
+//! donated devices: independent peers must converge on one chain, settle jobs, and answer the
+//! API the same way, and this is where that convergence is proven cheaply on every change.
 
 use ce_chain::payer_settle_bytes;
 use ce_identity::Identity;

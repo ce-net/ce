@@ -15,6 +15,13 @@
 //!   - CE binary built for Linux x86_64 (musl). From macOS:
 //!       cargo build --release --target x86_64-unknown-linux-musl
 //!     Or set CE_BINARY=/path/to/linux-amd64-ce to use a pre-built binary.
+//!
+//! What these protect at scale: the moments where strangers' machines must agree without a
+//! coordinator. The cases here — a fresh cluster reaching consensus, a job bid propagating between
+//! nodes, and a late-joiner catching up to an existing chain — are the exact behaviors the network
+//! depends on when millions of independently provisioned nodes join, transact, and sync. Running
+//! them against genuine cloud servers (not mocks) means a regression that would silently fracture
+//! the supercomputer's agreement is caught on real hardware before it ever ships.
 
 use ce_deploy::{Cluster};
 use tokio::time::{sleep, Duration};

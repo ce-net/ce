@@ -7,6 +7,14 @@
 //!
 //! All tests assume ce-net.com is always live. If a test fails, it means either
 //! the network is down or a code change broke compatibility — both warrant attention.
+//!
+//! At scale these guard the on-ramp every new device uses. A phone, laptop, or server joining the
+//! supercomputer first hits the public ce-net.com bootstrap, dials the relay's P2P port, and syncs
+//! the chain from it — exactly the path the fast checks and the ignored `live_node_syncs_from_relay`
+//! exercise end to end. The local segment-distribution tests verify that as node counts grow the
+//! chain's history stays fully covered by archivers, so no era of the ledger is lost as millions of
+//! light nodes prune. If this entry point breaks, new participants cannot join, so it is verified
+//! continuously against the live network.
 
 use ce_chain::{Chain, ARCHIVE_DENSITY, SEGMENT_SIZE, segment_id_for_block, should_hold_segment};
 use ce_node::{Node, NodeConfig};

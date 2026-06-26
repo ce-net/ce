@@ -1,3 +1,20 @@
+//! `ce` — the single root binary every device runs to join the network.
+//!
+//! This is the CLI entry point and command surface for the whole system: one `clap` dispatcher over
+//! `ce start` (run the node: mine, meter, mesh, HTTP API), plus `status`/`id`/`balance`, identity
+//! `key` backup/restore, the `wallet` (credits + held capabilities), payment `channel`s, on-chain
+//! `name` claims, mesh service `discover`, and `grant` (issue capability tokens). On launch it
+//! auto-fetches bootstrap peers from ce-net.com so a node finds the mesh with zero configuration.
+//! Everything a participant does — from owning an identity to spending credits to authorizing
+//! others — flows through subcommands defined here.
+//!
+//! It is deliberately the ONLY root binary: apps (rdev, ce-expose, and the rest) build on the
+//! primitives this node exposes rather than shipping their own daemons, so onboarding a machine is
+//! one install of one program. That is the on-ramp at scale — for the supercomputer to be open and
+//! participant-owned, joining has to be a single command anyone can run on a phone, laptop, or
+//! server. Designed so that, across millions of heterogeneous devices, this same binary and the same
+//! `ce start` is the universal front door into the pooled compute, economy, and mesh.
+
 use anyhow::{anyhow, Context, Result};
 use ce_chain::{Chain, CREDIT};
 use ce_identity::Identity;
@@ -2218,11 +2235,38 @@ async fn app_publish(
             ("ceapp.toml", bytes.clone(), "text/plain"),
             ("ceapp.sig", sig_json.clone(), "application/json"),
         ] {
-            let url = format!("{hub}/apps/{name}/{suffix}");
-            let resp = client.put(&url).header("content-type", ctype).body(body).send().await;
+            let rel = format!("/apps/{name}/{suffix}");
+            let url = format!("{hub}{rel}");
+            // Signed write (ce-hub scheme): the hub records this identity as the app
+            // owner on first publish and 403s any later write from a different identity.
+            // Canonical = "PUT\n<path>\n<ts>\n<nonce>\n<sha256(body)hex>".
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .to_string();
+            let mut nh = Sha256::new();
+            nh.update(identity.secret_bytes());
+            nh.update(ts.as_bytes());
+            nh.update(suffix.as_bytes());
+            nh.update(&body);
+            let nonce = hex::encode(nh.finalize());
+            let body_hex = hex::encode(Sha256::digest(&body));
+            let canon = format!("PUT\n{rel}\n{ts}\n{nonce}\n{body_hex}");
+            let sig = hex::encode(identity.sign(canon.as_bytes()));
+            let resp = client
+                .put(&url)
+                .header("content-type", ctype)
+                .header("x-ce-id", &publisher)
+                .header("x-ce-ts", &ts)
+                .header("x-ce-nonce", &nonce)
+                .header("x-ce-sig", &sig)
+                .body(body)
+                .send()
+                .await;
             match resp {
-                Ok(r) if r.status().is_success() => println!("  uploaded {url}"),
-                Ok(r) => println!("  note: {url} -> {} (hub may require owner auth)", r.status()),
+                Ok(r) if r.status().is_success() => println!("  uploaded {url} (signed)"),
+                Ok(r) => println!("  note: {url} -> {} (owned by another identity?)", r.status()),
                 Err(e) => println!("  note: upload to {url} failed: {e}"),
             }
         }
@@ -2443,6 +2487,9 @@ async fn handle_ctl_line(
             if !caller_may_provision(&caller) {
                 return CtlResponse::Denied { reason: DenyReason::CapabilityDenied };
             }
+            if let Some(reason) = ce_gov_denies("ensure_dep", &req.name, &caller).await {
+                return CtlResponse::Denied { reason };
+            }
             match agent.ensure_dep(&caller, req).await {
                 Ok(handle) => CtlResponse::ok(&handle),
                 Err(e) => CtlResponse::Error { message: e.to_string() },
@@ -2454,6 +2501,9 @@ async fn handle_ctl_line(
             }
             if !caller_may_provision(&caller) {
                 return CtlResponse::Denied { reason: DenyReason::CapabilityDenied };
+            }
+            if let Some(reason) = ce_gov_denies("install", &req.name, &caller).await {
+                return CtlResponse::Denied { reason };
             }
             match agent.install(&caller, req).await {
                 Ok(()) => CtlResponse::ok(&serde_json::json!({ "installed": true })),
@@ -2475,6 +2525,42 @@ fn caller_may_provision(caller: &ce_appmgr::CallerContext) -> bool {
         .capabilities
         .iter()
         .any(|c| matches!(c.as_str(), "install" | "exec" | "deploy" | "sync"))
+}
+
+/// ce-gov policy gate (M12). When `CE_GOV_URL` is configured, every provisioning
+/// request (ensure_dep/install) is submitted to ce-gov for a pre-run policy
+/// decision and DENIED if ce-gov rejects it (fail-closed). When unconfigured,
+/// ce-gov is opt-in and the gate allows. Returns `Some(reason)` to deny.
+async fn ce_gov_denies(
+    op: &str,
+    target: &str,
+    caller: &ce_appmgr::CallerContext,
+) -> Option<ce_appmgr::DenyReason> {
+    let Ok(base) = std::env::var("CE_GOV_URL") else {
+        return None; // ce-gov not configured — opt-in, allow.
+    };
+    let url = format!("{}/policy/scan", base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "op": op,
+        "target": target,
+        "caller_app": caller.app,
+        "caller_caps": caller.capabilities,
+    });
+    match reqwest::Client::new().post(&url).json(&body).send().await {
+        Ok(resp) => {
+            let v: serde_json::Value = resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+            // ce-gov returns { "allow": bool, "reason": "..." }. Anything not an
+            // explicit allow is a policy denial (fail-closed).
+            if v["allow"].as_bool() == Some(true) {
+                None
+            } else {
+                Some(ce_appmgr::DenyReason::PolicyDenied)
+            }
+        }
+        // ce-gov configured but unreachable: fail closed — a policy gate that
+        // silently disappears when the judge is down is not a gate.
+        Err(_) => Some(ce_appmgr::DenyReason::PolicyDenied),
+    }
 }
 
 /// The agent's [`ce_appmgr::ControlPlane`] implementation: resolves, installs, and
@@ -2587,6 +2673,55 @@ fn dep_endpoint(m: &ce_appmgr::AppManifest) -> String {
     format!("ce-app://{}", m.app.name)
 }
 
+/// Resolve a tag/fleet/nearest placement to a concrete node id by querying the
+/// local node's `/atlas` and ranking candidates by free capacity (cpu*100 + mem,
+/// penalized by running jobs). `tag=a,b` requires all tags; `fleet=<name>` treats
+/// the fleet name as a required tag; `nearest` ranks the whole atlas.
+async fn resolve_placement_node(placement: &ce_appmgr::Placement, api_token: &str) -> Result<String> {
+    let required: Vec<String> = match placement {
+        ce_appmgr::Placement::Tag(tags) => tags.clone(),
+        ce_appmgr::Placement::Fleet(name) => vec![name.clone()],
+        ce_appmgr::Placement::Nearest => Vec::new(),
+        _ => Vec::new(),
+    };
+    let client = api_client(api_token);
+    let resp = client
+        .get("http://127.0.0.1:8844/atlas")
+        .send()
+        .await
+        .context("querying /atlas for placement")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("/atlas returned {}", resp.status()));
+    }
+    let entries: serde_json::Value = resp.json().await.context("decoding /atlas")?;
+    let arr = entries.as_array().cloned().unwrap_or_default();
+    // (node_id, score) candidates that satisfy the required tags.
+    let mut cands: Vec<(String, i64)> = Vec::new();
+    for e in &arr {
+        let Some(id) = e["node_id"].as_str() else { continue };
+        let cap = &e["capacity"];
+        let cpu = cap["cpu_cores"].as_u64().unwrap_or(0) as i64;
+        let mem = cap["mem_mb"].as_u64().unwrap_or(0) as i64;
+        let jobs = cap["running_jobs"].as_u64().unwrap_or(0) as i64;
+        let tags: Vec<&str> = cap["tags"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
+            .unwrap_or_default();
+        if !required.iter().all(|r| tags.iter().any(|t| t == r)) {
+            continue;
+        }
+        // Higher is better: free capacity, penalized by current load.
+        let score = cpu * 100 + mem - jobs * 50;
+        cands.push((id.to_string(), score));
+    }
+    cands.sort_by(|a, b| b.1.cmp(&a.1));
+    cands
+        .into_iter()
+        .next()
+        .map(|(id, _)| id)
+        .ok_or_else(|| anyhow!("no atlas node satisfies placement '{placement}' (need tags {required:?})"))
+}
+
 /// The oci image for a manifest, or a clear error for tiers that can't yet be
 /// placed on the mesh (native/wasm global install needs the remote agent path).
 fn oci_image_or_err(m: &ce_appmgr::AppManifest) -> Result<String> {
@@ -2616,12 +2751,11 @@ async fn mesh_deploy_oci(
 ) -> Result<()> {
     let target = match placement {
         ce_appmgr::Placement::Node(id) => id.clone(),
-        other => {
-            return Err(anyhow!(
-                "placement '{other}' needs atlas-based selection (tag/fleet/nearest) — \
-                 pending; use --on node=<id> for now"
-            ));
+        ce_appmgr::Placement::Local => {
+            return Err(anyhow!("internal: local placement reached mesh_deploy_oci"));
         }
+        // tag/fleet/nearest: pick a node from the live atlas.
+        other => resolve_placement_node(other, &read_api_token(data_dir)).await?,
     };
     let (node_id_hex, cap) = resolve_target(&data_dir.to_path_buf(), &target)?;
     let api_token = read_api_token(data_dir);
@@ -2905,11 +3039,28 @@ async fn run_app(
             }
             Ok(())
         }
-        RunPlan::Wasm { module, args: _ } => Err(anyhow!(
-            "wasm execution is the optional tier and not yet wired (module {}); \
-             use the oci or native tier for now",
-            module.display()
-        )),
+        RunPlan::Wasm { module, args } => {
+            if !module.exists() {
+                return Err(anyhow!(
+                    "wasm module for '{name}' is missing at {} — reinstall: ce app install {name}",
+                    module.display()
+                ));
+            }
+            let wasm = std::fs::read(&module)
+                .with_context(|| format!("reading wasm module {}", module.display()))?;
+            // Args reach the module on stdin (one per line); ce-wasm runs the WASI command
+            // fuel- and memory-bounded. Run on a blocking thread (CPU-bound).
+            let engine = ce_wasm::new_engine()?;
+            let stdin = args.join("\n").into_bytes();
+            let (code, out) = tokio::task::spawn_blocking(move || {
+                ce_wasm::execute_command(&engine, &wasm, 10_000_000_000, 512, stdin)
+            })
+            .await
+            .context("wasm execution task")??;
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&out);
+            std::process::exit(code);
+        }
         RunPlan::Recipe { source } => Err(anyhow!(
             "recipe apps build on the relay and promote to a native artifact — \
              run path pending (source {source})"

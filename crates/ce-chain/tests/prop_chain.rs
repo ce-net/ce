@@ -11,6 +11,14 @@
 //!    == gross`, `burn <= gross`, monotonic in `gross`, and exactly `1%` floor for large values.
 //! 3. **Pure helpers never panic and stay in-range** over random input: `expected_difficulty`,
 //!    `is_valid_name`, `segment_id_for_block`, `leader_threshold`/`ticket_value`.
+//!
+//! At the scale of a participant-owned supercomputer this is existential, not cosmetic. The ledger
+//! is the shared accounting of every credit earned and spent across millions of devices: if a large
+//! `u128` amount silently truncated through an f64 or a non-canonical encoding, balances would
+//! diverge between peers and consensus would fracture. Proving lossless transit for arbitrary
+//! amounts, a conserved settlement burn, and panic-free helpers over random input is what lets every
+//! node independently arrive at the same numbers from the same blocks. This is a test crate
+//! exercising library functions, not the live mining or sync path.
 
 use ce_chain::{
     Block, Chain, EquivocationProof, SETTLEMENT_BURN_BPS, SUPPLY_CAP, Tx, TxKind, channel_receipt_bytes,

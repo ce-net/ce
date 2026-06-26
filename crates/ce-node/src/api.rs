@@ -1,3 +1,12 @@
+//! HTTP API surface of a CE node — the axum router and handlers served on `:8844`.
+//! Exposes status/health, job bid/settle/expire/kill, credit transfers, payment
+//! channels, CEP-1 signal send plus the SSE push streams, and the capability-gated
+//! sync/exec and mesh-proxy endpoints, all behind bearer-token auth with per-sender
+//! monotonic nonces that close replay windows inside the freshness bound.
+//! This is the local control plane every operator, app, and SDK speaks to, so that
+//! when millions of nodes run side by side each is driven through one uniform,
+//! authenticated interface instead of bespoke per-host glue.
+
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, Request, State},
