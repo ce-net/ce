@@ -1,3 +1,14 @@
+//! ce-mesh — the libp2p networking layer for ce-net.
+//!
+//! Carries everything nodes say to each other in **ce-net** (a Byzantine-fault-tolerant compute
+//! marketplace on a proof-of-work chain): a Kademlia DHT for discovery, Gossipsub for blocks,
+//! transactions, height announcements, chain sync, and CEP-1 cell signaling, plus QUIC, AutoNAT,
+//! DCUtR hole-punching, and relay-client for NAT traversal. Mesh-first: device-to-device traffic
+//! routes over libp2p, never a stored ip:port.
+//!
+//! Architectural constraint: [`Mesh`] is `!Sync` (it owns the libp2p `Swarm`), so the event
+//! handlers here are free functions — never async methods that hold `&self` across an await.
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use ce_chain::{Block, Tx};

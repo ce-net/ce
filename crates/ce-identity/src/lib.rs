@@ -1,3 +1,11 @@
+//! ce-identity — cryptographic identity for ce-net nodes.
+//!
+//! Every node in **ce-net** (a Byzantine-fault-tolerant compute marketplace on a proof-of-work
+//! blockchain) *is* an Ed25519 keypair. This crate owns that primitive: key generation and
+//! on-disk persistence (the secret key, `chmod 600`), the 32-byte [`NodeId`] (the public key),
+//! and `sign`/`verify`. The `NodeId` is the only identifier used by the chain, the mesh, and the
+//! capability system — there is no separate account or username.
+
 use anyhow::{anyhow, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;

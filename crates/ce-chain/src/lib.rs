@@ -1,3 +1,12 @@
+//! ce-chain — the proof-of-work blockchain and economy at the core of ce-net.
+//!
+//! **ce-net** is a compute marketplace: nodes mine blocks to earn credits and spend credits to
+//! run containers on other nodes. This crate is the ledger that makes that trustless. It defines
+//! every transaction type (`Transfer`, `UptimeReward`, `JobBid`, `JobSettle`, `JobExpire`,
+//! `TrustGrant`, `Heartbeat`), proof-of-work mining and validation, balance tracking with credit
+//! escrow, the supply-capped halving emission schedule, and persistence (bincode + zstd). Money
+//! is integer base units (10^18 per credit), never floats; on-chain amounts are `u128`.
+
 use anyhow::{anyhow, Result};
 use ce_identity::{verify, Identity, NodeId};
 use serde::{Deserialize, Serialize};

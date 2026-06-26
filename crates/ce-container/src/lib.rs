@@ -1,3 +1,11 @@
+//! ce-container — Docker-backed workload execution for ce-net.
+//!
+//! When a node wins a job on the **ce-net** compute marketplace, this crate runs the container:
+//! image pull, lifecycle, logs, and stats via `bollard`, with CPU/memory/network limits and
+//! gVisor sandboxing where available. It is optional — a node with no Docker socket silently
+//! disables it and still participates in the mesh and economy. It plugs into the node as one
+//! [`ce_runtime::Runtime`] backend, alongside the WASM backend (`ce-wasm`).
+
 use anyhow::{anyhow, Result};
 use bollard::container::{
     CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
