@@ -9,6 +9,18 @@
 use crate::manifest::AppManifest;
 use crate::resolver::Registry;
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+
+/// A detached signature over a manifest's exact bytes, served alongside it at
+/// `/apps/<name>/ceapp.sig`. The publisher is a CE node id; the signature is the
+/// node's Ed25519 signature over the raw `ceapp.toml` bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureSidecar {
+    /// Publisher CE node id (64 hex).
+    pub publisher: String,
+    /// Ed25519 signature over the manifest bytes (128 hex = 64 bytes).
+    pub signature: String,
+}
 
 /// HTTP client for the ce-hub app registry.
 #[derive(Debug, Clone)]
@@ -50,6 +62,42 @@ impl HubRegistry {
             .with_context(|| format!("registry returned an error for {url}"))?;
         let body = resp.text().await.context("reading manifest body")?;
         AppManifest::parse(&body).with_context(|| format!("parsing manifest for '{name}'"))
+    }
+
+    /// Fetch the EXACT manifest bytes (not parsed) — required for signature
+    /// verification, which is over the published bytes.
+    pub async fn fetch_raw(&self, name: &str) -> Result<String> {
+        let url = self.manifest_url(name);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting manifest bytes from {url}"))?
+            .error_for_status()
+            .with_context(|| format!("registry error for {url}"))?;
+        resp.text().await.context("reading manifest bytes")
+    }
+
+    /// Fetch the detached signature sidecar, or `None` if the app is unsigned.
+    pub async fn fetch_signature(&self, name: &str) -> Result<Option<SignatureSidecar>> {
+        let url = format!("{}/apps/{}/ceapp.sig", self.base, name);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting signature from {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let sig: SignatureSidecar = resp
+            .error_for_status()
+            .with_context(|| format!("registry error for {url}"))?
+            .json()
+            .await
+            .context("decoding signature sidecar")?;
+        Ok(Some(sig))
     }
 }
 

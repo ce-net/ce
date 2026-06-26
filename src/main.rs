@@ -333,6 +333,12 @@ enum AppCommands {
         /// Apply the plan (write install records + shims) instead of a dry run.
         #[arg(long)]
         yes: bool,
+        /// Trust-on-first-use: record an unknown publisher and proceed (instead of refusing).
+        #[arg(long)]
+        tofu: bool,
+        /// Allow installing an unsigned app (no publisher signature). Not recommended.
+        #[arg(long)]
+        allow_unsigned: bool,
     },
     /// Show an app's manifest and resolved install plan from the registry.
     Info {
@@ -383,6 +389,33 @@ enum AppCommands {
         #[command(subcommand)]
         command: CtlCommands,
     },
+    /// Sign a `ceapp.toml` and publish it (manifest + signature) to the registry.
+    Publish {
+        /// Path to the ceapp.toml to publish.
+        path: String,
+        /// Also write the signed manifest + sidecar into this local dir (a servable registry).
+        #[arg(long)]
+        out: Option<String>,
+        /// ce-hub origin to upload the manifest + signature to (best-effort).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Manage the set of publisher keys this node trusts for installs.
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommands,
+    },
+}
+
+/// `ce app trust ...` — publisher trust management (the install gate).
+#[derive(Subcommand)]
+enum TrustCommands {
+    /// Trust a publisher node id for future installs.
+    Add { publisher: String },
+    /// Stop trusting a publisher.
+    Rm { publisher: String },
+    /// List trusted publishers.
+    Ls,
 }
 
 /// `ce app ctl ...` — the per-instance, capability-scoped app-facing control API.
@@ -1860,8 +1893,11 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
             }
         }
 
-        AppCommands::Install { name, on, registry, yes } => {
+        AppCommands::Install { name, on, registry, yes, tofu, allow_unsigned } => {
             let placement = ce_appmgr::Placement::parse(&on)?;
+            // Publisher trust gate: verify the app's signature and that its publisher
+            // is trusted (or trust-on-first-use) before any install side effect.
+            verify_publisher(&registry, &name, data_dir, tofu, allow_unsigned).await?;
             if !placement.is_local() {
                 // Global install: resolve the app, then ship its image to the target
                 // node over the mesh-deploy primitive (capability-authed). The remote
@@ -2073,8 +2109,184 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
                 ctl_serve(&store, data_dir, &sock, &registry, &hub).await?;
             }
         },
+
+        AppCommands::Publish { path, out, registry } => {
+            app_publish(data_dir, &path, out.as_deref(), registry.as_deref()).await?;
+        }
+
+        AppCommands::Trust { command } => match command {
+            TrustCommands::Add { publisher } => {
+                let pub_id = publisher.trim().to_lowercase();
+                if pub_id.len() != 64 || !pub_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(anyhow!("publisher must be a 64-hex node id"));
+                }
+                let mut set = load_trusted_publishers(data_dir);
+                if set.insert(pub_id.clone()) {
+                    save_trusted_publishers(data_dir, &set)?;
+                    println!("Trusting publisher {pub_id}");
+                } else {
+                    println!("Already trusting {pub_id}");
+                }
+            }
+            TrustCommands::Rm { publisher } => {
+                let pub_id = publisher.trim().to_lowercase();
+                let mut set = load_trusted_publishers(data_dir);
+                if set.remove(&pub_id) {
+                    save_trusted_publishers(data_dir, &set)?;
+                    println!("No longer trusting {pub_id}");
+                } else {
+                    println!("{pub_id} was not trusted");
+                }
+            }
+            TrustCommands::Ls => {
+                let set = load_trusted_publishers(data_dir);
+                if set.is_empty() {
+                    println!("No trusted publishers. Add one: ce app trust add <publisher-id>");
+                } else {
+                    for p in set {
+                        println!("{p}");
+                    }
+                }
+            }
+        },
     }
     Ok(())
+}
+
+// ===== M7: publish + manifest signing + trust =====
+
+fn trusted_publishers_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("trusted-publishers")
+}
+
+/// The set of publisher node ids this node trusts for installs (one 64-hex id/line).
+fn load_trusted_publishers(data_dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_to_string(trusted_publishers_path(data_dir))
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_lowercase())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_trusted_publishers(
+    data_dir: &std::path::Path,
+    set: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let body: String = set.iter().map(|p| format!("{p}\n")).collect();
+    std::fs::write(trusted_publishers_path(data_dir), body)?;
+    Ok(())
+}
+
+/// Sign a `ceapp.toml` with this node's identity and publish the manifest + a
+/// detached signature sidecar (to a local dir and/or a ce-hub origin).
+async fn app_publish(
+    data_dir: &std::path::Path,
+    path: &str,
+    out: Option<&str>,
+    registry: Option<&str>,
+) -> Result<()> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    let manifest = ce_appmgr::AppManifest::parse(&String::from_utf8_lossy(&bytes))
+        .with_context(|| format!("parsing {path}"))?;
+    let name = manifest.app.name.clone();
+
+    let identity = Identity::load_or_generate(&data_dir.join("identity"))?;
+    let publisher = identity.node_id_hex();
+    let signature = hex::encode(identity.sign(&bytes));
+    let sig = ce_appmgr::SignatureSidecar { publisher: publisher.clone(), signature };
+    let sig_json = serde_json::to_vec_pretty(&sig)?;
+
+    println!("publishing '{name}' signed by {publisher}");
+
+    if let Some(dir) = out {
+        let app_dir = std::path::Path::new(dir).join("apps").join(&name);
+        std::fs::create_dir_all(&app_dir)?;
+        std::fs::write(app_dir.join("ceapp.toml"), &bytes)?;
+        std::fs::write(app_dir.join("ceapp.sig"), &sig_json)?;
+        println!("  wrote {}", app_dir.join("ceapp.toml").display());
+        println!("  wrote {}", app_dir.join("ceapp.sig").display());
+    }
+
+    if let Some(hub) = registry {
+        let hub = hub.trim_end_matches('/');
+        let client = reqwest::Client::new();
+        for (suffix, body, ctype) in [
+            ("ceapp.toml", bytes.clone(), "text/plain"),
+            ("ceapp.sig", sig_json.clone(), "application/json"),
+        ] {
+            let url = format!("{hub}/apps/{name}/{suffix}");
+            let resp = client.put(&url).header("content-type", ctype).body(body).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => println!("  uploaded {url}"),
+                Ok(r) => println!("  note: {url} -> {} (hub may require owner auth)", r.status()),
+                Err(e) => println!("  note: upload to {url} failed: {e}"),
+            }
+        }
+    }
+
+    if out.is_none() && registry.is_none() {
+        println!("  (no --out or --registry; nothing written. Re-run with one.)");
+    }
+    Ok(())
+}
+
+/// Verify an app's publisher signature and trust before install. Refuses an
+/// untrusted publisher unless `tofu` (record + proceed), and an unsigned app unless
+/// `allow_unsigned`.
+async fn verify_publisher(
+    registry: &str,
+    name: &str,
+    data_dir: &std::path::Path,
+    tofu: bool,
+    allow_unsigned: bool,
+) -> Result<()> {
+    let reg = ce_appmgr::HubRegistry::new(registry);
+    let raw = reg.fetch_raw(name).await?;
+    let sig = reg.fetch_signature(name).await?;
+
+    let Some(sig) = sig else {
+        if allow_unsigned {
+            eprintln!("warning: installing UNSIGNED app '{name}' (--allow-unsigned)");
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "app '{name}' is unsigned — refuse by default. Re-run with --allow-unsigned to override, \
+             or ask the publisher to `ce app publish` a signed manifest."
+        ));
+    };
+
+    // Verify the Ed25519 signature over the exact manifest bytes.
+    let pub_id = sig.publisher.to_lowercase();
+    let node_id: [u8; 32] = hex::decode(&pub_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow!("signature publisher is not a 64-hex node id"))?;
+    let sig_bytes: [u8; 64] = hex::decode(&sig.signature)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow!("signature is not 128 hex chars"))?;
+    ce_identity::verify(&node_id, raw.as_bytes(), &sig_bytes)
+        .map_err(|e| anyhow!("signature verification FAILED for '{name}': {e}"))?;
+
+    // Trust check.
+    let mut trusted = load_trusted_publishers(data_dir);
+    if trusted.contains(&pub_id) {
+        return Ok(());
+    }
+    if tofu {
+        trusted.insert(pub_id.clone());
+        save_trusted_publishers(data_dir, &trusted)?;
+        eprintln!("trust-on-first-use: now trusting publisher {pub_id}");
+        return Ok(());
+    }
+    Err(anyhow!(
+        "publisher {pub_id} of '{name}' is not trusted. Trust it with `ce app trust add {pub_id}`, \
+         or re-run install with --tofu to trust-on-first-use."
+    ))
 }
 
 // ===== app-facing CtlAPI (M6): transport + security gates =====

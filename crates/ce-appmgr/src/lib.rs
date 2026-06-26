@@ -43,6 +43,6 @@ pub use run::{RunPlan, plan_run};
 pub use supervisor::{DaemonPolicy, RestartPolicy, daemon_policy, enabled_daemons};
 pub use placement::Placement;
 pub use platform::host_target;
-pub use registry::HubRegistry;
+pub use registry::{HubRegistry, SignatureSidecar};
 pub use resolver::{DepSpec, Plan, PlanItem, Registry, resolve};
 pub use store::{InstalledApp, Store, default_store};
