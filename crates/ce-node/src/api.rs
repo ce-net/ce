@@ -2183,10 +2183,30 @@ async fn publish_topic(State(state): State<ApiState>, Json(req): Json<PublishReq
         sig: sig.to_vec(),
     };
     let data = bincode::serialize(&msg).expect("serialize app pubsub");
-    match state.mesh_handle.publish_app(&req.topic, data).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "published" }))).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("publish failed: {e}")),
+    if let Err(e) = state.mesh_handle.publish_app(&req.topic, data).await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("publish failed: {e}"));
     }
+    // Self-delivery: gossipsub never echoes a message back to its own publisher, so without this a node
+    // that both publishes AND subscribes to a topic — the common case for an app served to browsers
+    // through this node's same-origin `/ce` bridge, where the publisher and the browser share this one
+    // node — would never receive its OWN messages. Deliver it to our local app bus immediately, exactly
+    // as a peer's would arrive (subscribers filter by topic). A cross-node publish still rides gossipsub.
+    let local = AppMessage {
+        from: hex::encode(state.host_node_id),
+        topic: req.topic,
+        payload_hex: hex::encode(&msg.payload),
+        received_at: now_secs(),
+        reply_token: None,
+    };
+    {
+        let mut ring = state.app_inbox.lock().await;
+        if ring.len() >= APP_INBOX_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(local.clone());
+    }
+    let _ = state.app_msg_tx.send(local);
+    (StatusCode::OK, Json(serde_json::json!({ "status": "published" }))).into_response()
 }
 
 // ----- Router -----
