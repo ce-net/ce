@@ -901,6 +901,10 @@ impl Mesh {
         rpc_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut dht_refresh = tokio::time::interval(Duration::from_secs(30));
         dht_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // relay_keepalive: re-dial any relay we've dropped, so a NAT'd node restores its circuit
+        // RESERVATION (and stays reachable) within seconds of the relay restarting — no node restart.
+        let mut relay_keepalive = tokio::time::interval(Duration::from_secs(5));
+        relay_keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -913,6 +917,9 @@ impl Mesh {
                 }
                 _ = rpc_sweep.tick() => {
                     self.sweep_pending_rpc();
+                }
+                _ = relay_keepalive.tick() => {
+                    self.redial_relays();
                 }
                 _ = dht_refresh.tick() => {
                     let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
@@ -954,6 +961,19 @@ impl Mesh {
                     .kademlia
                     .add_address(&peer_id, circuit.clone());
                 let _ = self.swarm.dial(circuit);
+            }
+        }
+    }
+
+    /// Re-dial any relay we are not currently connected to. On reconnect, `handle_event` re-listens
+    /// on the relay's `/p2p-circuit` (re-reserving the circuit), so a NAT'd node restores its
+    /// reachability automatically within ~5s of the relay (or our link) dropping — no manual restart.
+    fn redial_relays(&mut self) {
+        let relays: Vec<(PeerId, Multiaddr)> =
+            self.relay_peers.iter().map(|(p, a)| (*p, a.clone())).collect();
+        for (peer, addr) in relays {
+            if !self.swarm.is_connected(&peer) {
+                let _ = self.swarm.dial(addr);
             }
         }
     }
