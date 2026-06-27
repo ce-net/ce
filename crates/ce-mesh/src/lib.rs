@@ -654,6 +654,10 @@ pub struct Mesh {
     /// DHT under `addr_record_key(self)` so any peer — even one behind a different NAT that has never
     /// connected to us and shares no relay — can look up how to dial us.
     self_circuit_addrs: Vec<Multiaddr>,
+    /// Active circuit-reservation listeners, keyed by relay peer. We DROP a relay's listener when its
+    /// connection closes so a reconnect creates a FRESH (actually-reserving) one — otherwise a NAT'd
+    /// node keeps a dead reservation after a relay restart and silently stays unreachable.
+    relay_listeners: HashMap<PeerId, libp2p::core::transport::ListenerId>,
 }
 
 impl Mesh {
@@ -802,6 +806,7 @@ impl Mesh {
             pending_rpc_by_peer: HashMap::new(),
             bootstrapped: false,
             self_circuit_addrs: Vec::new(),
+            relay_listeners: HashMap::new(),
         };
 
         let handle = MeshHandle { cmd_tx };
@@ -1071,14 +1076,32 @@ impl Mesh {
     }
 
     async fn handle_event(&mut self, event: SwarmEvent<CeBehaviourEvent>, topics: &Topics) {
-        // Relay: when we connect to a registered relay, start listening on its circuit.
+        // Relay: when we connect to a registered relay, start listening on its circuit (reserve) —
+        // but only if we don't already hold a live listener for it, so duplicate connections don't
+        // pile up stale reservations.
         if let SwarmEvent::ConnectionEstablished { ref peer_id, .. } = event {
             if let Some(relay_ma) = self.relay_peers.get(peer_id).cloned() {
-                let circuit: Multiaddr = format!("{relay_ma}/p2p-circuit").parse()
-                    .expect("valid circuit multiaddr");
-                match self.swarm.listen_on(circuit) {
-                    Ok(_) => info!("relay circuit listening via {peer_id}"),
-                    Err(e) => warn!("relay circuit listen error: {e}"),
+                if !self.relay_listeners.contains_key(peer_id) {
+                    let circuit: Multiaddr = format!("{relay_ma}/p2p-circuit").parse()
+                        .expect("valid circuit multiaddr");
+                    match self.swarm.listen_on(circuit) {
+                        Ok(id) => {
+                            info!("relay circuit listening via {peer_id}");
+                            self.relay_listeners.insert(*peer_id, id);
+                        }
+                        Err(e) => warn!("relay circuit listen error: {e}"),
+                    }
+                }
+            }
+        }
+        // Relay disconnected: drop its now-DEAD circuit listener so the keepalive's reconnect makes a
+        // fresh reservation. Without this the node clings to a stale reservation after a relay restart
+        // and stays unreachable (scale test "disconnect/recover").
+        if let SwarmEvent::ConnectionClosed { ref peer_id, .. } = event {
+            if self.relay_listeners.contains_key(peer_id) && !self.swarm.is_connected(peer_id) {
+                if let Some(id) = self.relay_listeners.remove(peer_id) {
+                    self.swarm.remove_listener(id);
+                    info!("relay {peer_id} dropped — released stale reservation; will re-reserve on reconnect");
                 }
             }
         }
