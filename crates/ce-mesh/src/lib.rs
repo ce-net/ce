@@ -378,6 +378,9 @@ enum MeshCommand {
     PublishSignal(Vec<u8>),
     /// Dial a multiaddr to add a peer as a swarm connection hint.
     Dial(String),
+    /// Actively discover + dial a peer (DHT lookup + relay-circuit dial), so a subsequent stream to
+    /// it (e.g. a tunnel `open_stream`) has a live connection across NAT instead of failing.
+    Discover(PeerId),
     /// Send an RPC request to a specific peer; reply is delivered via `reply_tx`.
     SendRpc {
         peer_id: PeerId,
@@ -544,6 +547,13 @@ impl MeshHandle {
     /// Silently ignores invalid multiaddrs (logs a warning instead).
     pub async fn dial(&self, addr: String) -> Result<()> {
         self.send(MeshCommand::Dial(addr)).await
+    }
+
+    /// Actively establish a connection to `peer_id` (DHT lookup + relay-circuit dial). Fire-and-
+    /// forget; the connection comes up asynchronously. Call before opening a tunnel stream to a
+    /// NAT'd peer so `open_stream` has a live circuit to use.
+    pub async fn discover(&self, peer_id: PeerId) -> Result<()> {
+        self.send(MeshCommand::Discover(peer_id)).await
     }
 
     /// Send an RPC request to `peer_id` and await the response.
@@ -1287,6 +1297,9 @@ impl Mesh {
                 {
                     debug!("publish signal: {e}");
                 }
+            }
+            MeshCommand::Discover(peer_id) => {
+                self.discover_peer(peer_id);
             }
             MeshCommand::Dial(addr) => {
                 match addr.parse::<Multiaddr>() {

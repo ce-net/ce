@@ -1052,6 +1052,10 @@ async fn open_tunnel(State(state): State<ApiState>, Json(req): Json<TunnelReques
 
     let remote_port = req.remote_port;
     let control = state.tunnel_control.clone();
+    let mesh_handle = state.mesh_handle.clone();
+    // Establish the circuit connection up front (and keep it warm) so the first stream to a NAT'd
+    // peer doesn't fail — open_stream alone won't trigger the relay-circuit dial that the RPC path does.
+    let _ = mesh_handle.discover(peer_id).await;
     tokio::spawn(async move {
         loop {
             let conn = match listener.accept().await {
@@ -1063,8 +1067,9 @@ async fn open_tunnel(State(state): State<ApiState>, Json(req): Json<TunnelReques
             };
             let mut control = control.clone();
             let caps_bytes = caps_bytes.clone();
+            let mesh_handle = mesh_handle.clone();
             tokio::spawn(async move {
-                if let Err(e) = drive_tunnel_conn(&mut control, peer_id, conn, remote_port, &caps_bytes).await {
+                if let Err(e) = drive_tunnel_conn(&mut control, &mesh_handle, peer_id, conn, remote_port, &caps_bytes).await {
                     tracing::debug!("tunnel conn closed: {e}");
                 }
             });
@@ -1085,6 +1090,7 @@ async fn open_tunnel(State(state): State<ApiState>, Json(req): Json<TunnelReques
 /// Open a tunnel stream to `peer`, send the header, and splice `conn` to it both ways.
 async fn drive_tunnel_conn(
     control: &mut ce_mesh::StreamControl,
+    mesh_handle: &MeshHandle,
     peer: ce_mesh::CePeerId,
     mut conn: tokio::net::TcpStream,
     remote_port: u16,
@@ -1093,10 +1099,26 @@ async fn drive_tunnel_conn(
     use tokio::io::AsyncWriteExt;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let stream = control
-        .open_stream(peer, ce_mesh::TUNNEL_PROTOCOL)
-        .await
-        .map_err(|e| anyhow::anyhow!("open tunnel stream: {e}"))?;
+    // Two NAT'd peers only connect via the relay circuit, and `open_stream` won't dial it on its own.
+    // Trigger discovery and retry so a cold tunnel (no live connection yet) comes up instead of
+    // failing instantly the way it did before the cross-NAT fixes.
+    let mut stream = None;
+    for attempt in 0..6 {
+        match control.open_stream(peer, ce_mesh::TUNNEL_PROTOCOL).await {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => {
+                if attempt == 5 {
+                    return Err(anyhow::anyhow!("open tunnel stream: {e}"));
+                }
+                let _ = mesh_handle.discover(peer).await;
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+        }
+    }
+    let stream = stream.expect("loop returns or sets stream");
     let mut s = stream.compat();
     s.write_all(&remote_port.to_be_bytes()).await?;
     s.write_all(&(caps_bytes.len() as u32).to_be_bytes()).await?;
