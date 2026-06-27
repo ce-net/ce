@@ -76,6 +76,28 @@ pub fn service_key(service: &str) -> [u8; 32] {
     Sha256::digest(format!("ce-svc/{service}").as_bytes()).into()
 }
 
+/// DHT record key under which a node publishes its dialable (relay-circuit) addresses, keyed by its
+/// PeerId. Domain-separated (`ce-addr/`) from service ads (`ce-svc/`) and content cids so the
+/// keyspaces never collide.
+fn addr_record_key(peer: &PeerId) -> libp2p::kad::RecordKey {
+    libp2p::kad::RecordKey::new(&Sha256::digest(format!("ce-addr/{peer}").as_bytes()).to_vec())
+}
+
+/// The LAST `/p2p/<peer>` component of a multiaddr — for a relay-circuit address
+/// `…/p2p/<relay>/p2p-circuit/p2p/<target>` this is the dial *target* (`peer_id_from_multiaddr`
+/// returns the first, i.e. the relay).
+fn last_peer_id_from_multiaddr(ma: &Multiaddr) -> Option<PeerId> {
+    use libp2p::multiaddr::Protocol;
+    // Multiaddr's iterator isn't double-ended, so walk forward and keep the last /p2p/.
+    let mut last = None;
+    for p in ma.iter() {
+        if let Protocol::P2p(peer) = p {
+            last = Some(peer);
+        }
+    }
+    last
+}
+
 // ----- Wire types for chain sync -----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -628,6 +650,10 @@ pub struct Mesh {
     /// Set once we've kicked off the first Kademlia bootstrap (after the first connection gives us a
     /// peer to query). The periodic DHT refresh keeps the routing table warm thereafter.
     bootstrapped: bool,
+    /// Our own relay-circuit listen addresses (`<relay>/p2p-circuit/p2p/<self>`). Published to the
+    /// DHT under `addr_record_key(self)` so any peer — even one behind a different NAT that has never
+    /// connected to us and shares no relay — can look up how to dial us.
+    self_circuit_addrs: Vec<Multiaddr>,
 }
 
 impl Mesh {
@@ -775,6 +801,7 @@ impl Mesh {
             allowed_peers: std::collections::HashSet::new(),
             pending_rpc_by_peer: HashMap::new(),
             bootstrapped: false,
+            self_circuit_addrs: Vec::new(),
         };
 
         let handle = MeshHandle { cmd_tx };
@@ -870,6 +897,7 @@ impl Mesh {
                 }
                 _ = dht_refresh.tick() => {
                     let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+                    self.publish_self_addrs();
                 }
             }
         }
@@ -879,9 +907,84 @@ impl Mesh {
     /// Begin resolving an unconnected peer: query the DHT for the peers closest to it (which adds its
     /// address to our routing table) and attempt a direct dial (succeeds immediately if any behaviour
     /// already knows an address). Cheap and idempotent.
+    ///
+    /// Crucially, also dial the peer's **relay-circuit** address through every known relay. Two
+    /// nodes both behind NAT never connect directly until something bridges them — and a directed
+    /// RPC to a peer we've only ever heard about (e.g. `ce deploy --on <other-nat-node>`) has no
+    /// address to dial, so DHT discovery alone times out. Every node reserves a circuit on the
+    /// relay it bootstraps from, so `<relay>/p2p-circuit/p2p/<peer>` is a reachable address we can
+    /// construct from our own relays without any lookup.
     fn discover_peer(&mut self, peer_id: PeerId) {
         self.swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
         let _ = self.swarm.dial(peer_id);
+        // Authoritative path: fetch the addresses the peer published for itself (see
+        // `publish_self_addrs`). This resolves a peer reachable via ANY relay, not just one we share.
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .get_record(addr_record_key(&peer_id));
+        // Fast path for the common single-relay topology: construct + dial the peer's circuit address
+        // through every relay we know, so we don't wait on the DHT round-trip when we share a relay.
+        let relays: Vec<Multiaddr> = self.relay_peers.values().cloned().collect();
+        for relay_ma in relays {
+            if let Ok(circuit) =
+                format!("{relay_ma}/p2p-circuit/p2p/{peer_id}").parse::<Multiaddr>()
+            {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, circuit.clone());
+                let _ = self.swarm.dial(circuit);
+            }
+        }
+    }
+
+    /// Publish our relay-circuit addresses to the DHT so any peer can resolve how to dial us, even
+    /// across different relays / NATs with no prior contact. Idempotent; re-published periodically
+    /// because Kademlia records expire. No-op until we have a circuit address.
+    fn publish_self_addrs(&mut self) {
+        if self.self_circuit_addrs.is_empty() {
+            return;
+        }
+        let value = self
+            .self_circuit_addrs
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        let me = *self.swarm.local_peer_id();
+        let record = libp2p::kad::Record::new(addr_record_key(&me), value);
+        if let Err(e) = self
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .put_record(record, libp2p::kad::Quorum::One)
+        {
+            debug!("publish self addrs: {e}");
+        }
+    }
+
+    /// Add the dialable addresses a peer published (from a GetRecord result) and dial if we have an
+    /// RPC queued for it. The target PeerId is recovered from the circuit address's trailing `/p2p/`.
+    fn ingest_addr_record(&mut self, value: &[u8]) {
+        let Ok(text) = std::str::from_utf8(value) else {
+            return;
+        };
+        for line in text.lines() {
+            let Ok(ma) = line.parse::<Multiaddr>() else {
+                continue;
+            };
+            if let Some(peer) = last_peer_id_from_multiaddr(&ma) {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer, ma.clone());
+                if self.pending_rpc_by_peer.contains_key(&peer) && !self.swarm.is_connected(&peer) {
+                    let _ = self.swarm.dial(ma);
+                }
+            }
+        }
     }
 
     /// Send every RPC queued for `peer_id` now that a connection exists.
@@ -1003,6 +1106,19 @@ impl Mesh {
                 }
                 self.flush_pending_rpc(&peer_id);
                 let _ = self.event_tx.send(MeshEvent::PeerConnected(peer_id)).await;
+            }
+
+            // We started listening on a new address. If it's a relay-circuit address (how a NAT'd
+            // node is reachable), remember it and publish our address set to the DHT so peers can
+            // dial us.
+            SwarmEvent::NewListenAddr { ref address, .. }
+                if address.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)) =>
+            {
+                if !self.self_circuit_addrs.contains(address) {
+                    self.self_circuit_addrs.push(address.clone());
+                    self.publish_self_addrs();
+                }
+                info!("listening on {address}");
             }
 
             // Everything else: decode and forward to the node.
@@ -1180,24 +1296,32 @@ impl Mesh {
     /// Accumulate providers from a Kademlia `GetProviders` query and complete the pending
     /// `find_providers` call when the query's final progress step arrives.
     fn handle_kad_query(&mut self, id: kad::QueryId, result: kad::QueryResult, last: bool) {
-        if let kad::QueryResult::GetProviders(res) = result {
-            // Complete as soon as any provider is found — one is enough to attempt a fetch, and
-            // waiting for the query's final step can take tens of seconds. Otherwise wait for the
-            // last step (which may carry no providers, i.e. nobody has it).
-            let mut done = last;
-            if let Some((_, acc)) = self.pending_providers.get_mut(&id) {
-                if let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = &res {
-                    acc.extend(providers.iter().copied());
-                    if !acc.is_empty() {
-                        done = true;
+        match result {
+            kad::QueryResult::GetProviders(res) => {
+                // Complete as soon as any provider is found — one is enough to attempt a fetch, and
+                // waiting for the query's final step can take tens of seconds. Otherwise wait for the
+                // last step (which may carry no providers, i.e. nobody has it).
+                let mut done = last;
+                if let Some((_, acc)) = self.pending_providers.get_mut(&id) {
+                    if let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = &res {
+                        acc.extend(providers.iter().copied());
+                        if !acc.is_empty() {
+                            done = true;
+                        }
+                    }
+                }
+                if done {
+                    if let Some((tx, acc)) = self.pending_providers.remove(&id) {
+                        let _ = tx.send(acc.into_iter().collect());
                     }
                 }
             }
-            if done {
-                if let Some((tx, acc)) = self.pending_providers.remove(&id) {
-                    let _ = tx.send(acc.into_iter().collect());
-                }
+            // A peer's published address record (see `publish_self_addrs`): learn its dialable
+            // addresses and dial if we have an RPC queued for it.
+            kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(rec))) => {
+                self.ingest_addr_record(&rec.record.value);
             }
+            _ => {}
         }
     }
 }
@@ -1384,5 +1508,98 @@ mod conversion_tests {
         assert_eq!(req.from_node(), n);
         let app = RpcRequest::AppMessage { from_node: n, topic: "t".into(), payload: vec![] };
         assert_eq!(app.from_node(), n);
+    }
+}
+
+/// Tests for NAT-traversal address discovery: a node publishes its relay-circuit address to the DHT
+/// (`publish_self_addrs`), and a peer recovers + dials it (`ingest_addr_record`). These cover the
+/// pure key-derivation + multiaddr parsing the swarm-driven code relies on.
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use libp2p::PeerId;
+
+    fn circuit(relay: &PeerId, target: &PeerId) -> Multiaddr {
+        format!("/ip4/178.105.145.170/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}")
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn addr_record_key_is_deterministic() {
+        let p = peer_id_from_secret([11u8; 32]).unwrap();
+        assert_eq!(addr_record_key(&p), addr_record_key(&p));
+    }
+
+    #[test]
+    fn addr_record_key_differs_per_peer() {
+        let a = peer_id_from_secret([1u8; 32]).unwrap();
+        let b = peer_id_from_secret([2u8; 32]).unwrap();
+        assert_ne!(addr_record_key(&a), addr_record_key(&b));
+    }
+
+    #[test]
+    fn addr_record_key_domain_separated_from_services() {
+        // The address keyspace (`ce-addr/`) must not collide with the service keyspace (`ce-svc/`),
+        // even for the same string, or an address record could clobber a service advertisement.
+        let p = peer_id_from_secret([5u8; 32]).unwrap();
+        assert_ne!(addr_record_key(&p).to_vec(), service_key(&p.to_string()).to_vec());
+    }
+
+    #[test]
+    fn last_peer_id_extracts_circuit_target_not_relay() {
+        let relay = peer_id_from_secret([8u8; 32]).unwrap();
+        let target = peer_id_from_secret([9u8; 32]).unwrap();
+        let ma = circuit(&relay, &target);
+        // The FIRST /p2p/ is the relay; the LAST is the dial target. Mixing them up would make us
+        // try to RPC the relay instead of the peer — the exact bug this guards.
+        assert_eq!(peer_id_from_multiaddr(&ma).unwrap(), relay);
+        assert_eq!(last_peer_id_from_multiaddr(&ma).unwrap(), target);
+    }
+
+    #[test]
+    fn last_peer_id_handles_plain_p2p_address() {
+        let p = peer_id_from_secret([4u8; 32]).unwrap();
+        let ma: Multiaddr = format!("/ip4/9.9.9.9/tcp/4001/p2p/{p}").parse().unwrap();
+        assert_eq!(last_peer_id_from_multiaddr(&ma), Some(p));
+    }
+
+    #[test]
+    fn last_peer_id_none_without_p2p_component() {
+        let ma: Multiaddr = "/ip4/9.9.9.9/tcp/4001".parse().unwrap();
+        assert_eq!(last_peer_id_from_multiaddr(&ma), None);
+    }
+
+    #[test]
+    fn published_addr_record_roundtrips_to_targets() {
+        // `publish_self_addrs` joins addresses with '\n'; `ingest_addr_record` parses them back and
+        // recovers each target peer from the trailing /p2p/. Exercise that encode/decode contract.
+        let relay = peer_id_from_secret([20u8; 32]).unwrap();
+        let t1 = peer_id_from_secret([21u8; 32]).unwrap();
+        let t2 = peer_id_from_secret([22u8; 32]).unwrap();
+        let value = [circuit(&relay, &t1).to_string(), circuit(&relay, &t2).to_string()].join("\n");
+
+        let recovered: Vec<PeerId> = value
+            .lines()
+            .filter_map(|l| l.parse::<Multiaddr>().ok())
+            .filter_map(|m| last_peer_id_from_multiaddr(&m))
+            .collect();
+        assert_eq!(recovered, vec![t1, t2]);
+    }
+
+    #[test]
+    fn ingest_ignores_garbage_lines() {
+        let good = {
+            let relay = peer_id_from_secret([30u8; 32]).unwrap();
+            let target = peer_id_from_secret([31u8; 32]).unwrap();
+            circuit(&relay, &target).to_string()
+        };
+        let value = format!("not-a-multiaddr\n\n{good}\n///bogus");
+        let n = value
+            .lines()
+            .filter_map(|l| l.parse::<Multiaddr>().ok())
+            .filter_map(|m| last_peer_id_from_multiaddr(&m))
+            .count();
+        assert_eq!(n, 1, "only the one valid circuit address yields a target");
     }
 }
