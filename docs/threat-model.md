@@ -12,10 +12,13 @@ whole path **mint → pay → authorize → execute → contain**, designed fail
 > Sybil resistance over consensus weight only — the peer/DHT/relay/marketplace layer gets none from
 > PoW and needs its own economic defenses.** Paths C and D below summarize what that audit added to
 > this model. The audit's conclusion that PoW is the wrong backbone for CE led to a consensus
-> bake-off and a recommended replacement — **CE-TWLE** (VRF leader election weighted by
-> `min(bond, earned-work)`, zero wasted compute) — documented in [consensus.md](consensus.md). It
-> eliminates Path A's cheap-51% by removing PoW; its Phase 0 (a mandatory settlement burn that kills
-> the wash-trade leak) ships on the current chain first.
+> bake-off and a replacement — **CE-TWLE** (VRF leader election weighted by
+> `min(bond, earned-work)`, zero wasted compute) — documented in [consensus.md](consensus.md).
+> **This is now implemented** (the VRF seal swap, host bonds, equivocation slashing, and the 80%
+> settlement burn ship on `ce-chain`; see consensus.md §7): Path A's cheap-51% is eliminated by
+> removing PoW, and the settlement burn closes the wash-trade leak. Where the PoW-specific
+> "Defense (implemented)" wording below still says PoW/difficulty/cumulative-work, read it as
+> historical — the live chain is VRF-leader-elected with heaviest-weight fork choice.
 
 ## The three paths to running an attacker's code on a victim
 
