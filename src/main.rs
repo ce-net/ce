@@ -288,6 +288,19 @@ enum Commands {
     },
     /// Remove the background service installed by `ce install-service`.
     UninstallService,
+    /// Update the `ce` binary in place to the latest GitHub release (self-update).
+    ///
+    /// Downloads the release asset for this platform, verifies it runs, and atomically replaces
+    /// the running binary (using sudo only if its directory needs it). Run `ce update --restart`
+    /// to also restart the background service afterwards.
+    Update {
+        /// Reinstall even if already on the latest version.
+        #[arg(long)]
+        force: bool,
+        /// Restart the ce background service after updating (if one is installed).
+        #[arg(long)]
+        restart: bool,
+    },
     /// Show CE node logs (works on macOS and Linux).
     Logs {
         /// Number of recent lines to show (then follow).
@@ -1002,6 +1015,175 @@ fn uninstall_service() -> Result<()> {
     Err(anyhow!("uninstall-service is not supported on this platform"))
 }
 
+/// Self-update: download the latest GitHub release for this platform and atomically replace the
+/// running `ce` binary. Shells out to `tar`/`sudo` from the environment — no extra crates.
+async fn self_update(force: bool, restart: bool) -> Result<()> {
+    const REPO: &str = "ce-net/ce";
+    let current = env!("CARGO_PKG_VERSION");
+    let asset = update_asset_name()?;
+
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("ce/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    let rel: serde_json::Value = client
+        .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+        .send()
+        .await
+        .context("fetching latest release")?
+        .error_for_status()
+        .context("GitHub releases API")?
+        .json()
+        .await
+        .context("decoding release JSON")?;
+    let tag = rel["tag_name"]
+        .as_str()
+        .context("latest release has no tag_name")?;
+    let latest = tag.trim_start_matches('v');
+
+    if latest == current && !force {
+        println!("ce is already up to date (v{current}).");
+        return Ok(());
+    }
+    println!("Updating ce v{current} -> {tag} ...");
+
+    let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
+    let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}.{ext}");
+    let bytes = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("downloading {url}"))?
+        .error_for_status()
+        .with_context(|| format!("downloading {url}"))?
+        .bytes()
+        .await
+        .context("reading release bytes")?;
+
+    let tmp = std::env::temp_dir().join(format!("ce-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).context("creating temp dir")?;
+    let archive = tmp.join(format!("ce.{ext}"));
+    std::fs::write(&archive, &bytes).context("writing archive")?;
+
+    // `tar` extracts both .tar.gz and .zip on macOS/Linux and Windows 10+.
+    let ok = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&tmp)
+        .status()
+        .context("running tar")?
+        .success();
+    if !ok {
+        anyhow::bail!("failed to extract {}", archive.display());
+    }
+
+    let bin_name = if cfg!(windows) { "ce.exe" } else { "ce" };
+    let new_bin = tmp.join(bin_name);
+    if !new_bin.exists() {
+        anyhow::bail!("release archive did not contain {bin_name}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&new_bin, std::fs::Permissions::from_mode(0o755))
+            .context("chmod new binary")?;
+    }
+
+    // Verify the downloaded binary actually runs before we swap it in.
+    let out = std::process::Command::new(&new_bin)
+        .arg("--version")
+        .output()
+        .context("running the downloaded binary")?;
+    if !out.status.success() {
+        anyhow::bail!("downloaded binary failed its --version check");
+    }
+
+    let exe = std::env::current_exe().context("resolving current executable")?;
+    replace_binary(&new_bin, &exe)?;
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    println!(
+        "Updated: {} is now {}",
+        exe.display(),
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
+
+    if restart {
+        restart_service();
+    } else {
+        println!("Restart your node to run the new version (or re-run with --restart).");
+    }
+    Ok(())
+}
+
+/// The release asset base name for this platform (no extension).
+fn update_asset_name() -> Result<&'static str> {
+    Ok(match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "ce-linux-amd64",
+        ("linux", "aarch64") => "ce-linux-arm64",
+        ("macos", "x86_64") => "ce-macos-amd64",
+        ("macos", "aarch64") => "ce-macos-arm64",
+        ("windows", "x86_64") => "ce-windows-amd64",
+        (os, arch) => anyhow::bail!("no prebuilt release for {os}-{arch}; build from source"),
+    })
+}
+
+/// Replace `dst` with `src`, atomically when possible; escalate with sudo if the dir needs it.
+fn replace_binary(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    let dir = dst.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let staged = dir.join(".ce-update.tmp");
+    if std::fs::copy(src, &staged).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
+        }
+        // Same directory => same filesystem => atomic rename over the running binary (allowed on
+        // Unix even while executing).
+        return std::fs::rename(&staged, dst)
+            .with_context(|| format!("replacing {}", dst.display()));
+    }
+    // No write permission to the install dir: fall back to sudo on Unix.
+    #[cfg(unix)]
+    {
+        let ok = std::process::Command::new("sudo")
+            .arg("install")
+            .arg("-m")
+            .arg("755")
+            .arg(src)
+            .arg(dst)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "cannot write {} — try `sudo ce update`, or re-run the installer",
+        dst.display()
+    )
+}
+
+/// Best-effort restart of the ce background service (systemd user, then system).
+fn restart_service() {
+    let attempts: &[(&str, &[&str])] = &[
+        ("systemctl", &["--user", "restart", "ce"]),
+        ("systemctl", &["restart", "ce"]),
+    ];
+    for (cmd, args) in attempts {
+        if let Ok(s) = std::process::Command::new(cmd).args(*args).status() {
+            if s.success() {
+                println!("Restarted the ce service ({cmd} {}).", args.join(" "));
+                return;
+            }
+        }
+    }
+    println!("Could not auto-restart the service; restart your node manually.");
+}
+
 fn show_logs(lines: usize) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -1147,6 +1329,10 @@ async fn main() -> Result<()> {
 
         Commands::UninstallService => {
             uninstall_service()?;
+        }
+
+        Commands::Update { force, restart } => {
+            self_update(force, restart).await?;
         }
 
         Commands::Logs { lines } => {
