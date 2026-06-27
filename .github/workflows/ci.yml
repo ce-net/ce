@@ -89,6 +89,8 @@ jobs:
     # dev binary (e.g. a relay node update) can be built on demand without cutting a release.
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
+    # A wedged runner must fail (and free the release) rather than hang for hours.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -100,7 +102,9 @@ jobs:
             os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
           - name: macos-amd64
-            os: macos-13
+            # Cross-compile on Apple Silicon (plentiful runners). The dedicated Intel runner
+            # (macos-13) is scarce and chronically stalls in the queue, blocking the release.
+            os: macos-14
             target: x86_64-apple-darwin
           - name: macos-arm64
             os: macos-14
@@ -162,7 +166,9 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # `always()` so one failed/dropped build leg (e.g. a stalled macOS runner) can't block the
+    # release — it publishes with whatever artifacts uploaded. Still tag-gated.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write
     steps:
