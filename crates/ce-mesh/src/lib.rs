@@ -983,11 +983,35 @@ impl Mesh {
     /// Re-dial any relay we are not currently connected to. On reconnect, `handle_event` re-listens
     /// on the relay's `/p2p-circuit` (re-reserving the circuit), so a NAT'd node restores its
     /// reachability automatically within ~5s of the relay (or our link) dropping — no manual restart.
+    /// Reconcile every relay to the invariant: **connected ⇒ holds a live circuit reservation;
+    /// disconnected ⇒ re-dialing**. This is level-triggered (runs every keepalive tick) rather than
+    /// edge-triggered, because the connect/close events race on a relay restart: libp2p often emits
+    /// `ConnectionEstablished` (new conn) BEFORE `ConnectionClosed` (old conn), so the event-time
+    /// re-listen is skipped (listener still present) and the close then drops it — leaving the node
+    /// connected with NO reservation, silently unreachable. Reconciling on a timer fixes that for good.
     fn redial_relays(&mut self) {
         let relays: Vec<(PeerId, Multiaddr)> =
             self.relay_peers.iter().map(|(p, a)| (*p, a.clone())).collect();
         for (peer, addr) in relays {
-            if !self.swarm.is_connected(&peer) {
+            if self.swarm.is_connected(&peer) {
+                // Connected but missing a circuit listener (e.g. lost the close/establish race):
+                // reserve now so we stay reachable.
+                if !self.relay_listeners.contains_key(&peer) {
+                    if let Ok(circuit) = format!("{addr}/p2p-circuit").parse::<Multiaddr>() {
+                        match self.swarm.listen_on(circuit) {
+                            Ok(id) => {
+                                info!("relay {peer}: re-reserving circuit (keepalive reconcile)");
+                                self.relay_listeners.insert(peer, id);
+                            }
+                            Err(e) => debug!("reconcile listen on {peer}: {e}"),
+                        }
+                    }
+                }
+            } else {
+                // Disconnected: drop any now-dead listener and re-dial so we reconnect + re-reserve.
+                if let Some(id) = self.relay_listeners.remove(&peer) {
+                    self.swarm.remove_listener(id);
+                }
                 let _ = self.swarm.dial(addr);
             }
         }
