@@ -64,6 +64,23 @@
 - Chain tests use the genesis/bootstrap weight fallback (e.g. `set_genesis_weights`) — there is no PoW to slow CI; the old `difficulty = 1` trick is obsolete
 - Use `NEXT_PORT` atomic counter in local integration tests to avoid port conflicts
 
+## Bug-fix methodology — MANDATORY, GLOBAL across all of ce-net
+
+Every bug fix, in **every repo and component** (node, SDKs, apps, services — no exceptions), follows
+reproduce-first TDD:
+
+1. **Write an automated test that reproduces the bug.** It must **fail first**, proving it captures the
+   real defect. No fixing on a hunch.
+2. **Diagnose the exact root cause** from the failing repro (read the logs/state).
+3. **Fix** the bug.
+4. The test goes **green**.
+5. **Leave the test in the suite forever** as a regression guard — never delete it after the fix.
+
+Reproduce-first finds the *actual* cause (guessing on live machines wastes cycles) and the kept test
+stops the bug silently returning. Mesh/relay/onboarding repros live as automated E2E in
+`crates/ce-deploy/*-e2e.sh` (+ `tests/onboarding_e2e.rs` for real VMs); use the analogous home in each
+other repo.
+
 ## Commits
 
 - Author: Leif Rydenfalk <ledamecrydenfalk@gmail.com>
