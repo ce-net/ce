@@ -19,7 +19,7 @@ added.
 ## Why
 
 Billing today is one `Heartbeat` tx every ~30s per running cell. At a few thousand cells that
-is already most of the chain's tx volume; at millions it is impossible — a single PoW chain
+is already most of the chain's tx volume; at millions it is impossible — a single global chain
 cannot ingest millions of micropayments per interval. We must move the *stream* of
 micropayments **off-chain** and only touch the chain to open and close a channel.
 
@@ -47,8 +47,10 @@ payer↔host (you open a channel with each host you run sustained work on).
    transport); they never hit the chain. Millions of them cost nothing.
 
 3. **Close / settle** — `ChannelClose { channel_id, cumulative, payer_sig }` submitted on-chain
-   (normally by the host, redeeming the latest receipt). Pays `cumulative` to the host and
-   returns `capacity − cumulative` to the payer. One tx. Two on-chain txs total, regardless of
+   (normally by the host, redeeming the latest receipt). Debits the payer the full gross
+   `cumulative`, credits the host `cumulative − settlement_burn(cumulative)` (the same 80%
+   settlement burn as `JobSettle` — the host keeps one fifth), and returns `capacity − cumulative`
+   to the payer. One tx. Two on-chain txs total, regardless of
    how many micropayments flowed.
 
 4. **Timeout** — if the channel reaches `expiry_height` unclosed, the payer reclaims the full
@@ -89,7 +91,8 @@ New `TxKind` variants (integer base units throughout, never floats):
 - `ChannelClose { channel_id, cumulative: u128, payer_sig: [u8;64] }` — `payer_sig` over
   `channel_close_bytes(channel_id, host, cumulative)` (host bound, v2-style). Validated: channel
   open, `cumulative ≤ capacity`, sig verifies; opens/advances the dispute window; on finalize,
-  moves `cumulative` payer→host and unlocks the remainder.
+  debits the payer `cumulative`, credits the host `cumulative` net of the settlement burn, and
+  unlocks the remainder.
 - `ChannelExpire { channel_id, payer }` — payer reclaims after `expiry_height`.
 
 Chain caches: `open_channels: channel_id → (payer, host, capacity, expiry_height, best_cumulative, close_height?)`, parallel to `open_bids`. `NodeStats` gains channel settlements toward reputation (earned/spent already cover the redeemed amount).

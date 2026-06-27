@@ -118,21 +118,28 @@ curl -X POST http://localhost:8844/jobs/bid \
 
 | Crate | Description |
 |---|---|
-| `ce-identity` | Ed25519 keypair, node ID, sign, verify |
-| `ce-chain` | Blockchain, uptime emission, transactions, balance, persistence |
-| `ce-mesh` | libp2p networking — Kademlia DHT + Gossipsub, chain sync |
-| `ce-container` | Docker container management, gVisor isolation, resource limits |
-| `ce-node` | Orchestrator: ties everything together, HTTP API, mining loop |
-| `ce-protocol` | ce-protocol-1 (CEP-1) cell signaling wire format |
-| `ce-deploy` | Hetzner provisioning and SSH deployment for E2E tests |
+| `ce-identity` | Ed25519 keypair, the 32-byte NodeId (the node's only identifier), sign/verify |
+| `ce-cap` | CE's single trust primitive: verify signed, attenuating capability chains rooted at trusted keys |
+| `ce-tls` | TLS-from-identity: self-signed certs keyed by the node's Ed25519 identity, NodeId-pinned (no CA) |
+| `ce-runtime` | Execution-runtime seam: the `Workload` type and backend-agnostic `Runtime` trait (Docker, WASM) |
+| `ce-guard` | Pre-execution screening seam (`Guardian` trait + verdict); policy/AI lives in the ce-guardian app |
+| `ce-wasm` | WebAssembly execution backend: a wasmtime `Runtime`, content-addressed modules, fuel-metered, memory-capped |
+| `ce-appmgr` | Universal app & system manager: install/resolve/sandbox/supervise any app via `ceapp.toml` (oci/native/wasm/recipe) |
+| `ce-chain` | Ledger + economy: transaction types, VRF leader election + uptime emission, balances/escrow, persistence (bincode+zstd) |
+| `ce-mesh` | libp2p networking — Kademlia DHT + Gossipsub, chain sync, QUIC/AutoNAT/DCUtR/relay NAT traversal |
+| `ce-container` | Docker-backed workload execution (bollard), gVisor isolation, CPU/mem/network limits; one `Runtime` backend |
+| `ce-node` | Orchestrator: axum HTTP API, block-production loop, mesh event loop, job manager, runtime registry |
+| `ce-protocol` | ce-protocol-1 (CEP-1) cell signaling wire format (CellSignal, BurnProof) |
+| `ce-deploy` | Hetzner provisioning and SSH deployment for the E2E test suite (operator tooling, not in the runtime path) |
 
 ### Credit model
 
-Nodes earn credits by staying online and mining blocks. Credits are spent to run containers on other nodes.
+Nodes earn credits by staying online and producing blocks when elected leader. Credits are spent to run containers on other nodes.
 
-- Block production: every 10 seconds, the node seals a block and includes one `UptimeReward` tx for itself
+- Consensus is VRF leader election (not PoW): each ~10s slot, the node with a valid VRF ticket below its weight-proportional threshold produces the block. Consensus weight `W = min(bond, earned-work-score)`.
+- Block production: roughly every 10 seconds the elected leader produces a block carrying one `UptimeReward` tx
 - Emission starts at 1,000 credits/block, halves every 210,000 blocks, hard cap 21 billion
-- Running a job debits the payer; the host earns the settlement cost
+- Running a job debits the payer; the host earns the settlement cost, minus a protocol burn (80% of each settlement is destroyed — the provider keeps one fifth)
 - No balance → `POST /jobs/bid` returns 402
 
 ### Transaction types
@@ -140,12 +147,16 @@ Nodes earn credits by staying online and mining blocks. Credits are spent to run
 | Type | Who signs | Effect |
 |---|---|---|
 | `Transfer` | sender | Move credits between nodes |
-| `UptimeReward` | miner | Mint credits for the block producer |
+| `UptimeReward` | leader | Mint credits for the elected block producer |
 | `JobBid` | payer | Broadcast an open offer for compute; `bid` credits are locked |
-| `JobSettle` | host (+ payer co-sig) | Confirm job completion, transfer cost (≤ bid) |
+| `JobSettle` | host (+ payer co-sig) | Confirm job completion, transfer cost (≤ bid); 80% of cost is burned |
 | `JobExpire` | payer | Reclaim locked credits after EXPIRY_BLOCKS (1440) with no settlement |
-| `TrustGrant` | grantor | Record on-chain that grantor trusts grantee as a named device |
-| `Heartbeat` | host | Periodic billing for a running cell: debits cell, credits host |
+| `Heartbeat` | host | Periodic billing for a running cell: debits cell, credits host (same burn) |
+| `ChannelOpen` / `ChannelClose` / `ChannelExpire` | payer / host / payer | Off-chain micropayment channel lifecycle (see docs/payment-channels.md) |
+| `NameClaim` | claimant | Claim a unique human-readable name (first claim wins) |
+| `RevokeCapability` | issuer | Revoke a capability the issuer minted (by issuer+nonce) |
+| `HostBond` / `HostUnbond` | host | Post / withdraw the slashable host bond that backs consensus weight |
+| `SlashEquivocation` | reporter | Burn an equivocating host's bond (25% to the reporter) |
 
 ### Job lifecycle
 
@@ -186,7 +197,7 @@ libp2p 0.53, six Gossipsub topics:
 | Topic | Purpose |
 |---|---|
 | `ce-transactions` | Broadcast pending txs |
-| `ce-blocks` | Broadcast newly mined blocks |
+| `ce-blocks` | Broadcast newly produced blocks |
 | `ce-heights` | Height announcements for sync triggering |
 | `ce-syncreq` | Request blocks from a given height |
 | `ce-syncresp` | Serve blocks to syncing nodes (up to 500/batch, 4MB max) |
@@ -245,9 +256,19 @@ See [docs/api.md](docs/api.md) for the complete reference.
 | GET | `/transactions/stream` | SSE push stream — every accepted transaction |
 | POST | `/signals/send` | Sign and broadcast a CEP-1 signal |
 | GET | `/atlas` | Peer capacity atlas from capacity advertisements |
-| PUT | `/sync/*path` | Upload a file (CE identity auth, must be trusted device) |
-| GET | `/sync/*path` | Download a file (CE identity auth, must be trusted device) |
-| POST | `/exec` | Run a command remotely (CE identity auth, must be trusted device) |
+| GET | `/netgraph` | Per-peer RTT latency graph |
+| POST | `/blobs`, GET `/blobs/:hash` | Content-addressed blob store (sha256, 128 MiB limit) |
+| POST | `/mesh/send`, GET `/mesh/messages` | Directed signed app messages + inbound snapshot/stream |
+| POST | `/mesh/request`, `/mesh/reply` | Mesh-app request/reply (the `serve` pattern) |
+| POST | `/mesh/publish`, `/mesh/subscribe` | App pub/sub over a topic |
+| POST | `/names/claim`, GET `/names/:name` | Claim / resolve human-readable names |
+| POST | `/discovery/advertise`, GET `/discovery/find/:service` | DHT service discovery |
+| POST | `/channels/open`, `/channels/receipt`, `/channels/:id/close` | Payment channels |
+| POST | `/mesh-deploy`, `/mesh-kill`, `/mesh-app-install` | Directed placement / app install on a host |
+| POST | `/tunnel` | Open a raw mesh stream (port forward) |
+
+Remote `exec` / file `sync` are no longer node routes — they moved to the `rdev` app. See
+[docs/api.md](docs/api.md) for the complete, current endpoint reference.
 
 ## Data Directory
 
@@ -258,33 +279,53 @@ Default: `~/.local/share/ce/`
 ├── identity/
 │   └── node.key          # Ed25519 secret key (chmod 600)
 └── chain/
-    └── chain.json        # Full blockchain (JSON)
+    └── chain.json        # Full blockchain (bincode + zstd; .json name is legacy)
 ```
 
 ## CLI
 
 ```
+# Node lifecycle
 ce start [--port 4001] [--api-port 8844] [--bootstrap <multiaddr>] [--relay <multiaddr>]
+         [--no-mine] [--light] [--tls] [--ephemeral] [--no-mdns] [--api-bind <addr>]
 ce status
 ce balance
 ce id
+ce install-service / ce uninstall-service / ce logs   # run ce as a system service
+
+# Identity key (TTY-only; key material never crosses the API)
+ce key backup / ce key restore / ce key fingerprint
 
 # Capabilities (authorize others on your resources; see docs/capabilities.md)
 ce grant <node-id> --can exec,sync,tunnel --expires 90d   # issue a capability token
 ce revoke <nonce>                   # revoke a capability you issued (on-chain)
-ce wallet add <alias> <node-id> --cap <token>   # hold a capability you were issued
 ce tunnel <alias> 2222:22           # forward a local port to a peer over the mesh
 
 # Remote exec + file sync/mirror are the `rdev` app (built on CE primitives):
 #   rdev exec <alias> --image rust -- cargo build
 #   rdev watch ~/code <alias>:code     # continuous 1:1 folder mirror
 
+# Wallet (credits + held capabilities)
+ce wallet balance | history | send <node-id> <credits> | watch | ls | rm <alias>
+ce wallet add <alias> <node-id> --cap <token>   # hold a capability you were issued
+
+# Payment channels (off-chain micropayments)
+ce channel open <node-id> <capacity> | ls | receipt <id> <amount> | close <id> | expire <id>
+
+# Names + discovery
+ce name claim <name> | resolve <name>
+ce discover advertise <service> | find <service>
+
 # Cell economy
-ce deploy <image> [--fund N] [--cpu N] [--mem N] [--duration N]
-                                    # submit a job bid on the local node
+ce deploy <image> [--on <device>] [--fund N] [--cpu N] [--mem N] [--duration N]
+                                    # submit a job bid locally, or place on a host over the mesh
 ce ps [--api-port N]                # list all jobs on this node
-ce kill <job-id> [--api-port N]     # force-stop a job
+ce kill <job-id> [--on <device>]    # force-stop a job (locally or on a remote host)
 ce fund <node-id> <credits>         # transfer credits to another node
 ce run <cell-id> [payload-hex] [--burn-tx <tx-id>]
                                     # send a CEP-1 signal to a cell
+
+# Apps (the universal app/system manager — see PLAN/ce-app-package-runtime.md)
+ce app install <slug> [--on <device>] | info | ls | ps | uninstall <slug>
+ce app run <slug> | daemon <slug> | kill <slug> | ctl <slug> ... | publish | trust <node-id>
 ```

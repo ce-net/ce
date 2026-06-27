@@ -1,7 +1,8 @@
 //! ce-node — the orchestrator that ties ce-net together on a host.
 //!
-//! Runs the node process for **ce-net** (a compute marketplace on a proof-of-work blockchain):
-//! the axum HTTP API, the mining loop (always in `spawn_blocking` — PoW is CPU-bound), the mesh
+//! Runs the node process for **ce-net** (a compute marketplace on a VRF-leader-elected blockchain):
+//! the axum HTTP API, the block-production loop (one VRF eval + a signature when this node is the
+//! elected slot leader — not PoW mining), the mesh
 //! event loop ([`ce_mesh`]), and the job manager (bid, settle, expire, 30s heartbeats, capacity
 //! broadcast). It wires the chain, identity, mesh, the capability verifier (re-exported below as
 //! [`capability`]), and the runtime registry (`Vec<Arc<dyn Runtime>>`) into one running node.

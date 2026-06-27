@@ -192,6 +192,11 @@ pub struct Daemon {
     pub args: Vec<String>,
     #[serde(default = "default_restart")]
     pub restart: String,
+    /// Secret/config env-var NAMES this daemon needs (NOT values). The supervisor injects them from
+    /// ce-iam at spawn (`ce-iam secret use --ns app:<name> <names> -- <bin>`), so the values live in the
+    /// ce-iam vault (scoped, managed), never in this manifest, on disk, or in a stored env. Empty = none.
+    #[serde(default)]
+    pub secrets: Vec<String>,
     /// Liveness probe the single ce supervisor polls (URL or command).
     #[serde(default)]
     pub health: Option<String>,

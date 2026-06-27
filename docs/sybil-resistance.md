@@ -153,9 +153,11 @@ that to the verification dial (§4.2); it is no longer an unauthorized-billing h
 **E4 — Wash-traded reputation.** `JobSettle` validates the payer co-signature and `cost <= bid`
 but never verifies the host executed anything (`ce-chain/src/lib.rs:905`). One attacker runs
 payer A + host B and self-settles to fabricate B's `/history` track record. Downgraded to **low**
-on verification: the wash trade only moves the attacker's *own* credits between its own identities
-(net-zero minus nothing, since no fee), so it buys a fake reputation but costs real mined credits
-to stage, and only pays off if some honest party later trusts that reputation. It is the
+on verification: the wash trade moves the attacker's *own* credits between its own identities, but
+this is **no longer net-zero** — the 80% settlement burn (implemented; see [consensus.md](consensus.md)
+Phase 0) destroys four fifths of every self-settled `cost`, so each wash cycle burns real value. It
+buys a fake reputation but bleeds credits to stage it, and only pays off if some honest party later
+trusts that reputation. It is the
 **EigenTrust self-promotion / whitewashing** problem (any reputation system with free identities
 and positive-feedback scoring is Sybil-vulnerable unless anchored to a cost). Fix: anchor
 reputation to a bond, and never let reputation alone buy out redundant verification on high-value

@@ -34,7 +34,7 @@ Node status snapshot.
 {
   "node_id": "a3f2...64 hex chars",
   "height": 1042,
-  "difficulty": 4,
+  "difficulty": 0,
   "balance": "987000",
   "circulating_supply": "1042000000000000000000",
   "burned_total": "5000000000000000000",
@@ -50,7 +50,7 @@ Node status snapshot.
 |---|---|---|
 | `node_id` | string | 64-hex-char Ed25519 public key (= this node's identity) |
 | `height` | integer | Index of the tip block (0 = only genesis) |
-| `difficulty` | integer | Vestigial PoW field, always 0 in uptime-emission model |
+| `difficulty` | integer | Vestigial (former PoW difficulty); 0 on any live chain past genesis under VRF leader election. Not used for consensus. |
 | `balance` | string | This node's credit balance, base units (decimal string) |
 | `circulating_supply` | string | Total emitted minus total burned, base units (decimal string) |
 | `burned_total` | string | Credits destroyed by the settlement burn (see below), base units (decimal string) |
@@ -354,9 +354,9 @@ node id → `400`.
 
 ## GET /beacon
 
-Verifiable public randomness from the PoW chain tip — unpredictable (it took work to find) and
-globally agreed. Seed reproducible, auditable host selection from `hash` so nobody can be shown
-to have cherry-picked who ran the work.
+Verifiable public randomness from the chain tip — globally agreed and seeded by the VRF leader
+proof, so no single party can grind or predict it ahead of the slot. Seed reproducible, auditable
+host selection from `hash` so nobody can be shown to have cherry-picked who ran the work.
 
 **Response** `200 OK`
 ```json
@@ -443,7 +443,7 @@ curl -N http://localhost:8844/blocks/stream
 
 **Response** `text/event-stream`
 ```
-data: {"index":42,"hash":"a1b2...","prev_hash":"9f0e...","timestamp":1716634800,"miner":"a3f2...","tx_count":3,"nonce":12345}
+data: {"index":42,"hash":"a1b2...","prev_hash":"9f0e...","timestamp":1716634800,"miner":"a3f2...","tx_count":3,"nonce":0}
 ```
 
 | Field | Type | Description |
@@ -452,9 +452,9 @@ data: {"index":42,"hash":"a1b2...","prev_hash":"9f0e...","timestamp":1716634800,
 | `hash` | string | 64-hex block hash |
 | `prev_hash` | string | 64-hex hash of the previous block |
 | `timestamp` | integer | Unix seconds when the block was sealed |
-| `miner` | string | 64-hex NodeId of the block producer |
+| `miner` | string | 64-hex NodeId of the block producer (the elected VRF leader; field name is legacy) |
 | `tx_count` | integer | Number of transactions in the block |
-| `nonce` | integer | PoW nonce |
+| `nonce` | integer | Vestigial (former PoW nonce); always 0 under VRF leader election |
 
 ---
 
@@ -475,7 +475,7 @@ data: {"id":"c3d4...","origin":"a3f2...","kind":"Transfer","amount":500}
 |---|---|---|
 | `id` | string | 64-hex transaction ID (SHA256 of the serialised tx) |
 | `origin` | string | 64-hex NodeId of the signer |
-| `kind` | string | `Transfer` \| `UptimeReward` \| `JobBid` \| `JobSettle` \| `JobExpire` \| `TrustGrant` \| `Heartbeat` |
+| `kind` | string | `Transfer` \| `UptimeReward` \| `JobBid` \| `JobSettle` \| `JobExpire` \| `Heartbeat` \| `ChannelOpen` \| `ChannelClose` \| `ChannelExpire` \| `NameClaim` \| `RevokeCapability` \| `HostBond` \| `HostUnbond` \| `SlashEquivocation` |
 | `amount` | integer | Credit amount (0 for kinds without one) |
 
 ---
@@ -554,6 +554,195 @@ Stop a mesh-deployed job. Body: `{ "node_id": "<64 hex>", "job_id": "<64 hex>", 
 **Response** `204 No Content`. Errors mirror `/mesh-deploy`.
 
 (Remote exec / file sync are the `rdev` app over `AppRequest`, not node endpoints.)
+
+### POST /mesh-app-install
+
+Install a published ceapp on a specific remote host over the mesh (the native counterpart to
+`/mesh-deploy`). The local node packages an `AppInstall` RPC with the caller's capability and
+sends it to the target, which runs its local appmgr install flow.
+
+**Request body**
+```json
+{
+  "node_id": "<64 hex>",        // target host
+  "hint_multiaddr": "",          // optional relay circuit dial hint
+  "app": "clip",                 // published ceapp slug to resolve on the target
+  "registry": "https://hub...",  // registry/blob origin the target resolves from
+  "grant": null                   // optional scoped grant token
+}
+```
+**Response** `200 OK` → `{ "app": "clip", "version": "1.2.0" }`. Errors: `400` bad node_id,
+`502` host rejected, `504` mesh timeout.
+
+---
+
+## App messaging & pub/sub
+
+The mesh app-messaging primitive: directed messages, sync request/reply, and topic pub/sub over
+libp2p (`AppMessage`/`AppRequest` RPCs + gossipsub). This is what `ce_rs::serve` and the SDK
+`serve`/`locate` helpers are built on. Payloads are opaque, hex-encoded. A message addressed to
+**this node's own NodeId** is delivered to the node's local apps in-process (libp2p cannot dial
+self), so co-located apps can talk over the same API.
+
+### POST /mesh/send
+
+Send a directed, signed application message to a node. The receiver enqueues it for its local app.
+
+**Request body** `{ "to": "<64 hex>", "topic": "myapp", "payload_hex": "deadbeef" }`
+**Response** `200 OK` → `{ "status": "delivered" }`. Errors: `400` bad recipient/hex, `502` mesh
+send failed.
+
+### GET /mesh/messages
+
+Snapshot of recently-received app messages (a bounded ring buffer).
+**Response** `200 OK` → array of `{ from, topic, payload_hex, received_at, reply_token }`.
+
+### GET /mesh/messages/stream
+
+SSE push stream (`text/event-stream`) of inbound app messages, same shape as `/mesh/messages`.
+
+### POST /mesh/request
+
+Send a request to a node and **wait for its app's reply** (sync request/response). The peer's app
+answers via `/mesh/reply`.
+
+**Request body** `{ "to": "<64 hex>", "topic": "myapp", "payload_hex": "...", "timeout_ms": 30000 }`
+**Response** `200 OK` → `{ "payload_hex": "..." }`. Errors: `504` peer app did not reply in time.
+
+### POST /mesh/reply
+
+Answer a request previously received with a `reply_token`.
+**Request body** `{ "token": 12345, "payload_hex": "..." }`
+**Response** `200 OK` → `{ "status": "replied" }`.
+
+### POST /mesh/subscribe
+
+Subscribe this node to a pub/sub topic so received messages land in the inbox + stream. Idempotent;
+lasts the node's lifetime. **Request body** `{ "topic": "myapp" }` → `{ "status": "subscribed" }`.
+
+### POST /mesh/publish
+
+Publish a signed message to a topic (the node signs with its identity so subscribers verify
+authorship, and subscribes itself so it's in the topic mesh).
+**Request body** `{ "topic": "myapp", "payload_hex": "..." }` → `{ "status": "published" }`.
+
+---
+
+## Content-addressed blobs
+
+A minimal content-addressed store (precursor to the data layer). `Workload::Wasm { module_hash }`
+modules are resolved from here. The sha256 hash is self-verifying, so blobs are immutable and
+tamper-evident; a local miss falls through to a trustless mesh fetch (find providers via the DHT,
+verify bytes against the hash, then cache + re-announce so popular data self-replicates).
+
+### POST /blobs
+
+Upload raw bytes (not JSON; send the body as-is). Max body 128 MiB.
+**Response** `201 Created` → `{ "hash": "<64 hex sha256>" }`.
+
+### GET /blobs/:hash
+
+Fetch a blob by its 64-hex sha256. **Response** `200 OK` with the raw bytes, or `404` if not found
+locally or in the mesh.
+
+---
+
+## Paid data fetch
+
+### POST /data/fetch
+
+Paid chunk fetch: sign a payment-channel receipt and pull a chunk from a provider over the mesh,
+paying as you go. Called on the **payer** node; the provider verifies the receipt before serving,
+and the returned bytes are verified against `cid` before caching.
+
+**Request body**
+```json
+{
+  "provider": "<64 hex>",        // channel host to fetch from and pay
+  "cid": "<64 hex sha256>",      // chunk to fetch
+  "channel_id": "<64 hex>",      // open channel the payer holds with the provider
+  "cumulative": "1000000000000000000"  // monotonic authorised total (base units, string)
+}
+```
+**Response** `200 OK` with the raw chunk bytes. Errors: `502` if the provider returns bytes that
+do not match `cid`.
+
+---
+
+## Naming
+
+### POST /names/claim
+
+Claim a unique human-readable name (3-32 chars: lowercase `a-z`, `0-9`, hyphen, not leading/
+trailing). Submits a `NameClaim` tx; first claim wins once mined.
+**Request body** `{ "name": "myhost" }` → `202 Accepted` `{ "status": "submitted" }`.
+
+### GET /names/:name
+
+Resolve a claimed name. **Response** `200 OK` → `{ "name": "myhost", "node_id": "<64 hex>" }`, or
+`404` if not claimed.
+
+---
+
+## Service discovery
+
+### POST /discovery/advertise
+
+Advertise that this node provides a named service, discoverable via the DHT. Re-call periodically:
+provider records expire. **Request body** `{ "service": "my-service" }` → `{ "status": "advertised" }`.
+
+### GET /discovery/find/:service
+
+Find NodeIds advertising a named service.
+**Response** `200 OK` → `{ "service": "my-service", "providers": ["<64 hex>", ...] }`.
+
+---
+
+## Relay payment
+
+### POST /relay/pay
+
+Pay a relay for relay service: sign a payment-channel receipt and send it to the relay over the
+mesh. Called on the **payer** (client). Re-call periodically with a rising `cumulative`.
+
+**Request body** `{ "relay": "<64 hex>", "channel_id": "<64 hex>", "cumulative": "<base units string>" }`
+**Response** `200 OK` → `{ "status": "paid" }`.
+
+---
+
+## Capability revocation
+
+### POST /capabilities/revoke
+
+Revoke a capability **this node issued** by submitting an on-chain `RevokeCapability { issuer,
+nonce }`. Revoking any link invalidates that link and its whole subtree once mined. See
+docs/capabilities.md. **Request body** `{ "nonce": 42 }` → `201 Created` `{ "tx_id": "<64 hex>" }`.
+
+### GET /capabilities/revoked
+
+Read-only: the on-chain revoked `(issuer, nonce)` set, so apps (e.g. rdev) can deny revoked
+capability chains. **Response** `200 OK` → array of `{ "issuer": "<64 hex>", "nonce": <int> }`.
+
+---
+
+## Node info & operations
+
+### GET /bootstrap
+
+The bootstrap multiaddrs this node advertises (honors `CE_EXTERNAL_IP` / `CE_EXTERNAL_HOST` on
+relay nodes; otherwise returns just the bare `/p2p/<peer-id>`).
+**Response** `200 OK` → `{ "peers": ["/ip4/.../tcp/4001/p2p/...", ...] }`.
+
+### GET /netgraph
+
+Per-peer measured RTT graph (the latency edges used for nearest-provider blob fetch and placement).
+**Response** `200 OK` → array of `{ "peer": "<peer-id>", "rtt": { ... } }`.
+
+### POST /chain/save
+
+Snapshot the in-memory chain to disk on demand (the "dump" for ephemeral/in-memory nodes;
+persisting nodes also expose it so an operator can force a flush). Token-gated.
+**Response** `200 OK` → `{ "saved": "<path>" }`.
 
 ---
 

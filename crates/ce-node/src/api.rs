@@ -1302,10 +1302,11 @@ async fn get_netgraph(State(state): State<ApiState>) -> Response {
 
 // ----- GET /beacon -----
 //
-// Verifiable public randomness from the PoW chain: the tip block hash is unpredictable
-// (it took work to find) and globally agreed. Schedulers can seed host selection from it so
-// the choice is reproducible and auditable (nobody cherry-picked who ran the work). For
-// high-stakes use, derive from a confirmed-depth block rather than the volatile tip.
+// Verifiable public randomness from the chain tip: the tip block hash is globally agreed and
+// seeded by the VRF leader proof, so no single party can grind or predict it ahead of the slot.
+// Schedulers can seed host selection from it so the choice is reproducible and auditable (nobody
+// cherry-picked who ran the work). For high-stakes use, derive from a confirmed-depth block
+// rather than the volatile tip.
 
 async fn get_beacon(State(state): State<ApiState>) -> Response {
     let snap = state.chain.sync_snap().await;

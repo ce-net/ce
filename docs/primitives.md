@@ -18,7 +18,8 @@ Two constraints fix where the line falls:
    request must decide whether to run it *inside `ce-node`*, before acting. So anything
    that must be *enforced* lives in CE — but it stays generic (keys, amounts, permissions,
    tag-selectors), with no product concepts (no company, team, reputation score, scheduler).
-2. **CE is always trustless.** Consensus is proof-of-work / longest-chain. There is no
+2. **CE is always trustless.** Consensus is VRF leader election (CE-TWLE) with consensus
+   weight `W = min(bond, earned-work)`; fork choice is the heaviest-weight suffix. There is no
    federated quorum, no lighthouse authority, no global reputation oracle. Trust is built
    *by each participant* on top of the substrate — never granted by it.
 
@@ -34,7 +35,7 @@ Ed25519 keypair. A **NodeId** (`[u8;32]`, 64 hex) *is* a principal — a person,
 app are all just keys. Sign / verify. No accounts, no registration. (`ce-identity`)
 
 ### 2. Money — trustless credit ledger
-A PoW blockchain of credit balances. Integer **base units**, never floats (floats are
+A VRF-leader-elected blockchain of credit balances. Integer **base units**, never floats (floats are
 non-deterministic and split consensus): `1 credit = CREDIT (10^18) base units`, amounts
 `u128`, balances `i128`, `SUPPLY_CAP = 21e9 * CREDIT`. Emission: 1,000 credits/block,
 halving every 210,000 blocks. Transfer credits between any two keys. (`ce-chain`)
@@ -100,7 +101,7 @@ capability self-tags from the atlas via `ce fleet ls`. Pure organizational layer
 | Layer | Surface |
 |---|---|
 | HTTP API | `/status` `/health` `/bootstrap` `/atlas` `/transfer` `/jobs/bid` `/jobs` `/jobs/:id` `/jobs/:id/settle` `DELETE /jobs/:id` `/signals` `/signals/send` `/signals/stream` `/blocks/stream` `/transactions/stream` `/sync/*` `/exec` `/mesh-exec` `/mesh-sync/:id/*` (amounts are decimal **strings** of base units) |
-| Tx types | `Transfer` `UptimeReward` `JobBid` `JobSettle` `JobExpire` `Heartbeat` `TrustGrant` |
+| Tx types | `Transfer` `UptimeReward` `JobBid` `JobSettle` `JobExpire` `Heartbeat` `ChannelOpen` `ChannelClose` `ChannelExpire` `NameClaim` `RevokeCapability` `HostBond` `HostUnbond` `SlashEquivocation` |
 | Mesh RPC | `Exec` `SyncFile` `SegmentFetch` (grant rides as opaque bytes) |
 | Gossip topics | `ce-transactions` `ce-blocks` `ce-heights` `ce-syncreq` `ce-syncresp` `ce-protocol-1` `ce-segments` |
 | CLI | `start status balance id devices fleet grant sync exec deploy ps kill fund run` |
@@ -184,7 +185,7 @@ every app would otherwise reinvent → primitive.
 - Mesh-first: device-to-device always over libp2p, never stored ip:port HTTP.
 - The enforcer authorizes before doing work (via `ce-cap`); clients are never trusted by default.
 - Amounts cross JSON as strings (exceed 2^53).
-- `Mesh` is `!Sync`; mining is `spawn_blocking`; Docker is optional.
+- `Mesh` is `!Sync`; block production is one VRF eval + a signature (no PoW mining loop); Docker is optional.
 - Capability actions are opaque strings; the verifier knows no app vocabulary.
 - **The capability verifier (`ce-cap`) never imports app-tier reputation/policy.** Authorization is
   the signed, attenuating capability chain *alone*. Share-ratio / reputation are app-tier signals

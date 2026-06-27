@@ -68,6 +68,11 @@ pub fn daemon_args(m: &AppManifest) -> Vec<String> {
     m.daemon.as_ref().map(|d| d.args.clone()).unwrap_or_default()
 }
 
+/// The secret/config env-var NAMES this daemon needs from ce-iam (see `Daemon::secrets`).
+pub fn daemon_secrets(m: &AppManifest) -> Vec<String> {
+    m.daemon.as_ref().map(|d| d.secrets.clone()).unwrap_or_default()
+}
+
 /// The installed daemon apps the supervisor should currently keep running:
 /// installed, declares a `[daemon]`, and enabled via `ce app daemon enable`.
 pub fn enabled_daemons(store: &Store) -> Result<Vec<InstalledApp>> {

@@ -1,11 +1,14 @@
-//! ce-chain — the proof-of-work blockchain and economy at the core of ce-net.
+//! ce-chain — the VRF-leader-elected blockchain and economy at the core of ce-net.
 //!
-//! **ce-net** is a compute marketplace: nodes mine blocks to earn credits and spend credits to
-//! run containers on other nodes. This crate is the ledger that makes that trustless. It defines
-//! every transaction type (`Transfer`, `UptimeReward`, `JobBid`, `JobSettle`, `JobExpire`,
-//! `TrustGrant`, `Heartbeat`), proof-of-work mining and validation, balance tracking with credit
-//! escrow, the supply-capped halving emission schedule, and persistence (bincode + zstd). Money
-//! is integer base units (10^18 per credit), never floats; on-chain amounts are `u128`.
+//! **ce-net** is a compute marketplace: nodes produce blocks (when elected leader) to earn credits
+//! and spend credits to run containers on other nodes. This crate is the ledger that makes that
+//! trustless. It defines every transaction type (`Transfer`, `UptimeReward`, `JobBid`, `JobSettle`,
+//! `JobExpire`, `Heartbeat`, the `Channel*` family, `NameClaim`, `RevokeCapability`, `HostBond`,
+//! `HostUnbond`, `SlashEquivocation`), VRF leader-election block validation (consensus weight
+//! `W = min(bond, earned-work)`; the `difficulty`/`nonce` fields are vestigial, kept at 0), balance
+//! tracking with credit escrow + an 80% settlement burn, the supply-capped halving emission
+//! schedule, and persistence (bincode + zstd). Money is integer base units (10^18 per credit),
+//! never floats; on-chain amounts are `u128`.
 
 use anyhow::{anyhow, Result};
 use ce_identity::{verify, Identity, NodeId};

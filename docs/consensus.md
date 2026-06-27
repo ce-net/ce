@@ -4,8 +4,11 @@ Status: design recommendation, 2026-06-05. Produced by a multi-agent bake-off: C
 requirements pinned from the code, six candidate consensus models each designed concretely for CE,
 every design red-teamed by two adversaries (Sybil/economic-capture + liveness/centralization),
 scored by a three-judge panel, and synthesized into one recommendation. This is a **pre-launch
-architecture decision**, not yet implemented. Companion: [sybil-resistance.md](sybil-resistance.md)
-(the marketplace-correctness layer) and [threat-model.md](threat-model.md).
+architecture decision and phased-implementation record**: Phases 0-3 (settlement burn, host bonds +
+equivocation slashing, consensus-weight oracle, and the VRF leader-election seal swap) are
+**implemented on `ce-chain`** — see §7 for status; cutover hardening (Phase 7) is still pending.
+Companion: [sybil-resistance.md](sybil-resistance.md) (the marketplace-correctness layer) and
+[threat-model.md](threat-model.md).
 
 ---
 
@@ -235,8 +238,9 @@ signed checkpoint into the new genesis, so **no credits are lost and PoW miners 
   closes the wash-trade leak independently and de-risks everything downstream — do this first.**
   - **Status: the settlement burn is IMPLEMENTED** (`ce-chain`, branch `phase0-settlement-burn`).
     `JobSettle`/`Heartbeat`/`ChannelClose` now debit the payer the full gross amount, credit the host
-    `gross − burn`, and destroy the burn (`SETTLEMENT_BURN_BPS = 100`, i.e. 1.00%, a pre-launch
-    tunable — see §5 "burn calibration"). `NodeStats.earned` tracks the host's net gain; a new
+    `gross − burn`, and destroy the burn (`SETTLEMENT_BURN_BPS = 8000`, i.e. 80.00% — the provider
+    keeps one fifth of every settlement; a pre-launch tunable — see §5 "burn calibration").
+    `NodeStats.earned` tracks the host's net gain; a new
     `burned_total()` / `circulating_supply()` are exposed and surfaced on `/status`. Validation is
     unchanged (the burn is deterministic and the payer debit — the only balance-checked side — is the
     same). Tests prove a wash trade between two attacker-owned keys now destroys the burn every cycle

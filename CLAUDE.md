@@ -15,18 +15,18 @@ No emojis ever in the repo unless told so by a human. This is NOT a playground f
 
 ## CE Project Overview
 
-Rust workspace: Byzantine-fault-tolerant compute marketplace on a PoW blockchain.
+Rust workspace: Byzantine-fault-tolerant compute marketplace on a VRF-leader-elected blockchain.
 
-**Crates:** `ce-identity` / `ce-chain` / `ce-mesh` / `ce-container` / `ce-node` / `ce-protocol` / `ce-deploy`
+**Crates:** `ce-identity` / `ce-cap` / `ce-tls` / `ce-runtime` / `ce-guard` / `ce-wasm` / `ce-appmgr` / `ce-chain` / `ce-mesh` / `ce-container` / `ce-node` / `ce-protocol` / `ce-deploy` (see README.md for what each does).
 
-**Credit model:** Mine blocks → earn credits. Run jobs → spend credits (payer debited, host credited). No credits → 402.
+**Credit model:** Produce blocks (when elected leader) → earn credits. Run jobs → spend credits (payer debited, host credited; 80% of each settlement is burned). No credits → 402.
 
-**Consensus:** honest-majority PoW. Difficulty self-adjusts every 2016 blocks targeting 10 min/block.
+**Consensus:** VRF leader election (CE-TWLE), not PoW. Each ~10s slot, the node with a valid VRF ticket below its weight-proportional threshold produces the block; fork choice is the heaviest-weight suffix. Consensus weight `W = min(bond, earned-work-score)`. The `difficulty`/`nonce` block fields are vestigial (kept at 0). See docs/consensus.md.
 
 **Key constraints:**
 - `Mesh` (`Swarm` inside) is `!Sync` → event handlers are free fns (not async methods)
 - `[u8; 64]` sigs use local `sig_serde` module — serde only handles arrays ≤ 32
-- Mining runs in `spawn_blocking` — never block the async executor
+- Block production is one VRF eval + one signature — no PoW mining loop
 - Docker metering is optional (silently disabled if socket is missing)
 
 **Gossipsub topics:** `ce-transactions`, `ce-blocks`, `ce-heights`, `ce-syncreq`, `ce-syncresp`, `ce-protocol-1` (planned)

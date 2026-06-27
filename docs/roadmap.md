@@ -2,6 +2,15 @@
 
 Current state and what needs to be built to achieve the full vision.
 
+> **Note (superseded in places).** The "Current State" snapshot below is dated 2026-05-25 and
+> predates two large changes: (1) the consensus migration from PoW to **VRF leader election
+> (CE-TWLE)** with host bonds, equivocation slashing, and an 80% settlement burn — see
+> [consensus.md](consensus.md); and (2) the move of remote **exec / file sync** out of the node
+> into the `rdev` app (the `/sync`, `/exec`, `/mesh-exec`, `/mesh-sync` routes and `machines.toml`
+> are **gone** — capabilities are now CE's only trust primitive, see
+> [capabilities.md](capabilities.md) and [primitives.md](primitives.md)). Treat the consensus and
+> node-to-node-services details here as historical; the linked docs are authoritative.
+
 ---
 
 ## Vision
@@ -23,13 +32,13 @@ These are the same system from two angles. The identity primitive that lets untr
 | Component | Status | Notes |
 |---|---|---|
 | `ce-identity` | ✅ Complete | Ed25519 keypair, node ID, sign/verify, benchmarks |
-| `ce-chain` | ✅ Complete | Uptime emission, Transfer/UptimeReward/JobBid/JobSettle/JobExpire/TrustGrant/Heartbeat, supply cap (21B), halving schedule, credit escrow (locked_balance), tx_by_id, last_heartbeat_epoch, full validation, persistence, tests |
+| `ce-chain` | ✅ Complete | VRF leader election + uptime emission, Transfer/UptimeReward/JobBid/JobSettle/JobExpire/Heartbeat/Channel{Open,Close,Expire}/NameClaim/RevokeCapability/HostBond/HostUnbond/SlashEquivocation, 80% settlement burn, supply cap (21B), halving schedule, credit escrow (locked_balance), tx_by_id, last_heartbeat_epoch, full validation, persistence, tests |
 | `ce-mesh` | ✅ Complete | 7 gossip topics (ce-transactions/blocks/heights/syncreq/syncresp/protocol-1/segments), Kademlia DHT, chain sync, CEP-1 signal routing, relay mining |
 | `ce-protocol` | ✅ Complete | CEP-1 wire format, BurnProof, CellSignal build/verify/encode/decode |
 | `ce-container` | ✅ Complete | gVisor detection, CPU/memory/network limits, image pull, wait-for-exit, stop_job |
 | `ce-node` | ✅ Complete | Mining loop, mesh event loop, job manager, heartbeat loop (30s), capacity broadcast (60s), atlas, signal ring buffer, tx pool, nonce replay prevention |
-| HTTP API | ✅ Complete | /jobs/bid, /jobs (list), /jobs/:id, /jobs/:id/settle, /jobs/:id DELETE, /transfer, /status, /signals, /signals/send, /health, /atlas, /sync/*, /exec, /bootstrap, /mesh-exec, /mesh-sync |
-| CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, grant, revoke, wallet (add/ls/rm), sync, exec, deploy, ps, kill, fund, run |
+| HTTP API | ✅ Complete | See [api.md](api.md) for the authoritative list. Jobs/economy, channels, blobs, mesh app messaging/pub-sub, names, discovery, mesh-deploy/kill/app-install, tunnel, capability revoke. (The former `/sync`, `/exec`, `/mesh-exec`, `/mesh-sync` routes are **removed** — exec/sync are the `rdev` app.) |
+| CLI | ✅ Complete | start (auto-bootstrap from ce-net.com), balance, status, id, key, grant, revoke, wallet, channel, name, discover, tunnel, deploy, ps, kill, fund, run, app. (`sync`/`exec` are the `rdev` app, not `ce`.) |
 | Capability authorization | ✅ Complete | **The single trust primitive — `machines.toml`/`ce devices`/the v1 grant are removed.** A node honors a signed, attenuating capability chain rooted at its own key or a configured root (`<data_dir>/roots`); multi-level delegation, expiry, and on-chain `RevokeCapability` revocation. Enforced on mesh RPC and HTTP (`X-CE-Caps`). `ce grant`/`ce revoke` + a client wallet. **Spec: `docs/capabilities.md`; core: `crates/ce-node/src/capability.rs`.** (Sections below describing the old device-registry/grant-v1 model are superseded.) |
 | `ce-deploy` | ✅ Complete | Hetzner provisioning, SSH deploy, E2E tests |
 | Integration tests | ✅ Complete | single node mines, two nodes sync, tx pool propagates, API health/status, signal propagation, job lifecycle (requires Docker, skipped by default) |
@@ -41,7 +50,7 @@ The foundation — identity, chain, mesh, protocol, containers, job economy, dis
 
 ### Known gaps and correctness issues
 
-**Fork selection** — `Chain::append` uses first-wins. If two nodes mine simultaneously and then each receives the other's block, whichever arrived first stays. No longest-chain rule. Fix: in `mesh_event_loop`, on `NewBlock`, compare against current tip and replace if the incoming chain would be longer (needs a reorg function).
+**Fork selection** — implemented (this gap is closed). `Chain` performs a `try_reorg` and selects the **heaviest-weight** suffix (`Block::work()` returns the producer's consensus weight), not first-wins or longest-chain. See [consensus.md](consensus.md).
 
 **`difficulty` field is vestigial** — Always 0. Kept for forward compatibility. Fine for now.
 

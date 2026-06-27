@@ -357,6 +357,14 @@ enum AppCommands {
         #[arg(long)]
         allow_unsigned: bool,
     },
+    /// Re-fetch an installed app from the registry, picking up a republished binary (new content
+    /// digest, same version). Unlike `install`, this does NOT skip an already-installed app.
+    Update {
+        /// App to update; omit to update every installed app.
+        name: Option<String>,
+        #[arg(long, default_value = "https://ce-net.com")]
+        registry: String,
+    },
     /// Show an app's manifest and resolved install plan from the registry.
     Info {
         name: String,
@@ -2014,7 +2022,7 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
                 if let Some(members) = fleet_targets(data_dir, &placement)? {
                     // Fan out: this host first (a normal local install), then every paired device.
                     println!("fleet install '{name}' {version} -> this host + {} device(s)", members.len());
-                    install_local(&name, &registry, &store).await?;
+                    install_local(&name, &registry, &store, false).await?;
                     // A fleet install is turnkey: enable the daemon on this host too (the remote
                     // legs enable it on their hosts), so e.g. `clip` runs everywhere after one
                     // command. The single supervisor (`ce app daemon run`) starts it.
@@ -2052,7 +2060,24 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
                 println!("\nDry run. Re-run with --yes to install.");
                 return Ok(());
             }
-            install_local(&name, &registry, &store).await?;
+            install_local(&name, &registry, &store, false).await?;
+        }
+
+        AppCommands::Update { name, registry } => {
+            let targets: Vec<String> = match name {
+                Some(n) => vec![n],
+                None => store.list()?.into_iter().map(|a| a.manifest.app.name).collect(),
+            };
+            if targets.is_empty() {
+                println!("No apps installed to update.");
+                return Ok(());
+            }
+            for n in &targets {
+                println!("Updating {n}...");
+                if let Err(e) = install_local(n, &registry, &store, true).await {
+                    eprintln!("  update '{n}' failed: {e}");
+                }
+            }
         }
 
         AppCommands::Ls => {
@@ -2849,7 +2874,7 @@ async fn resolve_placement_node(placement: &ce_appmgr::Placement, api_token: &st
 /// Install an app on THIS host: resolve, materialize + sha256-verify each artifact, record, and
 /// write launcher shims. Does not enable daemons (local install is deliberate; use `ce app daemon
 /// enable`). Shared by the local install path and the local leg of a `fleet=mine` fan-out.
-async fn install_local(name: &str, registry: &str, store: &ce_appmgr::Store) -> Result<()> {
+async fn install_local(name: &str, registry: &str, store: &ce_appmgr::Store, force: bool) -> Result<()> {
     let reg = ce_appmgr::HubRegistry::new(registry);
     let plan = ce_appmgr::resolve(&reg, name).await?;
     store.ensure()?;
@@ -2858,7 +2883,10 @@ async fn install_local(name: &str, registry: &str, store: &ce_appmgr::Store) -> 
     let target = ce_appmgr::host_target();
     for item in &plan.items {
         let m = &item.manifest;
-        if store.is_installed(&m.app.name) {
+        // `force` (from `ce app update`) re-materializes even when already installed: materialize only
+        // refetches a content tier whose on-disk hash != the manifest digest, so a republished binary
+        // (new digest, same version) is picked up. Without force, an installed app is left as-is.
+        if !force && store.is_installed(&m.app.name) {
             continue;
         }
         // Materialize first (fetch + sha256-verify content-addressed tiers, resolve the oci image)
@@ -3329,11 +3357,26 @@ async fn run_supervisor(
                     let token = mint_ctl_token(&identity, &name);
                     let caller = caller_context_for(&app.manifest, &name);
                     let _ = write_ctl_token(data_dir, &token, &caller);
-                    match std::process::Command::new(&bin)
-                        .args(&args)
-                        .env("CE_INSTANCE_TOKEN", &token)
-                        .spawn()
-                    {
+                    // If the manifest declares `[daemon].secrets`, launch the daemon THROUGH
+                    // `ce-iam secret use --ns app:<name> <names> -- <bin> <args>`, so ce-iam injects those
+                    // values (from its scoped vault) as env at spawn. The values live in ce-iam, never in
+                    // the manifest, on disk, or in a stored env. No secrets declared -> spawn directly.
+                    let secrets = ce_appmgr::daemon_secrets(&app.manifest);
+                    let mut cmd = if secrets.is_empty() {
+                        let mut c = std::process::Command::new(&bin);
+                        c.args(&args);
+                        c
+                    } else {
+                        let mut c = std::process::Command::new("ce-iam");
+                        c.arg("secret").arg("use").arg("--ns").arg(format!("app:{name}"));
+                        for s in &secrets {
+                            c.arg(s);
+                        }
+                        c.arg("--").arg(&bin).args(&args);
+                        c
+                    };
+                    cmd.env("CE_INSTANCE_TOKEN", &token);
+                    match cmd.spawn() {
                         Ok(child) => {
                             children.insert(name.clone(), child);
                             register_instance(&hub, &node_hex, &name, &version, "native").await;
