@@ -35,28 +35,32 @@ if [ -z "${LATEST}" ]; then
   exit 1
 fi
 
-URL="https://github.com/${REPO}/releases/download/${LATEST}/${ASSET}"
+# Release assets are gzipped tarballs (ce-<target>.tar.gz) each containing the `ce` binary.
+URL="https://github.com/${REPO}/releases/download/${LATEST}/${ASSET}.tar.gz"
 echo "Downloading CE ${LATEST} (${ASSET})..."
 
-# ── Download ──────────────────────────────────────────────────────────────────
+# ── Download + extract ─────────────────────────────────────────────────────────
 
-TMP=$(mktemp)
-curl -fsSL "${URL}" -o "${TMP}"
-chmod +x "${TMP}"
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "${TMPDIR}"' EXIT
+curl -fsSL "${URL}" -o "${TMPDIR}/ce.tar.gz"
+tar -xzf "${TMPDIR}/ce.tar.gz" -C "${TMPDIR}"
+chmod +x "${TMPDIR}/${BIN}"
 
 # ── Install binary ────────────────────────────────────────────────────────────
 
+SRC="${TMPDIR}/${BIN}"
 if [ -w /usr/local/bin ]; then
   INSTALL_DIR="/usr/local/bin"
+  mv "${SRC}" "${INSTALL_DIR}/${BIN}"
 elif sudo -n true 2>/dev/null; then
-  sudo mv "${TMP}" "/usr/local/bin/${BIN}"
   INSTALL_DIR="/usr/local/bin"
+  sudo mv "${SRC}" "${INSTALL_DIR}/${BIN}"
 else
   INSTALL_DIR="${HOME}/.local/bin"
   mkdir -p "${INSTALL_DIR}"
+  mv "${SRC}" "${INSTALL_DIR}/${BIN}"
 fi
-
-[ "${TMP}" != "${INSTALL_DIR}/${BIN}" ] && mv "${TMP}" "${INSTALL_DIR}/${BIN}"
 echo "Installed: ${INSTALL_DIR}/${BIN}"
 
 if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
