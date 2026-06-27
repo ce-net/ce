@@ -943,9 +943,11 @@ fn install_service(light: bool, no_mine: bool) -> Result<()> {
             .collect::<Vec<_>>()
             .join(" ");
 
+        // Restart=always (not just on-failure) + no start-rate limit, so the node comes back from a
+        // clean exit or a crash. `default.target` for the user manager.
         let unit = format!(
-            "[Unit]\nDescription=CE — global compute mesh node\nAfter=network.target\n\n\
-             [Service]\nExecStart={exec_start}\nRestart=on-failure\nRestartSec=10\n\n\
+            "[Unit]\nDescription=CE — global compute mesh node\nAfter=network.target\nStartLimitIntervalSec=0\n\n\
+             [Service]\nExecStart={exec_start}\nRestart=always\nRestartSec=5\n\n\
              [Install]\nWantedBy=default.target\n"
         );
 
@@ -961,6 +963,23 @@ fn install_service(light: bool, no_mine: bool) -> Result<()> {
                 let err = String::from_utf8_lossy(&out.stderr);
                 return Err(anyhow!("systemctl --user {subcmd}: {err}"));
             }
+        }
+
+        // Enable linger so the --user service keeps running after logout / reboot / SSH disconnect.
+        // Without this, systemd tears the user manager (and ce) down when the login session ends —
+        // the #1 reason ce "randomly stops" on a desktop. Best-effort (needs polkit/privs).
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_default();
+        match std::process::Command::new("loginctl")
+            .args(["enable-linger", &user])
+            .status()
+        {
+            Ok(s) if s.success() => println!("Enabled linger — ce keeps running across logout/reboot."),
+            _ => println!(
+                "NOTE: could not enable linger; run `sudo loginctl enable-linger {user}` so ce \
+                 survives logout/reboot."
+            ),
         }
 
         println!("CE service installed and started.");
