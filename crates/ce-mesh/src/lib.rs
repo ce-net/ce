@@ -838,6 +838,25 @@ impl Mesh {
             debug!("QUIC listen: {e}");
         }
 
+        // Register our public address with the swarm so the RELAY SERVER can hand out dialable
+        // relayed (circuit) addresses. Without this, libp2p logs "Accepting relay reservation
+        // without providing external addresses of local node" and the relayed address is never
+        // advertised — so two NAT'd peers reserve circuits but the HOP between them fails
+        // ("unreachable"). Relay nodes set CE_EXTERNAL_IP to their public IPv4; clients (behind NAT)
+        // leave it unset and rely on AutoNAT/identify instead.
+        if let Ok(ext_ip) = std::env::var("CE_EXTERNAL_IP") {
+            let ext_ip = ext_ip.trim();
+            if !ext_ip.is_empty() {
+                match format!("/ip4/{ext_ip}/tcp/{listen_port}").parse::<Multiaddr>() {
+                    Ok(addr) => {
+                        self.swarm.add_external_address(addr.clone());
+                        info!("registered external address {addr} (relay can hand out circuit hops)");
+                    }
+                    Err(e) => warn!("CE_EXTERNAL_IP={ext_ip} is not a valid IPv4: {e}"),
+                }
+            }
+        }
+
         // Browser-reachable libp2p: when CE_WS_PORT is set (the public relay), bind a websocket
         // listener so a js-libp2p peer in a browser can dial in over wss (TLS terminated at the edge)
         // and join the mesh as a real, self-identified peer. Native nodes leave this unset.
