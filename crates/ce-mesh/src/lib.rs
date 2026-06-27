@@ -780,7 +780,21 @@ impl Mesh {
                     dcutr,
                     ping,
                     relay_client,
-                    relay_server: relay::Behaviour::new(peer_id, relay::Config::default()),
+                    // libp2p's relay defaults cap each circuit at 128 KiB / 2 min — fine for a quick
+                    // hole-punch handshake, fatal as INFRASTRUCTURE: it silently kills tunnels (SSH/
+                    // HTTP) and drops chain-sync/RPC over the circuit ("connection lost") the instant a
+                    // NAT'd pair moves real data. Raise the ceilings so relayed connections behave like
+                    // a normal link. (DCUtR still upgrades to direct when it can; this is the fallback.)
+                    relay_server: relay::Behaviour::new(peer_id, {
+                        let mut c = relay::Config::default();
+                        c.max_circuit_duration = std::time::Duration::from_secs(60 * 60 * 12); // 12h, not 2 min
+                        c.max_circuit_bytes = u64::MAX;       // no 128 KiB data cap
+                        c.max_reservations = 8192;            // many NAT'd nodes per relay
+                        c.max_reservations_per_peer = 16;
+                        c.max_circuits = 8192;
+                        c.max_circuits_per_peer = 64;
+                        c
+                    }),
                     rpc,
                     stream: libp2p_stream::Behaviour::new(),
                 })

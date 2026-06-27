@@ -43,8 +43,10 @@ pid(){ cein "$1" 'ce id | grep -oE "12D3[A-Za-z0-9]+" | head -1'; }
 height(){ cein "$1" 'curl -s --max-time 6 http://127.0.0.1:8844/status|python3 -c "import sys,json;print(json.load(sys.stdin)[\"height\"])" 2>/dev/null|tr -dc 0-9'; }
 # A deploy "reached" the target if it is NOT a discovery timeout (any app-level reply counts).
 reached(){ # $1=from $2=alias  -> echoes REACHED / UNREACHABLE
+  # REACHED requires an ACTUAL successful deploy (job_id), not just "not a discovery timeout" — a
+  # relayed RPC that connects then dies (e.g. circuit byte/time cap) must count as a FAILURE.
   out=$(cein "$1" "ce deploy alpine:latest --on $2 --cmd echo --cmd ok --fund 1000 --duration 30 2>&1 | head -2")
-  if printf '%s' "$out" | grep -qi 'during discovery'; then echo "UNREACHABLE"; else echo "REACHED"; fi
+  if printf '%s' "$out" | grep -qiE 'job_id|deployed on'; then echo "REACHED"; else echo "UNREACHABLE"; fi
 }
 
 start_relay(){ # $1=name
