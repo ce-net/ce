@@ -48,15 +48,33 @@ tar -xzf "${TMPDIR}/ce.tar.gz" -C "${TMPDIR}"
 chmod +x "${TMPDIR}/${BIN}"
 
 # ── Install binary ────────────────────────────────────────────────────────────
+# Prefer REPLACING the `ce` already on PATH, so an upgrade lands where the shell actually looks
+# (otherwise a new binary in /usr/local/bin gets shadowed by an old one in ~/.local/bin and
+# `ce --version` keeps reporting the old version). Fall back to /usr/local/bin, then ~/.local/bin.
 
 SRC="${TMPDIR}/${BIN}"
-if [ -w /usr/local/bin ]; then
-  INSTALL_DIR="/usr/local/bin"
-  mv "${SRC}" "${INSTALL_DIR}/${BIN}"
-elif sudo -n true 2>/dev/null; then
-  INSTALL_DIR="/usr/local/bin"
-  sudo mv "${SRC}" "${INSTALL_DIR}/${BIN}"
-else
+EXISTING="$(command -v "${BIN}" 2>/dev/null || true)"
+EXISTING_DIR=""
+[ -n "${EXISTING}" ] && EXISTING_DIR="$(cd "$(dirname "${EXISTING}")" 2>/dev/null && pwd || true)"
+
+install_to() { # $1 = dir; uses sudo if needed. Sets INSTALL_DIR on success, else returns 1.
+  local dir="$1"
+  if [ -w "${dir}" ]; then
+    mv "${SRC}" "${dir}/${BIN}" && INSTALL_DIR="${dir}" && return 0
+  elif sudo -n true 2>/dev/null; then
+    sudo mv "${SRC}" "${dir}/${BIN}" && INSTALL_DIR="${dir}" && return 0
+  fi
+  return 1
+}
+
+INSTALL_DIR=""
+if [ -n "${EXISTING_DIR}" ]; then
+  install_to "${EXISTING_DIR}" || true        # replace the in-use binary
+fi
+if [ -z "${INSTALL_DIR}" ]; then
+  install_to "/usr/local/bin" || true
+fi
+if [ -z "${INSTALL_DIR}" ]; then
   INSTALL_DIR="${HOME}/.local/bin"
   mkdir -p "${INSTALL_DIR}"
   mv "${SRC}" "${INSTALL_DIR}/${BIN}"
@@ -65,6 +83,16 @@ echo "Installed: ${INSTALL_DIR}/${BIN}"
 
 if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
   echo "  Add ${INSTALL_DIR} to your PATH or run: export PATH=\"\$PATH:${INSTALL_DIR}\""
+fi
+
+# Warn if some OTHER `ce` earlier in PATH will shadow what we just installed.
+hash -r 2>/dev/null || true
+RESOLVED="$(command -v "${BIN}" 2>/dev/null || true)"
+if [ -n "${RESOLVED}" ] && [ "${RESOLVED}" != "${INSTALL_DIR}/${BIN}" ]; then
+  echo "  WARNING: another '${BIN}' shadows the new one on your PATH:"
+  echo "             in use:    ${RESOLVED}  ($(${RESOLVED} --version 2>/dev/null | head -1))"
+  echo "             installed: ${INSTALL_DIR}/${BIN}"
+  echo "           Remove the stale one (e.g. rm -f '${RESOLVED}') or reorder PATH, then re-run your node."
 fi
 
 # ── systemd service (Linux only) ─────────────────────────────────────────────
