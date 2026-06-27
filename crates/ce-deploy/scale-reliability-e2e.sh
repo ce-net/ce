@@ -85,7 +85,7 @@ for i in $(seq 1 8); do sleep 8; r=$(reached cs-cliA b); echo "  t=$((i*8))s aft
 [ "$ok" = REACHED ] && pass "after relayA removed, A failed over to relayB and reached B" || fail "A did NOT fail over to the second relay"
 
 echo "=== [3] disconnect/recover: restart relayB, reachability must self-heal ==="
-docker restart cs-relayB >/dev/null 2>&1; echo "relayB restarted"
+cein cs-relayB "pkill -f 'ce start'; sleep 1; CE_EXTERNAL_IP=$RB_IP CE_NO_AUTOBOOTSTRAP=1 nohup ce start --no-mine --no-mdns --api-bind 0.0.0.0 >/tmp/ce.log 2>&1 & sleep 2; true"; echo "relayB ce restarted in place (IP preserved)"
 ok=UNREACHABLE
 for i in $(seq 1 10); do sleep 8; r=$(reached cs-cliA b); echo "  t=$((i*8))s after restart: $r"; [ "$r" = REACHED ] && { ok=REACHED; break; }; done
 [ "$ok" = REACHED ] && pass "reachability recovered on its own after relay restart (no node restart)" || fail "reachability did NOT recover after relay restart"
