@@ -49,6 +49,11 @@ pub struct AppMeta {
     #[serde(default)]
     pub summary: String,
     pub runtime: Runtime,
+    /// Capability strings this app PROVIDES to its host node while running, advertised in the node's atlas
+    /// tags so placement can route apps that `requires` them here (e.g. ce-serve provides `http-ingress`).
+    /// Opaque, community-defined vocabulary — `ce` only carries + matches the strings, hardcodes nothing.
+    #[serde(default)]
+    pub provides: Vec<String>,
     /// CE node id of the publisher; the manifest is signed by this key.
     #[serde(default)]
     pub publisher: String,
@@ -118,9 +123,14 @@ pub struct Deps {
     /// Systems that must be running for this app (e.g. `"postgres"`).
     #[serde(default)]
     pub services: Vec<String>,
-    /// ce-cap abilities the app requires (e.g. `exec`, `sync`).
+    /// ce-cap abilities the app requires (e.g. `exec`, `sync`) — what must be GRANTED to run it.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Node capability strings this app REQUIRES for PLACEMENT — matched against a node's atlas tags
+    /// (node-intrinsic like `gpu`/`wasm`/`docker`/os/arch, UNION app-provided like `http-ingress`). An
+    /// install with these only lands on nodes that advertise all of them. Opaque strings; nothing hardcoded.
+    #[serde(default)]
+    pub requires: Vec<String>,
     /// Host features; value `"optional"` means degrade rather than fail.
     #[serde(default)]
     pub system: BTreeMap<String, String>,
@@ -214,12 +224,12 @@ impl AppManifest {
                 let Some(n) = &self.native else {
                     bail!("runtime = \"native\" but no [native] section");
                 };
-                if n.artifacts.is_empty() {
-                    bail!("[native].artifacts is empty — nothing to install");
-                }
                 if n.bin.trim().is_empty() {
                     bail!("[native].bin is empty");
                 }
+                // NB: `artifacts` may be empty here. A local dev manifest (`ce app install ./app`) has the
+                // binary on disk and needs no published digests; `ce app publish` fills `artifacts`, and
+                // `materialize` enforces the per-target digest when installing from a registry.
             }
             Runtime::Oci => {
                 let Some(o) = &self.oci else {

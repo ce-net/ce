@@ -408,14 +408,17 @@ enum AppCommands {
     },
     /// Sign a `ceapp.toml` and publish it (manifest + signature) to the registry.
     Publish {
-        /// Path to the ceapp.toml to publish.
-        path: String,
+        /// Path to the ceapp.toml to publish (omit when using --repo).
+        path: Option<String>,
         /// Also write the signed manifest + sidecar into this local dir (a servable registry).
         #[arg(long)]
         out: Option<String>,
         /// ce-hub origin to upload the manifest + signature to (best-effort).
         #[arg(long)]
         registry: Option<String>,
+        /// Discover and publish EVERY `ceapp.toml` under this directory — one repo, many ceapps (§8.3).
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Manage the set of publisher keys this node trusts for installs.
     Trust {
@@ -540,6 +543,13 @@ enum WalletCommands {
         /// The capability token printed by `ce grant` on the target.
         #[arg(long)]
         cap: String,
+        /// Enrol this device in one or more ORGANIZATIONS (repeatable) — for `--on org=<x>`.
+        #[arg(long = "org")]
+        orgs: Vec<String>,
+        /// Put this device in one or more named WORKSPACES (repeatable) — for `--on workspace=<x>`.
+        /// (The `personal` workspace is implicitly every paired device.)
+        #[arg(long = "workspace")]
+        workspaces: Vec<String>,
     },
     /// List wallet entries.
     Ls,
@@ -774,6 +784,14 @@ struct WalletEntry {
     node_id: String,
     /// The capability token (hex), as printed by `ce grant`.
     cap: String,
+    /// Organizations this device is enrolled in (multi-membership) — for `--on org=<x>`. A device can be
+    /// in several (your personal org AND your company's). Empty = personal only.
+    #[serde(default)]
+    orgs: Vec<String>,
+    /// Workspaces this device belongs to — for `--on workspace=<x>`. The implicit `personal` workspace is
+    /// every paired device, so it need not be listed here; add named workspaces (e.g. `acme/backend`).
+    #[serde(default)]
+    workspaces: Vec<String>,
 }
 
 fn wallet_path(data_dir: &PathBuf) -> PathBuf {
@@ -810,6 +828,10 @@ fn resolve_target(data_dir: &PathBuf, target: &str) -> Result<(String, Option<St
 
 // ----- Service install/uninstall -----
 
+/// Install CE as the ONE OS service (launchd/systemd) running `ce start`. Because `ce start` now also
+/// runs the app supervisor in-process, this single unit hosts the node + every installed app daemon —
+/// there are no per-app plists and no separate supervisor unit. This is the only service a machine in the
+/// "shared computer" needs.
 fn install_service(light: bool, no_mine: bool) -> Result<()> {
     let bin = std::env::current_exe()
         .map_err(|e| anyhow!("cannot determine binary path: {e}"))?;
@@ -1049,6 +1071,8 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Keep a copy of the data dir for the in-process app supervisor (config moves `data_dir`).
+            let sup_data = data_dir.clone();
             let config = NodeConfig {
                 listen_port: port,
                 bootstrap_peers,
@@ -1084,6 +1108,26 @@ async fn main() -> Result<()> {
                 println!("  /ip4/<your-ip>/tcp/{port}/p2p/{}", status.peer_id);
             }
             println!();
+            // ONE OS SERVICE: the node ALSO runs the app supervisor in-process, so every installed app
+            // daemon (rdev, clip, …) is hosted under this single `ce` service. There is no separate
+            // per-app plist and no separate supervisor unit — `ce install-service` (which runs `ce start`)
+            // is the one launchd/systemd service the whole "shared computer" needs on a machine. The
+            // supervisor reconciles enabled daemons every 5s, so `ce app daemon enable <x>` is picked up
+            // live. Opt out with CE_NO_APP_SUPERVISOR=1 (e.g. a minimal node that hosts no apps).
+            if std::env::var("CE_NO_APP_SUPERVISOR").is_err() {
+                let hub = std::env::var("CE_APP_HUB").unwrap_or_else(|_| "https://ce-net.com".to_string());
+                tokio::spawn(async move {
+                    let store = ce_appmgr::Store::new(&sup_data);
+                    if let Err(e) = store.ensure() {
+                        eprintln!("app supervisor: store init failed: {e}");
+                        return;
+                    }
+                    if let Err(e) = run_supervisor(&store, &sup_data, &hub, false, 5).await {
+                        eprintln!("app supervisor exited: {e}");
+                    }
+                });
+                println!("App supervisor running in-process (one service hosts the node + all app daemons).");
+            }
             println!("Press Ctrl-C to stop.");
             tokio::signal::ctrl_c().await?;
             println!("Shutting down.");
@@ -1417,13 +1461,13 @@ async fn main() -> Result<()> {
             }
 
             // ----- capability wallet -----
-            WalletCommands::Add { alias, node_id, cap } => {
+            WalletCommands::Add { alias, node_id, cap, orgs, workspaces } => {
                 if node_id.len() != 64 || !node_id.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err(anyhow!("node_id must be 64 hex chars"));
                 }
                 capability::decode_chain(&cap).map_err(|_| anyhow!("invalid capability token"))?;
                 let mut w = load_wallet(&data_dir);
-                w.entries.insert(alias.clone(), WalletEntry { node_id, cap });
+                w.entries.insert(alias.clone(), WalletEntry { node_id, cap, orgs, workspaces });
                 save_wallet(&data_dir, &w)?;
                 println!("Added wallet entry '{alias}'.");
             }
@@ -1911,6 +1955,37 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
         }
 
         AppCommands::Install { name, on, registry, yes, tofu, allow_unsigned } => {
+            // SOURCE = a local working tree (./path or a ceapp.toml): install straight from disk — no
+            // registry round-trip, no publisher gate (it's your own tree). The most-wanted dev source
+            // (§4.1): build locally, `ce app install ./myapp`, and it's live + supervised here at once.
+            if is_local_source(&name) {
+                let _ = (tofu, allow_unsigned);
+                let placement = ce_appmgr::Placement::parse(&on)?;
+                if !placement.is_local() {
+                    return Err(anyhow!(
+                        "local-source install is `--on self` for now; `ce app publish` it to install on \
+                         other nodes/orgs/workspaces"
+                    ));
+                }
+                return install_from_path(&name, &store, yes).await;
+            }
+            // SOURCE = a scheme URI (§4.1/§8.3): install ANY system, not just published ceapps. `oci:` is
+            // the universal "install any container/system" path (e.g. `ce app install oci:postgres:16`).
+            if let Some(image) = name.strip_prefix("oci:") {
+                let _ = (tofu, allow_unsigned, &registry);
+                let placement = ce_appmgr::Placement::parse(&on)?;
+                if !placement.is_local() {
+                    return Err(anyhow!("oci: source installs `--on self` for now"));
+                }
+                return install_oci_uri(image, &store).await;
+            }
+            if name.starts_with("git:") || name.starts_with("blob:") {
+                return Err(anyhow!(
+                    "source '{name}' is recognised but not wired yet: `git:` builds via the recipe tier and \
+                     `blob:` fetches by CID — both land after the recipe/blob build path. Use a published \
+                     name, `./path`, or `oci:` for now."
+                ));
+            }
             let placement = ce_appmgr::Placement::parse(&on)?;
             // Publisher trust gate: verify the app's signature and that its publisher
             // is trusted (or trust-on-first-use) before any install side effect.
@@ -2049,7 +2124,8 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
                     return Err(anyhow!("'{name}' is a one-shot app (no [daemon]); use `ce app run`"));
                 }
                 store.set_daemon_enabled(&name, true)?;
-                println!("Enabled daemon '{name}'. Start it with: ce app daemon run");
+                println!("Enabled daemon '{name}'. The running `ce` node supervises it in-process — it \
+                          starts within a few seconds (or on next `ce start`). No separate service.");
             }
             DaemonCommands::Disable { name } => {
                 store.set_daemon_enabled(&name, false)?;
@@ -2119,8 +2195,22 @@ async fn app_command(cmd: AppCommands, data_dir: &std::path::Path) -> Result<()>
             }
         },
 
-        AppCommands::Publish { path, out, registry } => {
-            app_publish(data_dir, &path, out.as_deref(), registry.as_deref()).await?;
+        AppCommands::Publish { path, out, registry, repo } => {
+            if let Some(dir) = repo {
+                // One repo, many ceapps: publish every ceapp.toml under <dir> (skipping build/target dirs).
+                let manifests = discover_ceapps(std::path::Path::new(&dir))?;
+                if manifests.is_empty() {
+                    return Err(anyhow!("no ceapp.toml found under {dir}"));
+                }
+                println!("Publishing {} ceapp(s) from {dir}:", manifests.len());
+                for mp in &manifests {
+                    app_publish(data_dir, &mp.to_string_lossy(), out.as_deref(), registry.as_deref()).await?;
+                }
+            } else if let Some(path) = path {
+                app_publish(data_dir, &path, out.as_deref(), registry.as_deref()).await?;
+            } else {
+                return Err(anyhow!("give a ceapp.toml path or --repo <dir>"));
+            }
         }
 
         AppCommands::Trust { command } => match command {
@@ -2188,6 +2278,31 @@ fn save_trusted_publishers(
     let body: String = set.iter().map(|p| format!("{p}\n")).collect();
     std::fs::write(trusted_publishers_path(data_dir), body)?;
     Ok(())
+}
+
+/// Find every `ceapp.toml` under `dir` (recursive), skipping build/vcs/dependency dirs. This is how one
+/// repo holds MANY ceapps (§8.3): a `core` app + one per platform integration, each its own manifest.
+fn discover_ceapps(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if matches!(name.as_ref(), "target" | ".git" | "node_modules" | ".cargo-shared" | "dist" | "build") {
+                    continue;
+                }
+                walk(&path, out);
+            } else if name == "ceapp.toml" {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out.sort();
+    Ok(out)
 }
 
 /// Sign a `ceapp.toml` with this node's identity and publish the manifest + a
@@ -2687,6 +2802,9 @@ async fn resolve_placement_node(placement: &ce_appmgr::Placement, api_token: &st
     let required: Vec<String> = match placement {
         ce_appmgr::Placement::Tag(tags) => tags.clone(),
         ce_appmgr::Placement::Fleet(name) => vec![name.clone()],
+        // A capability is just an atlas tag (node-intrinsic like `gpu`/`wasm`, or app-provided like
+        // `http-ingress`) — pick the best node advertising it.
+        ce_appmgr::Placement::Capability(c) => vec![c.clone()],
         ce_appmgr::Placement::Nearest => Vec::new(),
         _ => Vec::new(),
     };
@@ -2772,6 +2890,144 @@ async fn install_local(name: &str, registry: &str, store: &ce_appmgr::Store) -> 
     Ok(())
 }
 
+/// Is this install SOURCE a local working tree (vs a registry app name)? (§4.1)
+fn is_local_source(s: &str) -> bool {
+    s == "."
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with('/')
+        || s.starts_with('~')
+        || s.ends_with("ceapp.toml")
+        || std::path::Path::new(s).join("ceapp.toml").is_file()
+}
+
+/// Ask cargo where it builds this repo — honours `CARGO_TARGET_DIR`, a `.cargo/config.toml` `target-dir`
+/// (incl. a global one), and workspace layout. None if there's no Cargo.toml or cargo isn't available.
+fn cargo_target_dir(repo: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !repo.join("Cargo.toml").is_file() {
+        return None;
+    }
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.get("target_directory")?.as_str().map(std::path::PathBuf::from)
+}
+
+/// Install a native ceapp straight from a local working tree (§4.1): read its `ceapp.toml`, take the
+/// locally-built binary, place it in the store, record + shim it, and (if a daemon) enable it so the
+/// in-process supervisor starts it. No registry, no blob fetch, no publish loop — the dev inner loop.
+async fn install_from_path(src: &str, store: &ce_appmgr::Store, _yes: bool) -> Result<()> {
+    let p = std::path::Path::new(src);
+    let manifest_path = if p.is_dir() || p.join("ceapp.toml").is_file() {
+        p.join("ceapp.toml")
+    } else {
+        p.to_path_buf()
+    };
+    let manifest_path = std::fs::canonicalize(&manifest_path)
+        .map_err(|e| anyhow!("no ceapp.toml at {}: {e}", manifest_path.display()))?;
+    let toml = std::fs::read_to_string(&manifest_path)?;
+    let m = ce_appmgr::AppManifest::parse(&toml)?;
+    let repo = manifest_path.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
+    store.ensure()?;
+
+    // Only native is wired for local install today; oci/wasm/recipe resolve through their own tiers.
+    let native = m.native.as_ref().ok_or_else(|| {
+        anyhow!("local install supports `[native]` apps; '{}' is {:?}", m.app.name, m.app.runtime)
+    })?;
+    let bin = native.bin.clone();
+    // Find the locally-built release binary. The authoritative source is `cargo metadata` (it honours
+    // CARGO_TARGET_DIR, a `.cargo/config.toml` `target-dir`, and workspace layout — e.g. this machine
+    // points every build at a shared `~/ce-net/.cargo-shared`). Fall back to the conventional locations
+    // for non-cargo trees.
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(td) = cargo_target_dir(&repo) {
+        candidates.push(td.join("release").join(&bin));
+    }
+    candidates.push(repo.join("target/release").join(&bin));
+    if let Some(w) = repo.parent() {
+        candidates.push(w.join(".cargo-shared/release").join(&bin));
+    }
+    candidates.push(repo.join(".cargo-shared/release").join(&bin));
+    let built = candidates.iter().find(|c| c.is_file()).cloned().ok_or_else(|| {
+        anyhow!("no local build of '{bin}' — run `cargo build --release` first (looked in {candidates:?})")
+    })?;
+    let bytes = std::fs::read(built)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hex::encode(hasher.finalize());
+
+    let version = m.app.version.to_string();
+    let vdir = store.version_dir(&m.app.name, &version);
+    std::fs::create_dir_all(&vdir)?;
+    let dest = vdir.join(&bin);
+    std::fs::write(&dest, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let rec = ce_appmgr::InstalledApp { manifest: m.clone(), target: ce_appmgr::host_target(), digest: Some(digest) };
+    store.record(&rec)?;
+    if m.is_daemon() {
+        store.set_daemon_enabled(&m.app.name, true)?; // the in-process supervisor (ce start) starts it
+    }
+    #[cfg(unix)]
+    {
+        let shim = app_shim_name(&m);
+        store.write_shim(&shim, &m.app.name)?;
+    }
+    println!(
+        "installed {} {} from {} [native {}]{}",
+        m.app.name,
+        version,
+        manifest_path.display(),
+        dest.display(),
+        if m.is_daemon() { " + enabled (supervised by `ce start`)" } else { "" }
+    );
+    println!("Ensure {} is on PATH.", store.bin_dir().display());
+    Ok(())
+}
+
+/// Derive an app name from an OCI image ref: `postgres:16` -> `postgres`, `ghcr.io/foo/bar:1.2` -> `bar`.
+fn oci_app_name(image: &str) -> String {
+    let no_digest = image.split('@').next().unwrap_or(image);
+    let no_tag = no_digest.rsplit_once(':').map(|(a, _)| a).unwrap_or(no_digest);
+    no_tag.rsplit('/').next().unwrap_or(no_tag).to_string()
+}
+
+/// Install ANY container/system as a ceapp from an `oci:<image>` source (§8.3 — "homebrew for the mesh").
+/// Synthesizes a minimal oci manifest and records it; the image is pulled lazily by ce-container on first
+/// run. No publish loop needed — this is how a legacy system becomes a ceapp you can run anywhere.
+async fn install_oci_uri(image: &str, store: &ce_appmgr::Store) -> Result<()> {
+    store.ensure()?;
+    let name = oci_app_name(image);
+    if name.is_empty() {
+        return Err(anyhow!("could not derive an app name from oci image '{image}'"));
+    }
+    let toml = format!(
+        "[app]\nname = \"{name}\"\nversion = \"0.0.0\"\nruntime = \"oci\"\n\n[oci]\nimage = \"{image}\"\n"
+    );
+    let m = ce_appmgr::AppManifest::parse(&toml)?;
+    let rec =
+        ce_appmgr::InstalledApp { manifest: m.clone(), target: ce_appmgr::host_target(), digest: None };
+    store.record(&rec)?;
+    #[cfg(unix)]
+    {
+        let shim = app_shim_name(&m);
+        store.write_shim(&shim, &m.app.name)?;
+    }
+    println!("installed {name} [oci {image}] (image pulled on first run). Run it: ce app run {name}");
+    println!("Ensure {} is on PATH.", store.bin_dir().display());
+    Ok(())
+}
+
 /// The concrete targets a fan-out placement expands to. `fleet=mine` = every paired device in the
 /// wallet (each already holds an owner-rooted capability for that device), installed alongside this
 /// host. Returns `None` for placements that resolve to a single node (`node=`/`tag=`/`nearest`/other
@@ -2780,6 +3036,8 @@ fn fleet_targets(
     data_dir: &std::path::Path,
     placement: &ce_appmgr::Placement,
 ) -> Result<Option<Vec<String>>> {
+    // These placements fan out to a SET of devices (this host + the matching paired devices), unlike
+    // node/tag/capability/nearest which pick a single best node.
     match placement {
         ce_appmgr::Placement::Fleet(name) if name == "mine" => {
             let wallet = load_wallet(&data_dir.to_path_buf());
@@ -2788,6 +3046,30 @@ fn fleet_targets(
                 return Err(anyhow!(
                     "fleet=mine is empty: no paired devices in the wallet (add one with `ce wallet add`)"
                 ));
+            }
+            Ok(Some(members))
+        }
+        // `workspace=personal` is every paired device (the default personal scope); a named workspace is
+        // the devices tagged with it.
+        ce_appmgr::Placement::Workspace(ws) => {
+            let wallet = load_wallet(&data_dir.to_path_buf());
+            let members: Vec<String> = if ws == "personal" {
+                wallet.entries.keys().cloned().collect()
+            } else {
+                wallet.entries.iter().filter(|(_, e)| e.workspaces.contains(ws)).map(|(k, _)| k.clone()).collect()
+            };
+            if members.is_empty() {
+                return Err(anyhow!("workspace '{ws}' has no devices (enrol one, or `ce wallet add`)"));
+            }
+            Ok(Some(members))
+        }
+        // Every paired device enrolled in the org.
+        ce_appmgr::Placement::Org(org) => {
+            let wallet = load_wallet(&data_dir.to_path_buf());
+            let members: Vec<String> =
+                wallet.entries.iter().filter(|(_, e)| e.orgs.contains(org)).map(|(k, _)| k.clone()).collect();
+            if members.is_empty() {
+                return Err(anyhow!("org '{org}' has no enrolled devices in your wallet"));
             }
             Ok(Some(members))
         }
@@ -2962,6 +3244,20 @@ async fn run_supervisor(
 
     loop {
         let daemons = ce_appmgr::enabled_daemons(store)?;
+        // CAPABILITY ADVERTISEMENT: publish the union of supervised apps' `[app].provides` to a file the
+        // node reads each capacity broadcast, so this node's atlas tags include app-provided capabilities
+        // (e.g. ce-serve installed -> `http-ingress`). That's how capability-routed placement finds it —
+        // no hardcoding of any specific app/edge in the node.
+        {
+            let mut provided: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for app in &daemons {
+                for c in &app.manifest.app.provides {
+                    provided.insert(c.clone());
+                }
+            }
+            let body: String = provided.into_iter().map(|c| format!("{c}\n")).collect();
+            let _ = std::fs::write(data_dir.join("extra-capabilities"), body);
+        }
         for app in &daemons {
             let name = app.manifest.app.name.clone();
             let version = app.manifest.app.version.to_string();
@@ -3026,7 +3322,18 @@ async fn run_supervisor(
                         eprintln!("daemon '{name}': artifact missing at {}", bin.display());
                         continue;
                     }
-                    match std::process::Command::new(&bin).args(&args).spawn() {
+                    // SCOPED IDENTITY, not env config: mint this daemon's per-instance capability (its
+                    // authority derived from the manifest `[deps]`) and hand it over as CE_INSTANCE_TOKEN.
+                    // The app uses that token to read its config + secrets from ce-iam WITHIN ITS SCOPE —
+                    // config/secrets never live in plaintext env or in the published manifest.
+                    let token = mint_ctl_token(&identity, &name);
+                    let caller = caller_context_for(&app.manifest, &name);
+                    let _ = write_ctl_token(data_dir, &token, &caller);
+                    match std::process::Command::new(&bin)
+                        .args(&args)
+                        .env("CE_INSTANCE_TOKEN", &token)
+                        .spawn()
+                    {
                         Ok(child) => {
                             children.insert(name.clone(), child);
                             register_instance(&hub, &node_hex, &name, &version, "native").await;

@@ -27,6 +27,7 @@
 //! software gets onto the pool without bespoke per-app plumbing.
 
 pub mod ctlapi;
+pub mod desired;
 pub mod instances;
 pub mod manifest;
 pub mod materialize;
@@ -38,6 +39,7 @@ pub mod run;
 pub mod store;
 pub mod supervisor;
 
+pub use desired::{DesiredApp, DesiredSet, Reconcile};
 pub use ctlapi::{
     CallerContext, ControlPlane, CtlEnvelope, CtlRequest, CtlResponse, DenyReason, DepHandle,
     EnsureDepRequest, InstallRequest, InstancesQuery, precheck_declared,

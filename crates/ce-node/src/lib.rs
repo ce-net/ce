@@ -578,8 +578,9 @@ impl Node {
             let job_store2 = job_store.clone();
             let send_nonce2 = send_nonce.clone();
             let self_tags2 = self_tags.clone();
+            let data_dir2 = node.config.data_dir.clone();
             tokio::spawn(async move {
-                capacity_broadcast_loop(identity2, handle2, job_store2, send_nonce2, self_tags2)
+                capacity_broadcast_loop(identity2, handle2, job_store2, send_nonce2, self_tags2, data_dir2)
                     .await;
             });
         }
@@ -2270,6 +2271,7 @@ async fn capacity_broadcast_loop(
     job_store: JobStore,
     send_nonce: Arc<AtomicU64>,
     self_tags: Vec<String>,
+    data_dir: std::path::PathBuf,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
     ticker.tick().await;
@@ -2295,6 +2297,14 @@ async fn capacity_broadcast_loop(
         // CEP-1 capability list — no wire-format change — and peers strip the prefix.
         for t in &self_tags {
             capabilities.push(Capability { name: format!("tag:{t}"), version: 1 });
+        }
+        // App-PROVIDED capabilities: the in-process app supervisor writes the union of running ceapps'
+        // `[app].provides` to `<data>/extra-capabilities`; advertise them as tags too, re-read each cycle
+        // so installing/removing an app (e.g. ce-serve) changes what this node advertises live.
+        if let Ok(extra) = std::fs::read_to_string(data_dir.join("extra-capabilities")) {
+            for line in extra.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                capabilities.push(Capability { name: format!("tag:{line}"), version: 1 });
+            }
         }
 
         let nonce = send_nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

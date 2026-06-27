@@ -24,6 +24,13 @@ pub enum Placement {
     Tag(Vec<String>),
     /// Every node in a named fleet.
     Fleet(String),
+    /// Any node advertising this CAPABILITY (an atlas tag — node-intrinsic like `gpu`/`wasm` or
+    /// app-provided like `http-ingress`). Routes work to where the capability lives.
+    Capability(String),
+    /// Every device enrolled in a named ORGANIZATION you're authorized on.
+    Org(String),
+    /// Every device in a named WORKSPACE (within your personal org by default).
+    Workspace(String),
     /// Atlas/latency-guided: the nearest capable node.
     Nearest,
 }
@@ -72,6 +79,24 @@ impl Placement {
                         }
                         Ok(Placement::Fleet(val.to_string()))
                     }
+                    "capability" | "cap" => {
+                        if val.is_empty() {
+                            bail!("placement 'capability=' needs a capability name");
+                        }
+                        Ok(Placement::Capability(val.to_string()))
+                    }
+                    "org" => {
+                        if val.is_empty() {
+                            bail!("placement 'org=' needs an org name");
+                        }
+                        Ok(Placement::Org(val.to_string()))
+                    }
+                    "workspace" | "ws" => {
+                        if val.is_empty() {
+                            bail!("placement 'workspace=' needs a workspace name");
+                        }
+                        Ok(Placement::Workspace(val.to_string()))
+                    }
                     other => bail!("unknown placement kind '{other}'"),
                 }
             }
@@ -91,6 +116,9 @@ impl std::fmt::Display for Placement {
             Placement::Node(id) => write!(f, "node={id}"),
             Placement::Tag(tags) => write!(f, "tag={}", tags.join(",")),
             Placement::Fleet(name) => write!(f, "fleet={name}"),
+            Placement::Capability(c) => write!(f, "capability={c}"),
+            Placement::Org(o) => write!(f, "org={o}"),
+            Placement::Workspace(w) => write!(f, "workspace={w}"),
             Placement::Nearest => write!(f, "nearest"),
         }
     }
@@ -111,6 +139,17 @@ mod tests {
             Placement::Tag(vec!["gpu".into(), "linux".into()])
         );
         assert_eq!(Placement::parse("fleet=edge").unwrap(), Placement::Fleet("edge".into()));
+        assert_eq!(
+            Placement::parse("capability=http-ingress").unwrap(),
+            Placement::Capability("http-ingress".into())
+        );
+        assert_eq!(Placement::parse("cap=gpu").unwrap(), Placement::Capability("gpu".into()));
+        assert_eq!(Placement::parse("org=acme").unwrap(), Placement::Org("acme".into()));
+        assert_eq!(
+            Placement::parse("workspace=personal").unwrap(),
+            Placement::Workspace("personal".into())
+        );
+        assert_eq!(Placement::parse("ws=backend").unwrap(), Placement::Workspace("backend".into()));
     }
 
     #[test]
@@ -119,11 +158,17 @@ mod tests {
         assert!(Placement::parse("tag=").is_err());
         assert!(Placement::parse("bogus=1").is_err());
         assert!(Placement::parse("whatever").is_err());
+        assert!(Placement::parse("capability=").is_err());
+        assert!(Placement::parse("org=").is_err());
+        assert!(Placement::parse("workspace=").is_err());
     }
 
     #[test]
     fn display_roundtrips() {
-        for s in ["self", "nearest", "node=abc", "tag=gpu,linux", "fleet=edge"] {
+        for s in [
+            "self", "nearest", "node=abc", "tag=gpu,linux", "fleet=edge",
+            "capability=http-ingress", "org=acme", "workspace=personal",
+        ] {
             let p = Placement::parse(s).unwrap();
             assert_eq!(Placement::parse(&p.to_string()).unwrap(), p);
         }
