@@ -1347,18 +1347,18 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     let store = ce_appmgr::Store::new(&sup_data);
                     if let Err(e) = store.ensure() {
-                        eprintln!("app supervisor: store init failed: {e}");
+                        tracing::warn!("app supervisor: store init failed: {e}");
                         return;
                     }
                     if let Err(e) = run_supervisor(&store, &sup_data, &hub, false, 5).await {
-                        eprintln!("app supervisor exited: {e}");
+                        tracing::warn!("app supervisor exited: {e}");
                     }
                 });
-                println!("App supervisor running in-process (one service hosts the node + all app daemons).");
+                tracing::info!("App supervisor running in-process (one service hosts the node + all app daemons).");
             }
-            println!("Press Ctrl-C to stop.");
+            tracing::info!("ce node running — press Ctrl-C to stop");
             tokio::signal::ctrl_c().await?;
-            println!("Shutting down.");
+            tracing::info!("Shutting down.");
         }
 
         Commands::InstallService { light, no_mine } => {
@@ -3528,7 +3528,7 @@ async fn run_supervisor(
                     Ok(Some(status)) => Reap::Exited(status.code().unwrap_or(1)),
                     Ok(None) => Reap::Running,
                     Err(e) => {
-                        eprintln!("daemon '{name}': wait failed: {e}");
+                        tracing::warn!("daemon '{name}': wait failed: {e}");
                         Reap::WaitErr
                     }
                 },
@@ -3557,10 +3557,10 @@ async fn run_supervisor(
                         .map(|p| p.restart.should_restart(code))
                         .unwrap_or(false);
                     if !restart {
-                        println!("daemon '{name}' exited ({code}); not restarting");
+                        tracing::info!("daemon '{name}' exited ({code}); not restarting");
                         continue;
                     }
-                    println!("daemon '{name}' exited ({code}); restarting");
+                    tracing::info!("daemon '{name}' exited ({code}); restarting");
                 }
                 Reap::Untracked => {}
             }
@@ -3571,7 +3571,7 @@ async fn run_supervisor(
             match plan {
                 ce_appmgr::RunPlan::Native { bin, args } => {
                     if !bin.exists() {
-                        eprintln!("daemon '{name}': artifact missing at {}", bin.display());
+                        tracing::warn!("daemon '{name}': artifact missing at {}", bin.display());
                         continue;
                     }
                     // SCOPED IDENTITY, not env config: mint this daemon's per-instance capability (its
@@ -3639,7 +3639,7 @@ async fn run_supervisor(
                     }
                 }
                 other => {
-                    eprintln!("daemon '{name}': unsupported runtime for supervision: {other:?}");
+                    tracing::warn!("daemon '{name}': unsupported runtime for supervision: {other:?}");
                 }
             }
         }
@@ -3682,7 +3682,7 @@ async fn register_instance(
         metrics: serde_json::Value::Null,
     };
     if let Err(e) = hub.register(&rec).await {
-        eprintln!("warning: ce-hub registration for '{name}' failed (continuing): {e}");
+        tracing::warn!("ce-hub registration for '{name}' failed (continuing): {e}");
     }
 }
 
