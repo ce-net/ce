@@ -958,6 +958,56 @@ async fn mesh_app_install(
     }
 }
 
+// ----- POST /mesh-update -----
+
+/// Tell a specific remote node to self-update its `ce` binary to the latest release and restart,
+/// over the mesh. The local node forwards a `SelfUpdate` RPC carrying the caller's `ce:update`
+/// capability; the target replies `UpdateStarted` then restarts onto the new version. This is the
+/// transport for `ce update --on <node|fleet=mine>` — central, one-command fleet updates.
+#[derive(Debug, Deserialize)]
+struct MeshUpdateRequest {
+    node_id: String,
+    #[serde(default)]
+    hint_multiaddr: String,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    grant: Option<String>,
+}
+
+async fn mesh_update(State(state): State<ApiState>, Json(req): Json<MeshUpdateRequest>) -> Response {
+    let node_id: NodeId = match hex::decode(&req.node_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(arr) => arr,
+        None => return err(StatusCode::BAD_REQUEST, "`node_id` must be 64 hex chars"),
+    };
+    let peer_id = match peer_id_from_node_id(&node_id) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid node_id: {e}")),
+    };
+    let grant = match caps_to_bytes(&req.grant) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    if !req.hint_multiaddr.is_empty() {
+        let _ = state.mesh_handle.dial(req.hint_multiaddr).await;
+    }
+    let rpc_req = RpcRequest::SelfUpdate {
+        from_node: state.host_node_id,
+        force: req.force,
+        grant,
+    };
+    match state.mesh_handle.send_rpc(peer_id, rpc_req).await {
+        Ok(RpcResponse::UpdateStarted { from_version }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "node_id": req.node_id, "from_version": from_version, "status": "updating" })),
+        )
+            .into_response(),
+        Ok(RpcResponse::Error(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Ok(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "unexpected rpc response type"),
+        Err(e) => err(StatusCode::GATEWAY_TIMEOUT, format!("mesh rpc failed: {e}")),
+    }
+}
+
 // ----- POST /mesh-kill -----
 
 #[derive(Debug, Deserialize)]
@@ -2346,6 +2396,7 @@ pub async fn start(
         // Personal mesh OS: relay-routed mesh RPCs (correct path for NAT traversal).
         .route("/mesh-deploy", post(mesh_deploy))
         .route("/mesh-app-install", post(mesh_app_install))
+        .route("/mesh-update", post(mesh_update))
         .route("/mesh-kill", post(mesh_kill))
         .route("/tunnel", post(open_tunnel))
         .with_state(state);

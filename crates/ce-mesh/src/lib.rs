@@ -183,6 +183,17 @@ pub enum RpcRequest {
         /// Scoped capability chain (bincode of `Vec<SignedCapability>`), opaque to transport.
         grant: Option<Vec<u8>>,
     },
+    /// Update the receiving node's OWN `ce` binary to the latest release and restart it. The node
+    /// runs its existing self-update flow (`ce update --restart`) in a detached subprocess, so this
+    /// is the central, one-command way to keep a whole fleet current over the mesh. Gated by the
+    /// `ce:update` capability. Replies `UpdateStarted` BEFORE the restart drops the connection.
+    SelfUpdate {
+        from_node: NodeId,
+        /// Re-download and replace even if the node already reports the latest version.
+        force: bool,
+        /// Scoped capability chain (bincode of `Vec<SignedCapability>`), opaque to transport.
+        grant: Option<Vec<u8>>,
+    },
     /// Fetch a content-addressed chunk (data-layer blob) from a peer that holds it. `cid` is the
     /// sha256 of the bytes; the caller verifies `sha256(reply) == cid` on receipt, so a wrong or
     /// tampered reply is detected and discarded. Open/unpaid in v0 — like `SegmentFetch`, serving
@@ -232,6 +243,7 @@ impl RpcRequest {
             | Self::FetchChunk { from_node, .. }
             | Self::AppMessage { from_node, .. }
             | Self::AppRequest { from_node, .. }
+            | Self::SelfUpdate { from_node, .. }
             | Self::RelayReceipt { from_node, .. } => *from_node,
         }
     }
@@ -252,6 +264,9 @@ pub enum RpcResponse {
     Killed,
     /// A ceapp was installed on the remote host. `version` is the installed manifest version.
     AppInstalled { app: String, version: String },
+    /// The remote node accepted a `SelfUpdate` and spawned its updater; `from_version` is the version
+    /// it was running before. The node restarts onto the new release moments after this reply.
+    UpdateStarted { from_version: String },
     /// The requested content-addressed chunk's bytes. The caller verifies `sha256(bytes) == cid`.
     ChunkData { cid: [u8; 32], bytes: Vec<u8> },
     /// The receiving node enqueued a directed `AppMessage` for the local app.
@@ -799,6 +814,14 @@ impl Mesh {
                     stream: libp2p_stream::Behaviour::new(),
                 })
             })?
+            // CRITICAL for cross-NAT reliability: libp2p 0.53 defaults idle_connection_timeout to
+            // ZERO, so a connection is torn down the instant it has no active substream — even a live
+            // relay circuit / DHT link flaps every few seconds (observed: the desktop's relay
+            // connection dropped every ~15s, so a 5.6 MB transfer never landed and directed RPC
+            // "timed out during discovery"). Keep connections alive for 10 minutes of idle so relay
+            // circuits, DHT links, and tunnels stay up between bursts of traffic. Truly-dead links are
+            // still reaped by ping failure + the relay keepalive reconciler.
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(600)))
             .build();
 
         // Clone a control handle out before the swarm is moved into the event loop; tunnels are

@@ -1723,6 +1723,7 @@ async fn handle_incoming_rpc(
         RpcRequest::Deploy { grant, .. } => ("deploy", grant.clone()),
         RpcRequest::Kill { grant, .. } => ("kill", grant.clone()),
         RpcRequest::AppInstall { grant, .. } => ("app:install", grant.clone()),
+        RpcRequest::SelfUpdate { grant, .. } => ("ce:update", grant.clone()),
         _ => unreachable!("non-action RPCs are handled in the event loop"),
     };
     let caps = match chain_bytes.as_deref().map(capability::decode_chain_bytes) {
@@ -1913,6 +1914,36 @@ async fn handle_incoming_rpc(
                     Err(e) => RpcResponse::Error(format!("app install failed: {e}")),
                 };
                 let _ = mesh_handle.respond_rpc(correlation_id, resp).await;
+            });
+        }
+        RpcRequest::SelfUpdate { force, .. } => {
+            // Capability already verified above (action `ce:update`). Reply FIRST (so the controller
+            // hears "started" before the restart drops this connection), then spawn the node's own
+            // `ce update --restart` in a DETACHED subprocess. The subprocess downloads the latest
+            // release, atomically swaps this binary, and restarts the service — bringing the node back
+            // on the new version. Central, one-command fleet updates over the mesh.
+            let from_version = env!("CARGO_PKG_VERSION").to_string();
+            let _ = mesh_handle
+                .respond_rpc(correlation_id, RpcResponse::UpdateStarted { from_version })
+                .await;
+            tokio::spawn(async move {
+                let exe = match std::env::current_exe() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("self-update: cannot find own binary: {e}");
+                        return;
+                    }
+                };
+                let mut cmd = tokio::process::Command::new(&exe);
+                cmd.arg("update").arg("--restart");
+                if force {
+                    cmd.arg("--force");
+                }
+                // Detach: the updater outlives the restart that replaces this very process.
+                match cmd.spawn() {
+                    Ok(_) => info!("self-update: spawned `{} update --restart` (force={force})", exe.display()),
+                    Err(e) => warn!("self-update: failed to spawn updater: {e}"),
+                }
             });
         }
     }

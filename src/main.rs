@@ -305,6 +305,11 @@ enum Commands {
         /// Restart the ce background service after updating (if one is installed).
         #[arg(long)]
         restart: bool,
+        /// Update REMOTE nodes over the mesh instead of this one: node=<id|alias> | fleet=mine
+        /// (every paired device) | tag=a,b. Each target self-updates and restarts on the new
+        /// release. Requires a `ce:update` capability for each target in your wallet.
+        #[arg(long)]
+        on: Option<String>,
     },
     /// Show CE node logs (works on macOS and Linux).
     Logs {
@@ -1399,8 +1404,18 @@ async fn main() -> Result<()> {
             uninstall_service()?;
         }
 
-        Commands::Update { force, restart } => {
-            self_update(force, restart).await?;
+        Commands::Update { force, restart, on } => {
+            match on {
+                None => self_update(force, restart).await?,
+                Some(placement_str) => {
+                    let placement = ce_appmgr::Placement::parse(&placement_str)?;
+                    if placement.is_local() {
+                        self_update(force, restart).await?;
+                    } else {
+                        update_remote(&placement, force, &data_dir).await?;
+                    }
+                }
+            }
         }
 
         Commands::Logs { lines } => {
@@ -3413,6 +3428,70 @@ async fn mesh_app_install_one(
     let result: serde_json::Value = resp.json().await?;
     let ver = result["version"].as_str().unwrap_or("?");
     println!("installed {name} {ver} on node={node_id_hex} (native, via remote appmgr)");
+    Ok(())
+}
+
+/// Update REMOTE node(s) over the mesh. `fleet=mine` (and other fan-out placements) update THIS host
+/// first (a normal self-update) and then every paired device; single-node placements update just that
+/// node. Each remote leg sends a `SelfUpdate` RPC (the `ce:update` capability) via /mesh-update; the
+/// target self-updates and restarts. Central, one-command fleet updates — no per-box ssh.
+async fn update_remote(
+    placement: &ce_appmgr::Placement,
+    force: bool,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    if let Some(members) = fleet_targets(data_dir, placement)? {
+        println!("fleet update -> this host + {} device(s)", members.len());
+        // This host first, in-process (so the controller updates too).
+        if let Err(e) = self_update(force, true).await {
+            eprintln!("  this host: {e}");
+        }
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        for member in &members {
+            match mesh_update_one(member, force, data_dir).await {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    eprintln!("  {member}: {e}");
+                    failed += 1;
+                }
+            }
+        }
+        println!("fleet update: {ok} ok, {failed} failed across {} device(s)", members.len());
+        return Ok(());
+    }
+    // Single remote node (node=/tag=/nearest/named-fleet).
+    let target = match placement {
+        ce_appmgr::Placement::Node(id) => id.clone(),
+        other => resolve_placement_node(other, &read_api_token(data_dir)).await?,
+    };
+    mesh_update_one(&target, force, data_dir).await
+}
+
+/// Send a `SelfUpdate` to one node via the local node's /mesh-update, attaching the wallet's
+/// `ce:update` capability for that target. The node replies before it restarts onto the new release.
+async fn mesh_update_one(target: &str, force: bool, data_dir: &std::path::Path) -> Result<()> {
+    let (node_id_hex, cap) = resolve_target(&data_dir.to_path_buf(), target)?;
+    let api_token = read_api_token(data_dir);
+    let client = api_client(&api_token);
+    let body = serde_json::json!({
+        "node_id": node_id_hex,
+        "force": force,
+        "grant": cap,
+    });
+    let resp = client
+        .post("http://127.0.0.1:8844/mesh-update")
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("mesh-update failed ({status}): {text}"));
+    }
+    let result: serde_json::Value = resp.json().await?;
+    let from = result["from_version"].as_str().unwrap_or("?");
+    println!("update started on node={node_id_hex} (was v{from}; restarting onto latest)");
     Ok(())
 }
 
