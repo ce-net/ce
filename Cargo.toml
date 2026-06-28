@@ -26,6 +26,7 @@ name = "ce"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 ce-node = { path = "crates/ce-node" }
 ce-identity = { path = "crates/ce-identity" }
 ce-cap = { path = "crates/ce-cap" }

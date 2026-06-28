@@ -1234,8 +1234,27 @@ fn show_logs(lines: usize) -> Result<()> {
     Err(anyhow!("logs not supported on this platform"))
 }
 
+/// Restore the default SIGPIPE disposition (Rust sets it to SIG_IGN at startup). With SIG_IGN, a
+/// write to a broken pipe returns EPIPE, and the `println!`/`print!` macros turn that Err into a
+/// panic ("failed printing to stdout: Broken pipe"). For a CLI that means `ce status | head` crashes
+/// with a panic instead of exiting quietly; for the daemon a transient stdout-pipe break could panic
+/// a worker. SIG_DFL makes a broken pipe terminate the process cleanly via signal — the conventional
+/// Unix behaviour (ripgrep/fd/etc. do the same). Disk-full write failures are handled separately by
+/// routing daemon output through `tracing` (which ignores write errors), not by this.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: setting a signal disposition to the default handler is async-signal-safe and is done
+    // once before any threads spawn.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(unix)]
+    restore_default_sigpipe();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("ce=info".parse()?))
         .init();
@@ -3585,9 +3604,12 @@ async fn run_supervisor(
                         Ok(child) => {
                             children.insert(name.clone(), child);
                             register_instance(&hub, &node_hex, &name, &version, "native").await;
-                            println!("started daemon '{name}' (native)");
+                            // tracing (not println!): this runs in the daemon's async runtime and is
+                            // re-emitted on every supervised restart — a raw macro here panics the
+                            // worker if the log write fails (disk full / broken pipe).
+                            tracing::info!("started daemon '{name}' (native)");
                         }
-                        Err(e) => eprintln!("daemon '{name}': spawn failed: {e}"),
+                        Err(e) => tracing::warn!("daemon '{name}': spawn failed: {e}"),
                     }
                 }
                 ce_appmgr::RunPlan::Oci { image, cmd, env, cpu_cores, mem_mb, daemon: _, .. } => {
@@ -3608,12 +3630,12 @@ async fn run_supervisor(
                             match cm.launch_job(&spec).await {
                                 Ok(cid) => {
                                     register_instance(&hub, &node_hex, &name, &version, "oci").await;
-                                    println!("started daemon '{name}' (oci {image}, container {cid})");
+                                    tracing::info!("started daemon '{name}' (oci {image}, container {cid})");
                                 }
-                                Err(e) => eprintln!("daemon '{name}': launch failed: {e}"),
+                                Err(e) => tracing::warn!("daemon '{name}': launch failed: {e}"),
                             }
                         }
-                        Err(e) => eprintln!("daemon '{name}': Docker unavailable: {e}"),
+                        Err(e) => tracing::warn!("daemon '{name}': Docker unavailable: {e}"),
                     }
                 }
                 other => {
