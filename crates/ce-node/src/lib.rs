@@ -915,6 +915,21 @@ async fn handle_tunnel_stream(
     Ok(())
 }
 
+/// Which height to request a resync FROM, given our height and how many consecutive rounds have
+/// failed to apply. Escalates the lookback so a node that's only slightly behind or on a shallow fork
+/// pulls just the recent window, and only a persistent failure (a deep fork / genuine divergence)
+/// falls back to a full resync from genesis. Prevents the "node 1 block behind keeps pulling the whole
+/// chain" storm. Pure + unit-tested.
+fn resync_from_height(our_height: u64, streak: u32) -> u64 {
+    let lookback: u64 = match streak {
+        0 => 128,
+        1 => 1_024,
+        2 => 8_192,
+        _ => return 0, // give up on shallow recovery: full resync from genesis
+    };
+    our_height.saturating_sub(lookback)
+}
+
 async fn mesh_event_loop(
     chain: ChainHandle,
     mut rx: mpsc::Receiver<MeshEvent>,
@@ -951,6 +966,11 @@ async fn mesh_event_loop(
 ) {
     use std::sync::atomic::Ordering as SyncedOrdering;
     let mut sync_ticks: u32 = 0;
+    // Consecutive "sync blocks didn't apply" rounds. Drives an escalating resync lookback so a node
+    // that's only slightly behind (or on a shallow fork) asks for just the recent gap instead of a
+    // full chain resync from genesis — which avoids the self-amplifying "serving thousands of blocks"
+    // storm. Resets to 0 the moment any block applies.
+    let mut resync_streak: u32 = 0;
     let mut last_nonce: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_heights: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_oldest: HashMap<NodeId, u64> = HashMap::new();
@@ -1124,6 +1144,7 @@ async fn mesh_event_loop(
                 }
 
                 if applied > 0 {
+                    resync_streak = 0; // progress made — back to cheap incremental sync
                     let new_height = chain.height().await;
                     info!("sync applied {applied} blocks, now at height {new_height}");
 
@@ -1187,12 +1208,18 @@ async fn mesh_event_loop(
                     let our_height = chain.height().await;
                     let best_peer_height = peer_heights.values().copied().max().unwrap_or(0);
                     if best_peer_height > our_height {
+                        // Escalating resync lookback: a node only slightly behind / on a shallow fork
+                        // asks for just the recent window; only a persistent failure (deep fork) walks
+                        // all the way back to genesis. This avoids the full-resync storm where a node
+                        // one block behind repeatedly pulls the entire chain.
+                        let from = resync_from_height(our_height, resync_streak);
+                        resync_streak = resync_streak.saturating_add(1);
                         warn!(
-                            "sync blocks didn't apply (our height {our_height}, \
-                             best peer {best_peer_height}, candidate tip {max_candidate}); \
-                             requesting full resync"
+                            "sync blocks didn't apply (our height {our_height}, best peer \
+                             {best_peer_height}, candidate tip {max_candidate}); resync from {from} \
+                             (attempt {resync_streak})"
                         );
-                        let _ = mesh_handle.send_sync_request(our_node_id, 0).await;
+                        let _ = mesh_handle.send_sync_request(our_node_id, from).await;
                     }
                 }
             }
@@ -2466,6 +2493,38 @@ fn tx_burn_amount(tx: &Tx) -> Option<u128> {
         | TxKind::RevokeCapability { .. }
         | TxKind::HostUnbond { .. }
         | TxKind::SlashEquivocation { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::resync_from_height;
+
+    #[test]
+    fn slightly_behind_asks_for_a_small_window_not_full_resync() {
+        // A node one block behind at height 4399 must NOT request from 0 (the storm); it asks for a
+        // shallow recent window so it pulls ~the gap, not the whole chain.
+        let from = resync_from_height(4399, 0);
+        assert!(from > 0, "first attempt must not be a full-genesis resync");
+        assert_eq!(from, 4399 - 128);
+    }
+
+    #[test]
+    fn escalates_then_falls_back_to_full_for_deep_divergence() {
+        let h = 100_000;
+        assert_eq!(resync_from_height(h, 0), h - 128);
+        assert_eq!(resync_from_height(h, 1), h - 1_024);
+        assert_eq!(resync_from_height(h, 2), h - 8_192);
+        // persistent failure => genuine deep fork => full resync from genesis
+        assert_eq!(resync_from_height(h, 3), 0);
+        assert_eq!(resync_from_height(h, 9), 0);
+    }
+
+    #[test]
+    fn lookback_saturates_near_genesis() {
+        // Early chain: lookback can't underflow below 0.
+        assert_eq!(resync_from_height(10, 0), 0);
+        assert_eq!(resync_from_height(50, 1), 0);
     }
 }
 

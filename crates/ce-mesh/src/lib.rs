@@ -683,6 +683,11 @@ pub struct Mesh {
     /// connection closes so a reconnect creates a FRESH (actually-reserving) one — otherwise a NAT'd
     /// node keeps a dead reservation after a relay restart and silently stays unreachable.
     relay_listeners: HashMap<PeerId, libp2p::core::transport::ListenerId>,
+    /// Peers we've done directed RPC with (deploy/tunnel/update targets — your fleet). We keep their
+    /// relay circuits WARM: the keepalive re-discovers any that drop, so a directed RPC to a peer you
+    /// actually use never pays a cold ~20s discovery + dial. This is what makes fleet ops reliable at
+    /// scale — circuits to known peers are maintained proactively, not built cold on demand.
+    warm_peers: std::collections::HashSet<PeerId>,
 }
 
 impl Mesh {
@@ -854,6 +859,7 @@ impl Mesh {
             bootstrapped: false,
             self_circuit_addrs: Vec::new(),
             relay_listeners: HashMap::new(),
+            warm_peers: std::collections::HashSet::new(),
         };
 
         let handle = MeshHandle { cmd_tx };
@@ -1050,6 +1056,15 @@ impl Mesh {
                     self.swarm.remove_listener(id);
                 }
                 let _ = self.swarm.dial(addr);
+            }
+        }
+        // Keep circuits to our working-set peers (fleet: deploy/tunnel/update targets) warm: proactively
+        // re-discover any that have dropped, so a directed RPC to them never starts from cold. This is
+        // the robustness fix that makes fleet ops reliable — circuits are maintained, not built on demand.
+        let warm: Vec<PeerId> = self.warm_peers.iter().copied().collect();
+        for peer in warm {
+            if !self.swarm.is_connected(&peer) && !self.relay_peers.contains_key(&peer) {
+                self.discover_peer(peer);
             }
         }
     }
@@ -1373,6 +1388,9 @@ impl Mesh {
                 }
             }
             MeshCommand::SendRpc { peer_id, request, reply_tx } => {
+                // A peer we direct-RPC is part of our working set (fleet): keep its circuit warm so
+                // future RPCs don't pay cold discovery. (Discover-only commands don't mark warm.)
+                self.warm_peers.insert(peer_id);
                 if self.swarm.is_connected(&peer_id) {
                     let req_id = self.swarm.behaviour_mut().rpc
                         .send_request(&peer_id, request);

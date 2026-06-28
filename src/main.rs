@@ -3415,17 +3415,7 @@ async fn mesh_app_install_one(
         "app": name,
         "grant": cap,
     });
-    let resp = client
-        .post("http://127.0.0.1:8844/mesh-app-install")
-        .json(&body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("mesh-app-install failed ({status}): {text}"));
-    }
-    let result: serde_json::Value = resp.json().await?;
+    let result = post_mesh_directed(&client, "http://127.0.0.1:8844/mesh-app-install", &body, "mesh-app-install").await?;
     let ver = result["version"].as_str().unwrap_or("?");
     println!("installed {name} {ver} on node={node_id_hex} (native, via remote appmgr)");
     Ok(())
@@ -3479,17 +3469,7 @@ async fn mesh_update_one(target: &str, force: bool, data_dir: &std::path::Path) 
         "force": force,
         "grant": cap,
     });
-    let resp = client
-        .post("http://127.0.0.1:8844/mesh-update")
-        .json(&body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("mesh-update failed ({status}): {text}"));
-    }
-    let result: serde_json::Value = resp.json().await?;
+    let result = post_mesh_directed(&client, "http://127.0.0.1:8844/mesh-update", &body, "mesh-update").await?;
     let from = result["from_version"].as_str().unwrap_or("?");
     println!("update started on node={node_id_hex} (was v{from}; restarting onto latest)");
     Ok(())
@@ -3515,6 +3495,42 @@ fn oci_image_or_err(m: &ce_appmgr::AppManifest) -> Result<String> {
 /// Ship an oci app to a target node via the node's `/mesh-deploy` primitive
 /// (capability-authed), then register the instance in ce-hub. Only explicit
 /// `node=<id>` placement is wired; tag/fleet/nearest need atlas-based selection.
+/// POST to a local node mesh-forwarding endpoint (`/mesh-deploy`, `/mesh-app-install`,
+/// `/mesh-update`), RETRYING while a cross-NAT circuit warms up. Directed RPC to a NAT'd peer can
+/// transiently fail "during discovery" for a few seconds when the circuit is cold; a one-shot CLI
+/// command shouldn't fail on that — it should wait for the path to come up (like `ce tunnel` does).
+/// Now that nodes also keep fleet circuits warm, this retry is rarely needed, but it makes the
+/// first-ever contact with a peer robust. Returns the parsed JSON response on success.
+async fn post_mesh_directed(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+    what: &str,
+) -> Result<serde_json::Value> {
+    let mut last = String::new();
+    for attempt in 0..6u32 {
+        let resp = client.post(url).json(body).send().await?;
+        if resp.status().is_success() {
+            return Ok(resp.json().await?);
+        }
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let transient = text.contains("during discovery")
+            || text.contains("peer unreachable")
+            || text.contains("timed out")
+            || status.as_u16() == 504;
+        if !transient || attempt == 5 {
+            return Err(anyhow!("{what} failed ({status}): {text}"));
+        }
+        last = text;
+        if attempt == 0 {
+            println!("  {what}: warming circuit to the target, retrying...");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    Err(anyhow!("{what}: exhausted discovery retries: {last}"))
+}
+
 async fn mesh_deploy_oci(
     app_name: &str,
     version: &str,
@@ -3545,17 +3561,7 @@ async fn mesh_deploy_oci(
         "bid": bid,
         "grant": cap,
     });
-    let resp = client
-        .post("http://127.0.0.1:8844/mesh-deploy")
-        .json(&body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("mesh-deploy failed ({status}): {text}"));
-    }
-    let result: serde_json::Value = resp.json().await?;
+    let result = post_mesh_directed(&client, "http://127.0.0.1:8844/mesh-deploy", &body, "mesh-deploy").await?;
     let job_id = result["job_id"].as_str().unwrap_or("?");
     println!("deployed {app_name} {version} on node={node_id_hex} (oci {image}, job {job_id})");
 
