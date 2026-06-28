@@ -943,6 +943,46 @@ fn install_service(light: bool, no_mine: bool) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        // PREFER a SYSTEM service when we have root (least-privilege account, boot-independent, no
+        // linger, restartable from any context). Fall back to a `--user` service only when not root.
+        // See PLAN/ce-security-model-container-auth.md.
+        if unsafe { libc::geteuid() } == 0 {
+            // Run as the REAL user (the one who ran sudo), not root — unprivileged + uses their existing
+            // node identity/data dir. Bake --data-dir into ExecStart so the system service (different
+            // $HOME) resolves the right data dir deterministically.
+            let (run_user, run_home) = install_target_user();
+            let ddir = run_home.join(".local").join("share").join("ce");
+            let exec_start = std::iter::once(bin.as_ref())
+                .chain(["--data-dir", &ddir.to_string_lossy()].iter().copied())
+                .chain(args.iter().map(|s| s.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let unit = format!(
+                "[Unit]\nDescription=CE — global compute mesh node\nAfter=network-online.target\n\
+                 Wants=network-online.target\nStartLimitIntervalSec=0\n\n\
+                 [Service]\nType=simple\nUser={run_user}\nExecStart={exec_start}\nRestart=always\n\
+                 RestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+            );
+            let unit_path = std::path::Path::new("/etc/systemd/system/ce.service");
+            std::fs::write(unit_path, &unit)?;
+            println!("Wrote {} (system service, runs as {run_user})", unit_path.display());
+            let _ = std::process::Command::new("systemctl").arg("daemon-reload").status();
+            let out = std::process::Command::new("systemctl")
+                .args(["enable", "--now", "ce"])
+                .output()
+                .map_err(|e| anyhow!("systemctl: {e}"))?;
+            if !out.status.success() {
+                return Err(anyhow!("systemctl enable --now ce: {}", String::from_utf8_lossy(&out.stderr)));
+            }
+            println!("CE system service installed and started (starts on boot; no linger needed).");
+            println!();
+            println!("  Logs : journalctl -u ce -f");
+            println!("  Stop : sudo systemctl stop ce");
+            println!("  Remove: sudo ce uninstall-service");
+            return Ok(());
+        }
+
+        // Not root: per-user service (fallback for no-sudo / shared / CI machines).
         let unit_dir = dirs_next::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
             .join(".config").join("systemd").join("user");
@@ -993,7 +1033,8 @@ fn install_service(light: bool, no_mine: bool) -> Result<()> {
             ),
         }
 
-        println!("CE service installed and started.");
+        println!("CE service installed and started (per-user; run `sudo ce install-service` for a more");
+        println!("robust system service that needs no linger).");
         println!();
         println!("  Logs : journalctl --user -u ce -f");
         println!("  Stop : systemctl --user stop ce");
@@ -1003,6 +1044,21 @@ fn install_service(light: bool, no_mine: bool) -> Result<()> {
 
     #[allow(unreachable_code)]
     Err(anyhow!("install-service is not supported on this platform. Start manually with: ce start"))
+}
+
+/// The real (unprivileged) user a root-installed system service should run as, and their home. When
+/// invoked via `sudo`, that's `$SUDO_USER` (so the node keeps using that user's existing identity/data
+/// dir, not root's). Degenerates to the current user/home if not run via sudo.
+#[cfg(target_os = "linux")]
+fn install_target_user() -> (String, std::path::PathBuf) {
+    if let Ok(u) = std::env::var("SUDO_USER") {
+        if !u.is_empty() && u != "root" {
+            return (u.clone(), std::path::PathBuf::from(format!("/home/{u}")));
+        }
+    }
+    let u = std::env::var("USER").unwrap_or_else(|_| "root".into());
+    let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/root"));
+    (u, home)
 }
 
 fn uninstall_service() -> Result<()> {
@@ -1025,6 +1081,21 @@ fn uninstall_service() -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        // Mode-aware: remove whichever is installed — the system unit (needs root) and/or the
+        // per-user unit.
+        let system_unit = std::path::Path::new("/etc/systemd/system/ce.service");
+        if system_unit.exists() {
+            if unsafe { libc::geteuid() } != 0 {
+                return Err(anyhow!(
+                    "a system ce service is installed; re-run as root: sudo ce uninstall-service"
+                ));
+            }
+            let _ = std::process::Command::new("systemctl").args(["disable", "--now", "ce"]).output();
+            std::fs::remove_file(system_unit)?;
+            let _ = std::process::Command::new("systemctl").arg("daemon-reload").status();
+            println!("CE system service stopped and removed.");
+            return Ok(());
+        }
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "disable", "--now", "ce"])
             .output();
@@ -1036,8 +1107,10 @@ fn uninstall_service() -> Result<()> {
             let _ = std::process::Command::new("systemctl")
                 .args(["--user", "daemon-reload"])
                 .output();
+            println!("CE service stopped and removed.");
+        } else {
+            println!("No CE service found (already uninstalled).");
         }
-        println!("CE service stopped and removed.");
         return Ok(());
     }
 
@@ -1197,21 +1270,85 @@ fn replace_binary(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     )
 }
 
-/// Best-effort restart of the ce background service (systemd user, then system).
+/// Restart whichever ce service is actually installed — mode-aware. Earlier this only tried
+/// `systemctl … ce`, so it failed on the relay (its unit is `ce-relay`) and on macOS (launchd), which
+/// left `ce update --restart` swapping the binary but not actually restarting the running node. Now we
+/// detect the real service: launchd agent/daemon on macOS; on Linux a system unit (`ce`, or the relay's
+/// `ce-relay`) or the `--user` unit (with the user bus env that a non-login shell lacks).
 fn restart_service() {
-    let attempts: &[(&str, &[&str])] = &[
-        ("systemctl", &["--user", "restart", "ce"]),
-        ("systemctl", &["restart", "ce"]),
-    ];
-    for (cmd, args) in attempts {
-        if let Ok(s) = std::process::Command::new(cmd).args(*args).status() {
-            if s.success() {
-                println!("Restarted the ce service ({cmd} {}).", args.join(" "));
+    #[cfg(target_os = "macos")]
+    {
+        // LaunchDaemon (system) or LaunchAgent (per-user) — kickstart -k restarts in place.
+        let domains = [
+            format!("system/com.ce-net.ce"),
+            format!("gui/{}/com.ce-net.ce", unsafe { libc::getuid() }),
+        ];
+        for d in &domains {
+            if let Ok(s) = std::process::Command::new("launchctl")
+                .args(["kickstart", "-k", d])
+                .status()
+            {
+                if s.success() {
+                    println!("Restarted the ce service (launchctl kickstart {d}).");
+                    return;
+                }
+            }
+        }
+        println!("Could not auto-restart the launchd service; restart your node manually.");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // System units (root): prefer the one whose unit file exists. Covers `ce` and the relay's
+        // `ce-relay`. Use sudo only if we're not already root.
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let sys_units: &[&str] = &["ce", "ce-relay"];
+        for unit in sys_units {
+            let unit_file = format!("/etc/systemd/system/{unit}.service");
+            if std::path::Path::new(&unit_file).exists() {
+                let ok = if is_root {
+                    run_status("systemctl", &["restart", unit])
+                } else {
+                    run_status("sudo", &["systemctl", "restart", unit])
+                };
+                if ok {
+                    println!("Restarted the ce service (systemctl restart {unit}).");
+                    return;
+                }
+            }
+        }
+        // `--user` unit: needs the user bus, which a non-login shell / cron doesn't have in env.
+        let uid = unsafe { libc::getuid() };
+        let user_unit = dirs_next::home_dir()
+            .map(|h| h.join(".config/systemd/user/ce.service"))
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        if user_unit {
+            let xdg = format!("/run/user/{uid}");
+            let ok = std::process::Command::new("systemctl")
+                .args(["--user", "restart", "ce"])
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={xdg}/bus"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                println!("Restarted the ce service (systemctl --user restart ce).");
                 return;
             }
         }
+        println!("Could not auto-restart the service; restart your node manually.");
     }
-    println!("Could not auto-restart the service; restart your node manually.");
+}
+
+/// Run a command, returning whether it exited 0. Small helper for the service-mode logic.
+#[cfg(target_os = "linux")]
+fn run_status(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn show_logs(lines: usize) -> Result<()> {
