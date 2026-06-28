@@ -448,7 +448,13 @@ impl Block {
     /// Cumulative-work contribution of this block for fork choice: the producer's consensus weight.
     /// Validated on append to equal `consensus_weight(miner)`, so the heaviest-weight suffix wins.
     pub fn work(&self) -> u128 {
-        self.weight
+        // Each block is worth at least 1 unit of work. In the bootstrap regime (empty
+        // genesis_weights, no earned weight yet) every block has weight 0, so without this floor
+        // ALL chains have cumulative work 0 — fork choice can never prefer the longer chain and a
+        // node freezes on whatever fork it first saw (the live "stuck at height 73" bug). The floor
+        // makes heaviest-chain degrade gracefully to longest-chain when weights are zero/tied; real
+        // earned/bonded weights (orders of magnitude larger) still dominate when present.
+        self.weight.max(1)
     }
 
     /// Sign the block header. Called after the VRF proof and weight are set.
@@ -1165,6 +1171,50 @@ impl Chain {
     }
 
     /// Validates and appends a block. Returns false if invalid (caller should log and discard).
+    /// Read-only mirror of `append`'s rejection checks — returns WHY a block can't extend this chain.
+    /// For diagnostics (reorg logging); keeps the silent `append`->bool fast path untouched.
+    pub fn append_reject_reason(&self, block: &Block) -> &'static str {
+        if block.index != self.tip().index + 1 {
+            return "index != our tip+1";
+        }
+        if block.prev_hash != self.tip_hash() {
+            return "prev_hash != our tip hash (fork point)";
+        }
+        if !block.verify_seal() {
+            return "bad seal / producer signature";
+        }
+        let slot = block.timestamp / SLOT_SECS;
+        if slot <= self.tip().timestamp / SLOT_SECS {
+            return "slot not strictly after our tip slot";
+        }
+        let total = self.total_consensus_weight();
+        if total > 0 {
+            let weight = self.consensus_weight(&block.miner);
+            if weight == 0 {
+                return "producer has ZERO consensus weight on this chain (unknown/unbonded/no earned work here)";
+            }
+            if block.weight != weight {
+                return "declared weight != producer's consensus weight as computed on this chain";
+            }
+            let seed = self.confirmed_seed(slot);
+            match vrf_verify(&block.miner, &seed, &block.vrf_proof) {
+                Some(ticket) => {
+                    if ticket_value(&ticket) >= leader_threshold(weight, total) {
+                        return "VRF ticket above leader threshold (not elected for this slot here)";
+                    }
+                }
+                None => return "VRF proof does not verify against this slot's seed",
+            }
+        }
+        if !self.timestamp_ok(block) {
+            return "timestamp out of allowed bounds";
+        }
+        if block.transactions.len() > MAX_TXS_PER_BLOCK {
+            return "too many transactions";
+        }
+        "passes modelled checks (failure is in tx-verify / duplicate-id / emission rules)"
+    }
+
     pub fn append(&mut self, block: Block) -> bool {
         if block.index != self.tip().index + 1 {
             return false;
@@ -1732,7 +1782,18 @@ impl Chain {
         }
         let fork_pos = match fork_pos {
             Some(p) => p,
-            None => return false, // no connection to our kept chain (could be pre-checkpoint)
+            None => {
+                // No candidate block links to any block we hold — the chains share no common
+                // ancestor in our kept range (a deep fork, or our prefix was pruned past it).
+                let lo = candidate.first().map(|b| b.index).unwrap_or(0);
+                let hi = candidate.last().map(|b| b.index).unwrap_or(0);
+                tracing::warn!(
+                    "reorg rejected: candidate ({lo}..{hi}) shares no block with our chain (our tip {}); \
+                     cannot attach",
+                    self.tip().index
+                );
+                return false;
+            }
         };
 
         // Walk the candidates in chain order starting from the fork point.
@@ -1763,6 +1824,11 @@ impl Chain {
             .iter()
             .fold(0u128, |acc, b| acc.saturating_add(b.work()));
         if cand_suffix_work <= our_suffix_work {
+            tracing::debug!(
+                "reorg declined: candidate suffix work {cand_suffix_work} <= ours {our_suffix_work} \
+                 (fork at {fork_pos}, our tip {})",
+                self.tip().index
+            );
             return false;
         }
 
@@ -1792,8 +1858,18 @@ impl Chain {
             cumulative_work: 0,
         };
         reorg_chain.rebuild_caches();
+        let suffix_lo = new_suffix.first().map(|b| b.index).unwrap_or(0);
+        let suffix_hi = new_suffix.last().map(|b| b.index).unwrap_or(0);
         for block in new_suffix {
+            let idx = block.index;
+            // Diagnose BEFORE consuming the block, so a failure tells us exactly why it can't attach
+            // (this is the silent "sync blocks didn't apply" cause).
+            let reason = reorg_chain.append_reject_reason(&block);
             if !reorg_chain.append(block) {
+                tracing::warn!(
+                    "reorg rejected: candidate block {idx} (of suffix {suffix_lo}..{suffix_hi}) failed \
+                     validation rebuilding from fork {fork_pos}: {reason}"
+                );
                 return false; // invalid block in candidate chain; abort
             }
         }
@@ -3939,6 +4015,36 @@ mod tests {
         assert!(chain.try_reorg(fork_blocks));
         assert_eq!(chain.height(), 3);
         assert_eq!(chain.tip().miner, b.node_id());
+    }
+
+    #[test]
+    fn try_reorg_adopts_heavier_chain_without_genesis_weights() {
+        // Mirrors the REAL network (and the live desktop stuck at height 73): genesis_weights is
+        // EMPTY, so producers earn weight by producing (bootstrap fallback for the first block at
+        // total-weight 0, then VRF election). A node stranded on a short minority fork MUST be able
+        // to adopt the heavier canonical chain. Every existing reorg test grants genesis weight, so
+        // this earned-weight path was never covered — this is the reproduce-first test for the bug.
+        let a = make_identity("reorg-earn-canonical");
+        let b = make_identity("reorg-earn-fork");
+        let genesis = Chain::genesis(); // NO genesis weights — like a real node
+
+        // Canonical: producer A builds a long chain from genesis.
+        let canonical = build_fork(&genesis, &a, 6);
+
+        // Our node is stranded on B's short fork from the same genesis (height 2).
+        let mut ours = genesis.clone();
+        for blk in build_fork(&genesis, &b, 2) {
+            assert!(ours.append(blk), "fork block must be valid");
+        }
+        assert_eq!(ours.height(), 2);
+
+        // It must adopt the heavier canonical chain (6 blocks of work > 2).
+        assert!(
+            ours.try_reorg(canonical),
+            "node on a minority fork must reorg to the heavier canonical chain"
+        );
+        assert_eq!(ours.tip().miner, a.node_id());
+        assert_eq!(ours.height(), 6);
     }
 
     #[test]

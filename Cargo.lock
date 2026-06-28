@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "ce"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "ce-appmgr",
@@ -678,6 +678,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tracing",
  "zstd",
 ]
 
