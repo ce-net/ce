@@ -117,6 +117,11 @@ enum Commands {
         /// isolated local test meshes so they can't cross-link with a live node.
         #[arg(long)]
         no_mdns: bool,
+        /// Run in the foreground (block this terminal) instead of installing the persistent
+        /// background service. The service itself runs with this flag. Set automatically when stdout
+        /// is not a terminal (e.g. under systemd/launchd), so the unit always runs in foreground.
+        #[arg(long)]
+        foreground: bool,
     },
     /// Show this node's credit balance.
     Balance,
@@ -858,7 +863,8 @@ fn install_service(light: bool, no_mine: bool) -> Result<()> {
         .map_err(|e| anyhow!("cannot determine binary path: {e}"))?;
     let bin = bin.to_string_lossy();
 
-    let mut args = vec!["start".to_string()];
+    // `--foreground` so the service runs the node directly and never re-enters the install path.
+    let mut args = vec!["start".to_string(), "--foreground".to_string()];
     if light   { args.push("--light".into()); }
     if no_mine { args.push("--no-mine".into()); }
 
@@ -1266,7 +1272,31 @@ async fn main() -> Result<()> {
     let api_token = read_api_token(&data_dir);
 
     match cli.command {
-        Commands::Start { port, api_port, api_bind, bootstrap, relay, no_mine, light, tls, relay_price_per_min, ephemeral, no_mdns } => {
+        Commands::Start { port, api_port, api_bind, bootstrap, relay, no_mine, light, tls, relay_price_per_min, ephemeral, no_mdns, foreground } => {
+            // A node must STAY ALIVE: survive closing the terminal, logging out, and rebooting.
+            // So when `ce start` is run interactively (a real terminal) we don't block this shell —
+            // we install + enable the persistent background service (linger + Restart=always +
+            // start-on-boot) and detach. The service runs `ce start --foreground`, and any non-TTY
+            // invocation (systemd/launchd, Docker, scripts) also runs in the foreground, so there is
+            // no recursion. `--foreground` forces the blocking run for dev/debugging.
+            use std::io::IsTerminal;
+            let run_foreground = foreground
+                || std::env::var("CE_FOREGROUND").is_ok()
+                || !std::io::stdout().is_terminal();
+            if !run_foreground {
+                println!("Starting the CE node as a background service (stays alive across logout & reboot)...");
+                install_service(light, no_mine)?;
+                println!();
+                println!("Your node is running in the background. It will restart on crash and on boot.");
+                #[cfg(target_os = "linux")]
+                println!("  Logs : journalctl --user -u ce -f");
+                #[cfg(target_os = "macos")]
+                println!("  Logs : tail -f ~/.local/share/ce/ce.log");
+                println!("  Status: ce status");
+                println!("  Stop : ce uninstall-service");
+                println!("  Run attached instead: ce start --foreground");
+                return Ok(());
+            }
             // CE_BOOTSTRAP_PEERS: colon-separated list of bootstrap multiaddrs.
             // Useful for Docker/systemd deployments where CLI flags are inconvenient.
             let mut bootstrap_peers = bootstrap;
